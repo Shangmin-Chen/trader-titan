@@ -1,7 +1,7 @@
 ---
 name: daedalus-feature-implementation
 description: "Feature implementation agent for Trader Titan's TypeScript, React, Cloudflare Worker, Durable Object, and room protocol code."
-model: opus
+model: sonnet
 ---
 
 # Feature Implementation

@@ -1,7 +1,7 @@
 ---
 name: hermes-performance-profile
 description: "Performance auditor for Trader Titan's Cloudflare Worker, Durable Object storage, WebSocket fanout, provider calls, and React UI."
-model: opus
+model: sonnet
 ---
 
 # Performance Profiling

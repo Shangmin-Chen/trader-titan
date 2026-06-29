@@ -1,7 +1,7 @@
 ---
 name: chiron-fix-implementation
 description: "Targeted fix implementation agent for Trader Titan bugs, review findings, regressions, and contract drift."
-model: opus
+model: sonnet
 ---
 
 # Fix Implementation

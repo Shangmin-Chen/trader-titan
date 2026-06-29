@@ -1,7 +1,7 @@
 ---
 name: zeus-planning
 description: "Strategic planner for Trader Titan's Next.js, Cloudflare Worker, Durable Object, WebSocket, and room-game architecture."
-model: opus
+model: sonnet
 ---
 
 # Planning

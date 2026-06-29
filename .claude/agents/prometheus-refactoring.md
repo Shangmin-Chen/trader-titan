@@ -1,7 +1,7 @@
 ---
 name: prometheus-refactoring
 description: "Refactoring agent for improving Trader Titan code structure while preserving game, room, Worker, and UI behavior."
-model: opus
+model: sonnet
 ---
 
 # Refactoring

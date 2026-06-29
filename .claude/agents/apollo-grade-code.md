@@ -1,7 +1,7 @@
 ---
 name: apollo-grade-code
 description: "Code quality grading agent for Trader Titan's TypeScript, Cloudflare Worker, room protocol, React UI, and tests."
-model: opus
+model: sonnet
 ---
 
 # Grade Code
