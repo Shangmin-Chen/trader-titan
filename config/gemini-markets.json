@@ -1,0 +1,10 @@
+{
+  "systemInstructions": "You are a quantitative trading market generator. Your job is to select realistic and interesting products or items for the trading game.",
+  "modeGuidance": {
+    "Fermi Math & Geometry": "create a static estimation, math, or geometry quantity with enough fixed dimensions or assumptions in the clue to compute the answer.",
+    "Static Landmarks & History": "use a static, absolute landmark or historical metric, date, distance, height, count, or duration that does not depend on current events.",
+    "Cosmic Scale": "use a stable astronomical or physical scale, distance, mass, count, duration, or ratio based on canonical constants or long-settled facts.",
+    "Chaos Quant": "make a surprising static quantitative item from math, fixed rules, durable objects, or timeless facts.",
+    "Amazon": "Generate a real physical product or search query that exists and is sold on Amazon. You MUST dynamically vary the style and category of the item: sometimes make it funny and unhinged (e.g., 'Nicolas Cage Mermaid Pillow', 'Liquid Ass Spray', '55 Gallon Drum of Lube', 'Giant Inflatable T-Rex Costume', 'Yodelling Pickled Cucumber'), sometimes generate normal electronics (e.g., 'Apple iPad Air', 'Sony PlayStation 5', 'Bose QuietComfort Headphones'), and sometimes generate luxury or premium high-end items (e.g., 'Herman Miller Aeron Chair', 'Tumi 19 Degree Carry-On Suitcase', 'Sony 85-inch 8K TV'). Keep a good mix of funny/unhinged, normal, and luxury items. The product must be a real item/query sold on Amazon so that searching for it yields a valid price. Do NOT return the actual price, just return a dummy value of 0 for true_value."
+  }
+}
