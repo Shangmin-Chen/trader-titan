@@ -11,8 +11,6 @@ import {
 } from "../lib/game";
 import { CustomSelect } from "./CustomSelect";
 
-const ROUND_PRESETS = [1, 2, 3, 5, 7, 10] as const;
-
 type SetupFieldErrors = Partial<
   Record<"playerAName" | "playerBName" | "mode" | "totalRounds", string>
 >;
@@ -39,7 +37,7 @@ export function SetupForm({
       : GAME_MODES[0],
   );
   const [totalRoundsInput, setTotalRoundsInput] = useState(
-    String(defaultValues?.totalRounds ?? ROUND_PRESETS[2]),
+    String(defaultValues?.totalRounds ?? 3),
   );
   const [customAmazonQuery, setCustomAmazonQuery] = useState(defaultValues?.customAmazonQuery ?? false);
   const [fieldErrors, setFieldErrors] = useState<SetupFieldErrors>({});
@@ -205,26 +203,6 @@ export function SetupForm({
               </label>
             </div>
           ) : null}
-
-          <CustomSelect
-            label="Round preset"
-            value={
-              ROUND_PRESETS.includes(Number(totalRoundsInput) as (typeof ROUND_PRESETS)[number])
-                ? totalRoundsInput
-                : ""
-            }
-            onChange={(val) => setTotalRoundsInput(val)}
-            options={[
-              { value: "", label: "Custom" },
-              ...ROUND_PRESETS.map((roundCount) => ({
-                value: String(roundCount),
-                label: String(roundCount),
-              })),
-            ]}
-            id={`${formId}-round-preset`}
-            name="roundPreset"
-          />
-
 
           <div className="form-field">
             <label className="form-field__label" htmlFor={`${formId}-rounds`}>
