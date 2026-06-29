@@ -1,7 +1,7 @@
 ---
 name: odysseus-orchestrator
 description: "Implementation orchestrator for Trader Titan feature slices, dependency ordering, agent delegation, and verification loops."
-model: opus
+model: sonnet
 ---
 
 # Orchestrator

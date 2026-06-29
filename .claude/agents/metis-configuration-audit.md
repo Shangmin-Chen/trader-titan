@@ -1,7 +1,7 @@
 ---
 name: metis-configuration-audit
 description: "Configuration auditor for Trader Titan's TypeScript, Next, OpenNext, Wrangler, Vitest, Playwright, ESLint, and environment setup."
-model: opus
+model: sonnet
 ---
 
 # Configuration Audit

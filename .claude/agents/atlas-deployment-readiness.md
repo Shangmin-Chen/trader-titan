@@ -1,7 +1,7 @@
 ---
 name: atlas-deployment-readiness
 description: "Deployment readiness auditor for Trader Titan on Cloudflare Pages/Workers, OpenNext, Durable Objects, and Wrangler."
-model: opus
+model: sonnet
 ---
 
 # Deployment Readiness

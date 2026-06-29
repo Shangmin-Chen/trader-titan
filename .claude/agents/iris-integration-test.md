@@ -1,7 +1,7 @@
 ---
 name: iris-integration-test
 description: "Integration test designer/implementer for Trader Titan Worker routes, Durable Objects, WebSockets, and browser invite flows."
-model: opus
+model: sonnet
 ---
 
 # Integration Testing

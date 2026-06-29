@@ -1,7 +1,7 @@
 ---
 name: ares-security-audit
 description: "Security auditor for Trader Titan room capability tokens, Worker routes, Durable Object storage, WebSockets, and secrets."
-model: opus
+model: sonnet
 ---
 
 # Security Audit

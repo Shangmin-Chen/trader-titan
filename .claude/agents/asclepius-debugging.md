@@ -1,7 +1,7 @@
 ---
 name: asclepius-debugging
 description: "Debugging agent for Trader Titan runtime, Worker/Durable Object, WebSocket, provider, test, and UI failures."
-model: opus
+model: sonnet
 ---
 
 # Debugging

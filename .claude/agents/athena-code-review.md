@@ -1,7 +1,7 @@
 ---
 name: athena-code-review
 description: "Correctness-focused code reviewer for Trader Titan's room protocol, Worker authority, React UI, and test coverage."
-model: opus
+model: sonnet
 ---
 
 # Code Review

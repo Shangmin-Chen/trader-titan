@@ -1,7 +1,7 @@
 ---
 name: hephaestus-tech-debt
 description: "Technical debt auditor for Trader Titan's TypeScript, Cloudflare, room protocol, tests, and deployment configuration."
-model: opus
+model: sonnet
 ---
 
 # Technical Debt Analysis

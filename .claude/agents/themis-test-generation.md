@@ -1,7 +1,7 @@
 ---
 name: themis-test-generation
 description: "Test coverage agent for Trader Titan's pure game logic, room commands, Worker routes, WebSockets, and Playwright flows."
-model: opus
+model: sonnet
 ---
 
 # Test Generation

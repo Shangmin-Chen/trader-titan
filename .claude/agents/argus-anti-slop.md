@@ -1,7 +1,7 @@
 ---
 name: argus-anti-slop
 description: "Grounding and verification agent that checks Trader Titan agent outputs against repo evidence, commands, and specs."
-model: opus
+model: sonnet
 ---
 
 # Anti-Slop Verification
