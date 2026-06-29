@@ -8,7 +8,7 @@ export default defineConfig({
   workers: process.env.CI ? 1 : undefined,
   reporter: "html",
   use: {
-    baseURL: "http://127.0.0.1:3000",
+    baseURL: "http://localhost:8787",
     trace: "on-first-retry"
   },
   projects: [
@@ -18,8 +18,9 @@ export default defineConfig({
     }
   ],
   webServer: {
-    command: "npm run dev -- --hostname 127.0.0.1 --port 3000",
-    url: "http://127.0.0.1:3000",
+    command: "npm run build:cloudflare && wrangler dev --var WORKER_ITEM_PROVIDER:deterministic --port 8787",
+    timeout: 120_000,
+    url: "http://localhost:8787",
     reuseExistingServer: !process.env.CI
   }
 });

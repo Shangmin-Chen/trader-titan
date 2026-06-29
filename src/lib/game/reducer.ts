@@ -384,11 +384,19 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
       }
 
       const nextState: GameState = {
-        ...state,
         phase: "settlement",
-        item: action.item,
-        settlement: action.settlement,
+        mode: state.mode,
+        customAmazonQuery: state.customAmazonQuery,
+        players: state.players,
         scores: applySettlementToScores(state.scores, action.settlement),
+        roles: state.roles,
+        roundNumber: state.roundNumber,
+        totalRounds: state.totalRounds,
+        log: state.log,
+        item: action.item,
+        spreadWidth: state.spreadWidth,
+        quote: state.quote,
+        settlement: action.settlement,
         lastError: undefined,
       };
 

@@ -5,10 +5,15 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
+    "build:cloudflare": "node scripts/build-cloudflare.mjs",
     "start": "next start",
+    "preview:cloudflare": "npm run build:cloudflare && wrangler dev",
+    "deploy:cloudflare": "node scripts/assert-durable-room-ready.mjs && npm run build:cloudflare && opennextjs-cloudflare deploy",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
+    "typegen:worker": "wrangler types worker-configuration.d.ts --env-file .dev.vars.example",
     "test": "vitest run",
+    "worker-test": "vitest run --config vitest.worker.config.ts --configLoader runner",
     "test:e2e": "playwright test"
   },
   "dependencies": {
@@ -19,6 +24,9 @@
     "react-dom": "^19.2.7"
   },
   "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.16.20",
+    "@cloudflare/workers-types": "^4.20260629.1",
+    "@opennextjs/cloudflare": "^1.20.1",
     "@playwright/test": "^1.61.1",
     "@testing-library/jest-dom": "^6.9.1",
     "@testing-library/react": "^16.3.2",
@@ -29,7 +37,9 @@
     "eslint": "^9.39.4",
     "eslint-config-next": "^16.2.9",
     "jsdom": "^29.1.1",
+    "rclone.js": "^0.6.6",
     "typescript": "^6.0.3",
-    "vitest": "^4.1.9"
+    "vitest": "^4.1.9",
+    "wrangler": "^4.105.0"
   }
 }

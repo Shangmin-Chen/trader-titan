@@ -1,0 +1,7 @@
+[agents]
+# Allow the main prompt to spawn the orchestrator (Depth 1),
+# and allow the orchestrator to spawn specialized workers (Depth 2).
+max_depth = 2
+
+# Maximum concurrent parallel worker threads allowed open at one time
+max_threads = 6

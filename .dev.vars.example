@@ -1,0 +1,4 @@
+# Copy to .dev.vars for local Wrangler preview only.
+GEMINI_API_KEY=replace-with-local-key
+WORKER_ITEM_PROVIDER=deterministic
+NEXT_PUBLIC_APP_ENV=local

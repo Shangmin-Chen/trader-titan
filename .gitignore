@@ -1,9 +1,17 @@
 # Dependencies
 node_modules/
 
+# Nested projects checked out beside the app
+persephone/
+
 # Next.js
 .next/
+.open-next/
 out/
+
+# Cloudflare
+.wrangler/
+.dev.vars
 
 # Production
 build/

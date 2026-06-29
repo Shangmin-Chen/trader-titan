@@ -1,0 +1,22 @@
+name = "trader-titan"
+main = "src/worker/index.ts"
+compatibility_date = "2026-06-29"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+preview_urls = false
+
+[assets]
+directory = ".open-next/assets"
+binding = "ASSETS"
+run_worker_first = true
+
+[[durable_objects.bindings]]
+name = "GAME_ROOM"
+class_name = "GameRoomDurableObject"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["GameRoomDurableObject"]
+
+[observability]
+enabled = true
