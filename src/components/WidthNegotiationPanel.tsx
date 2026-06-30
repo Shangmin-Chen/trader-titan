@@ -55,11 +55,13 @@ export function WidthNegotiationPanel({
 
       <div className={styles.pathways}>
         <div className={`${styles.pathway} ${styles.pathwayTrade}`}>
-          <h3 className={styles.pathwayTitle}>Trade on width</h3>
-          <p className={styles.pathwayCopy}>
-            Accept the {formattedWidth}-wide market and trade at it now. This
-            locks in the deal at the current width.
-          </p>
+          <div className={styles.pathwayBody}>
+            <h3 className={styles.pathwayTitle}>Trade on width</h3>
+            <p className={styles.pathwayCopy}>
+              Accept the {formattedWidth}-wide market and trade at it now.
+              This locks in the deal at the current width.
+            </p>
+          </div>
           <div className="trading-panel__actions">
             <button
               className="trading-panel__button trading-panel__button--buy"
@@ -77,12 +79,14 @@ export function WidthNegotiationPanel({
         </div>
 
         <div className={`${styles.pathway} ${styles.pathwayTighten}`}>
-          <h3 className={styles.pathwayTitle}>Tighten width</h3>
-          <p className={styles.pathwayCopy}>
-            Demand a narrower market. This hands the decision back to{" "}
-            <span className={styles.pathwayMaker}>{makerName}</span>, who must
-            re-quote inside your tighter width before any trade.
-          </p>
+          <div className={styles.pathwayBody}>
+            <h3 className={styles.pathwayTitle}>Tighten width</h3>
+            <p className={styles.pathwayCopy}>
+              Demand a narrower market. This hands the decision back to{" "}
+              <span className={styles.pathwayMaker}>{makerName}</span>, who
+              must re-quote inside your tighter width before any trade.
+            </p>
+          </div>
           <SpreadWidthForm
             currentWidth={spreadWidth}
             disabled={disabled}

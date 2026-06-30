@@ -6,7 +6,10 @@
    data-dense without sacrificing clarity.
    ============================================================ */
 
-:root {
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
   /* ── Surfaces (zinc scale) ──────────────────────────────── */
   --bg-base:             #09090b;   /* zinc-950 */
   --bg-surface:          #111113;   /* zinc-950 lighter */
@@ -61,7 +64,72 @@
   --shadow-sm:   0 2px 6px rgba(0, 0, 0, 0.45);
   --shadow-md:   0 8px 24px rgba(0, 0, 0, 0.55);
   --shadow-lg:   0 20px 48px rgba(0, 0, 0, 0.65);
+}
 
+/* ── Light theme ───────────────────────────────────────────────
+   Activated via [data-theme="light"] on <html>, set by the
+   no-flash bootstrap script in layout.tsx (explicit user choice,
+   or system preference when no choice has been made yet). */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  /* ── Surfaces (zinc scale, inverted) ────────────────────── */
+  --bg-base:             #fafafa;   /* zinc-50 */
+  --bg-surface:          #f4f4f5;   /* zinc-100 */
+  --bg-elevated:         #ffffff;
+  --bg-card:             #ffffff;
+  --bg-hover:            #f4f4f5;   /* zinc-100 */
+
+  /* ── Borders ────────────────────────────────────────────── */
+  --border-subtle:       #e4e4e7;   /* zinc-200 */
+  --border-default:      #d4d4d8;   /* zinc-300 */
+  --border-strong:       #a1a1aa;   /* zinc-400 */
+  --border-focus:        #4f46e5;   /* indigo-600 — keyboard ring */
+
+  /* ── Text ───────────────────────────────────────────────── */
+  --text-primary:        #18181b;   /* zinc-900 */
+  --text-secondary:      #52525b;   /* zinc-600 */
+  --text-muted:          #71717a;   /* zinc-500 */
+  --text-disabled:       #a1a1aa;   /* zinc-400 */
+
+  /* ── Accent — Indigo (darker for AA contrast on white) ──── */
+  --accent:              #4f46e5;   /* indigo-600 */
+  --accent-hover:        #4338ca;   /* indigo-700 */
+  --accent-dim:          rgba(79, 70, 229, 0.08);
+  --accent-border:       rgba(79, 70, 229, 0.28);
+  --accent-focus-ring:   rgba(79, 70, 229, 0.20);
+
+  /* ── Trading colors ─────────────────────────────────────── */
+  --buy:                 #16a34a;   /* green-600 */
+  --buy-hover:           #15803d;   /* green-700 */
+  --buy-dim:             rgba(22, 163,  74, 0.08);
+  --buy-dim-md:          rgba(22, 163,  74, 0.14);
+  --buy-border:          rgba(22, 163,  74, 0.28);
+  --buy-border-strong:   rgba(22, 163,  74, 0.5);
+
+  --sell:                #dc2626;   /* red-600 */
+  --sell-hover:          #b91c1c;   /* red-700 */
+  --sell-dim:            rgba(220,  38,  38, 0.08);
+  --sell-dim-md:         rgba(220,  38,  38, 0.14);
+  --sell-border:         rgba(220,  38,  38, 0.28);
+  --sell-border-strong:  rgba(220,  38,  38, 0.5);
+
+  --warn:                #d97706;   /* amber-600 */
+  --warn-dim:            rgba(217, 119,  6, 0.12);
+  --warn-border:         rgba(217, 119,  6, 0.32);
+
+  /* ── Player identity colors ─────────────────────────────── */
+  --player-a:            #4f46e5;   /* indigo-600 */
+  --player-b:            #9333ea;   /* purple-600 */
+
+  /* ── Shadows (soft — dark shadows read heavy on white) ──── */
+  --shadow-xs:   0 1px 2px rgba(24, 24, 27, 0.06);
+  --shadow-sm:   0 2px 6px rgba(24, 24, 27, 0.08);
+  --shadow-md:   0 8px 24px rgba(24, 24, 27, 0.10);
+  --shadow-lg:   0 20px 48px rgba(24, 24, 27, 0.16);
+}
+
+:root {
   /* ── Typography ─────────────────────────────────────────── */
   --font-sans:  'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
   --font-mono:  'JetBrains Mono', ui-monospace, "Cascadia Code", monospace;
@@ -110,6 +178,11 @@
   --safe-right:  env(safe-area-inset-right, 0px);
   --safe-bottom: env(safe-area-inset-bottom, 0px);
   --safe-left:   env(safe-area-inset-left, 0px);
+
+  /* Rendered .game-shell__header height (measured ~101px at both the
+     768px and 1080px breakpoints) plus headroom, used to offset sticky
+     sidebars so they clear the sticky header instead of clipping under it. */
+  --shell-sticky-offset: 112px;
 
   /* ── Legacy alpha tokens (referenced by module CSS files) ── */
   --color-sell-a08:  rgba(248, 113, 113, 0.08);
@@ -165,11 +238,12 @@
 html {
   min-height: 100%;
   background: var(--bg-base);
-  color-scheme: dark;
   scroll-behavior: smooth;
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
   overflow-wrap: break-word;
+  /* color-scheme is set per-theme above (data-theme="dark" | "light") */
+  transition: background-color var(--transition-base);
 }
 
 body {
@@ -344,16 +418,32 @@ a:focus-visible,
   order: -1;
 }
 
-/* Centered layout when no sidebars (setup screen) */
-.game-shell__layout:not(.game-shell__layout--has-scoreboard):not(.game-shell__layout--has-action-log) .game-shell__main {
+/* Centered layout when no sidebars (setup screen) — both axes, so the
+   create/join card sits in the visual middle of the viewport instead of
+   pinned to the top-left of an otherwise empty page. */
+.game-shell__layout--centered {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.game-shell__layout--centered .game-shell__main {
+  /* Override the in-game min-height below — it exists to stop the main
+     column from jumping around as phases change while sidebars are
+     present, but here it would just be invisible dead space the centered
+     card has to "swim" inside of, defeating the centering. */
+  min-height: 0;
   max-width: 600px;
-  margin: 0 auto;
   width: 100%;
 }
 
-/* ── Panel base style ────────────────────────────────────────── */
-.game-shell__main,
-.game-shell__sidebar,
+/* ── Panel base style ────────────────────────────────────────────
+   Applies ONLY to actual content cards — NOT to `.game-shell__main` /
+   `.game-shell__sidebar`, which are plain layout containers. Giving the
+   layout containers their own border+background previously produced a
+   "card inside an identical card" look on every single screen, since
+   `.game-shell__main`'s sole child is always itself one of these panels. */
 .phase-panel,
 .item-panel,
 .trading-panel,
@@ -375,22 +465,10 @@ a:focus-visible,
   display: flex;
   flex-direction: column;
   justify-content: stretch;
-}
-
-@media (max-width: 767px) {
-  .game-shell__main {
-    border: none;
-    background: none;
-    box-shadow: none;
-    padding: 0;
-  }
+  gap: var(--space-md);
 }
 
 .game-shell__sidebar {
-  background: transparent;
-  box-shadow: none;
-  border: 0;
-  padding: 0;
   display: flex;
   flex-direction: column;
   gap: var(--space-md);
@@ -405,6 +483,60 @@ a:focus-visible,
   color: var(--text-secondary);
   font-size: var(--text-sm);
   font-weight: 500;
+}
+
+/* ── Header right-hand cluster (status + theme toggle) ──────── */
+.game-shell__header-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+}
+
+/* ── Theme toggle ────────────────────────────────────────────── */
+.theme-toggle {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  width: var(--tap-target);
+  height: var(--tap-target);
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-pill);
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  box-shadow: var(--shadow-xs);
+}
+
+.theme-toggle:hover {
+  border-color: var(--border-strong);
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.theme-toggle__icon {
+  position: absolute;
+  transition: opacity var(--transition-base), transform var(--transition-base);
+}
+
+.theme-toggle__icon--sun {
+  opacity: 0;
+  transform: rotate(-90deg) scale(0.5);
+}
+
+.theme-toggle__icon--moon {
+  opacity: 1;
+  transform: rotate(0deg) scale(1);
+}
+
+:root[data-theme="light"] .theme-toggle__icon--sun {
+  opacity: 1;
+  transform: rotate(0deg) scale(1);
+}
+
+:root[data-theme="light"] .theme-toggle__icon--moon {
+  opacity: 0;
+  transform: rotate(90deg) scale(0.5);
 }
 
 /* ── Phase chips ─────────────────────────────────────────────── */
@@ -459,6 +591,31 @@ a:focus-visible,
   background: var(--bg-elevated);
   word-break: break-all;
   overflow-wrap: break-word;
+}
+
+/* The toggle is the room-controls card's only always-visible element;
+   strip its own button chrome so it reads as a header row, not a nested
+   button-within-a-card. */
+.room-controls > .collapsible-region__toggle {
+  padding: 0;
+  border: none;
+  background: none;
+  min-height: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.room-controls > .collapsible-region__toggle:hover {
+  color: var(--text-primary);
+}
+
+.room-controls > .collapsible-region__body {
+  display: grid;
+  gap: var(--space-md);
+  margin-top: 0;
 }
 
 .room-controls__summary {
@@ -1883,6 +2040,20 @@ select.form-field__control {
   .game-shell__layout--has-scoreboard .game-shell__main {
     order: 0;
   }
+
+  /* Pin sidebars near the top of the viewport as the (usually much taller)
+     main column scrolls, instead of leaving them stranded above a large
+     void of empty page once their own content runs out. */
+  .game-shell__sidebar {
+    position: sticky;
+    /* Measured rendered .game-shell__header height is ~101px at both the
+       768px and 1080px breakpoints (single-row header in both cases) —
+       a single shared offset (with headroom) avoids the sidebar sticking
+       a few px under the sticky header, which clipped its top edge. */
+    top: calc(var(--safe-top) + var(--shell-sticky-offset));
+    max-height: calc(100vh - var(--safe-top) - var(--shell-sticky-offset) - var(--space-md));
+    overflow-y: auto;
+  }
 }
 
 @media (min-width: 1080px) {
@@ -1910,9 +2081,8 @@ select.form-field__control {
     min-height: 560px;
   }
 
-  .game-shell__layout:not(.game-shell__layout--has-scoreboard):not(.game-shell__layout--has-action-log) .game-shell__main {
-    margin: 24px auto;
-  }
+  /* Header height is the same as the 768px breakpoint, so --shell-sticky-offset
+     (set once below) already covers this breakpoint too — nothing to override. */
 }
 
 /* ============================================================

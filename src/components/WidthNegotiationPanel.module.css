@@ -64,11 +64,23 @@
 .pathway {
   display: flex;
   flex-direction: column;
+  /* space-between (not a flat gap) so the call-to-action lands on the same
+     baseline in both cards even though "Trade on width" has far less
+     content than "Tighten width" (which embeds a full form) — without
+     this the shorter card's button strands near the top with a slab of
+     empty space below it while its sibling fills the row. */
+  justify-content: space-between;
   gap: var(--space-sm);
   padding: var(--space-md);
   border-radius: var(--radius-md);
   border: 1px solid var(--border-subtle);
   background: var(--bg-card);
+}
+
+.pathwayBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
 }
 
 .pathwayTrade {

@@ -956,6 +956,7 @@ function RoomControls({
   onStart,
 }: RoomControlsProps) {
   const startHintId = useId();
+  const bodyId = useId();
   const guestLabel = room.seats.guest.occupied
     ? room.seats.guest.displayName
     : "Waiting for player B";
@@ -966,85 +967,156 @@ function RoomControls({
   const showStartHint =
     isHost && room.lifecycle === "lobby" && !canStartRoom && !guestPresent;
 
+  // Room admin chrome (invite link, reset/kick/forget) is the primary task
+  // in the lobby and on the game-over screen, so it starts expanded there.
+  // Once a round is actually in progress it's pure clutter ahead of the
+  // real gameplay content, so it starts collapsed — the host/guest can
+  // still reach it on demand via the toggle below. Re-derived on every
+  // lifecycle transition (not on every room update) without an effect, per
+  // https://react.dev/learn/you-might-not-need-an-effect#adjusting-some-state-when-a-prop-changes —
+  // a conditional setState during render, guarded by the lifecycle
+  // comparison below, intentionally bails out before paint.
+  const [expanded, setExpanded] = useState(() => room.lifecycle !== "active");
+  const [trackedLifecycle, setTrackedLifecycle] = useState(room.lifecycle);
+
+  if (room.lifecycle !== trackedLifecycle) {
+    setTrackedLifecycle(room.lifecycle);
+    setExpanded(room.lifecycle !== "active");
+  }
+
+  const toggleRef = useRef<HTMLButtonElement | null>(null);
+  const sectionRef = useRef<HTMLElement | null>(null);
+
+  // Anything inside this section can lose focus to nowhere: the "Start
+  // game"/"Reset lobby"/"Kick guest" buttons all get `disabled` the instant
+  // they're clicked (the `isCommanding` guard), and browsers blur a
+  // disabled focused control to <body> synchronously. The disclosure
+  // auto-collapsing on a lifecycle change (which unmounts "Start game"
+  // entirely) does the same thing. Both are indistinguishable from "the
+  // user alt-tabbed away" except for one signal: a same-document focus
+  // loss reports `relatedTarget === null` *and* the document still has
+  // focus — so catch that and land focus somewhere still visible instead
+  // of silently stranding keyboard/AT users right after their most
+  // consequential action.
+  //
+  // This has to be a native `addEventListener("focusout", ...)` rather
+  // than React's `onBlur` prop: React's synthetic event system does not
+  // dispatch onBlur/onFocus for elements that become `disabled` (verified
+  // empirically — the native `focusout` DOM event fires with
+  // `relatedTarget: null` exactly as expected, but no React-level handler
+  // on any ancestor ever receives it), so the synthetic prop is silently a
+  // no-op for the most common case this needs to handle.
+  useEffect(() => {
+    const section = sectionRef.current;
+    if (!section) {
+      return;
+    }
+
+    function handleFocusOut(event: globalThis.FocusEvent) {
+      if (event.relatedTarget === null && document.hasFocus()) {
+        toggleRef.current?.focus();
+      }
+    }
+
+    section.addEventListener("focusout", handleFocusOut);
+    return () => section.removeEventListener("focusout", handleFocusOut);
+  }, []);
+
   return (
-    <section className="room-controls" data-testid="room-controls">
-      <div className="room-controls__summary">
-        <p className="eyebrow">Room {room.id}</p>
-        <h2>
-          {session.role === "host"
-            ? room.seats.host.displayName
-            : room.seats.guest.occupied
-              ? room.seats.guest.displayName
-              : "Player B"}
-        </h2>
-        <p>
-          Host: {room.seats.host.displayName} | Guest: {guestLabel} |{" "}
-          {connectionStatusLabel(connectionStatus)}
-        </p>
-      </div>
+    <section className="room-controls" data-testid="room-controls" ref={sectionRef}>
+      <button
+        aria-controls={bodyId}
+        aria-expanded={expanded}
+        className="collapsible-region__toggle"
+        onClick={() => setExpanded((open) => !open)}
+        ref={toggleRef}
+        type="button"
+      >
+        <span>
+          Room settings · {connectionStatusLabel(connectionStatus)}
+        </span>
+        <span aria-hidden="true">{expanded ? "▾" : "▸"}</span>
+      </button>
 
-      {isHost ? (
-        <div className="invite-box">
-          <p className="form-field__label">Invite link</p>
-          <input type="hidden" id="room-invite-link" value={inviteLink} readOnly />
-          <CopyButton
-            value={inviteLink}
-            label="Copy invite link"
-            shareTitle="Join my Trader Titan room"
-          />
+      <div className="collapsible-region__body" id={bodyId}>
+        <div className="room-controls__summary">
+          <p className="eyebrow">Room {room.id}</p>
+          <h2>
+            {session.role === "host"
+              ? room.seats.host.displayName
+              : room.seats.guest.occupied
+                ? room.seats.guest.displayName
+                : "Player B"}
+          </h2>
+          <p>
+            Host: {room.seats.host.displayName} | Guest: {guestLabel} |{" "}
+            {connectionStatusLabel(connectionStatus)}
+          </p>
         </div>
-      ) : null}
 
-      <div className="room-actions">
-        {isHost && room.lifecycle === "lobby" ? (
-          <div>
-            <button
-              aria-describedby={showStartHint ? startHintId : undefined}
-              className="primary-button"
-              disabled={!canStartRoom}
-              onClick={onStart}
-              type="button"
-            >
-              Start game
-            </button>
-            {showStartHint ? (
-              <p className={styles.startHint} id={startHintId}>
-                Waiting for player B to join
-              </p>
-            ) : null}
+        {isHost ? (
+          <div className="invite-box">
+            <p className="form-field__label">Invite link</p>
+            <input type="hidden" id="room-invite-link" value={inviteLink} readOnly />
+            <CopyButton
+              value={inviteLink}
+              label="Copy invite link"
+              shareTitle="Join my Trader Titan room"
+            />
           </div>
         ) : null}
 
-        {isHost ? (
+        <div className="room-actions">
+          {isHost && room.lifecycle === "lobby" ? (
+            <div>
+              <button
+                aria-describedby={showStartHint ? startHintId : undefined}
+                className="primary-button"
+                disabled={!canStartRoom}
+                onClick={onStart}
+                type="button"
+              >
+                Start game
+              </button>
+              {showStartHint ? (
+                <p className={styles.startHint} id={startHintId}>
+                  Waiting for player B to join
+                </p>
+              ) : null}
+            </div>
+          ) : null}
+
+          {isHost ? (
+            <button
+              className="secondary-button"
+              disabled={!canHostControl}
+              onClick={onReset}
+              type="button"
+            >
+              Reset lobby
+            </button>
+          ) : null}
+
+          {isHost ? (
+            <button
+              className="danger-button"
+              disabled={!canHostControl || !room.seats.guest.occupied}
+              onClick={onKick}
+              type="button"
+            >
+              Kick guest
+            </button>
+          ) : null}
+
           <button
             className="secondary-button"
-            disabled={!canHostControl}
-            onClick={onReset}
+            disabled={isCommanding}
+            onClick={onLeaveLocalSession}
             type="button"
           >
-            Reset lobby
+            Forget this seat
           </button>
-        ) : null}
-
-        {isHost ? (
-          <button
-            className="danger-button"
-            disabled={!canHostControl || !room.seats.guest.occupied}
-            onClick={onKick}
-            type="button"
-          >
-            Kick guest
-          </button>
-        ) : null}
-
-        <button
-          className="secondary-button"
-          disabled={isCommanding}
-          onClick={onLeaveLocalSession}
-          type="button"
-        >
-          Forget this seat
-        </button>
+        </div>
       </div>
     </section>
   );
