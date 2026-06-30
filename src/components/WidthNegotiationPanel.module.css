@@ -1,6 +1,6 @@
-/* Width negotiation: make the current width prominent and clearly split the
-   trader's two pathways (trade now vs. tighten and hand back to the maker). */
+/* Width negotiation: current width spotlight + two clear decision pathways */
 
+/* ── Current width hero ──────────────────────────────────────── */
 .widthSpotlight {
   display: flex;
   flex-direction: column;
@@ -8,35 +8,37 @@
   gap: var(--space-2xs);
   padding: var(--space-md) var(--space-lg);
   border-radius: var(--radius-lg);
-  border: 1px solid var(--accent-cyan-a18);
-  background: var(--accent-cyan-a07);
+  border: 1px solid var(--accent-border);
+  background: var(--accent-dim);
   text-align: center;
 }
 
 .widthSpotlightLabel {
   font-size: var(--text-xs);
-  letter-spacing: 0.12em;
+  letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--text-muted);
+  font-weight: 500;
 }
 
 .widthSpotlightValue {
   font-family: var(--font-mono);
-  font-weight: 800;
+  font-weight: 700;
   font-size: var(--text-2xl);
   line-height: 1.1;
-  color: var(--accent-cyan);
+  color: var(--accent-hover);
 }
 
 .widthSpotlightHint {
   font-size: var(--text-sm);
   color: var(--text-secondary);
+  line-height: 1.4;
 }
 
+/* ── Prompts ─────────────────────────────────────────────────── */
 .prompt {
   margin: 0;
-  font-family: var(--font-display);
-  font-weight: 700;
+  font-weight: 600;
   font-size: var(--text-md);
   color: var(--text-primary);
 }
@@ -45,13 +47,13 @@
   margin: 0;
   padding: var(--space-sm) var(--space-md);
   border-radius: var(--radius-md);
-  border: 1px solid var(--border-mid);
-  background: var(--bg-surface-soft);
-  color: var(--text-secondary);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-card);
+  color: var(--text-muted);
   font-size: var(--text-sm);
 }
 
-/* Two clearly separated decision paths. */
+/* ── Two decision pathways ───────────────────────────────────── */
 .pathways {
   display: grid;
   grid-template-columns: 1fr;
@@ -62,26 +64,38 @@
 .pathway {
   display: flex;
   flex-direction: column;
+  /* space-between (not a flat gap) so the call-to-action lands on the same
+     baseline in both cards even though "Trade on width" has far less
+     content than "Tighten width" (which embeds a full form) — without
+     this the shorter card's button strands near the top with a slab of
+     empty space below it while its sibling fills the row. */
+  justify-content: space-between;
   gap: var(--space-sm);
   padding: var(--space-md);
   border-radius: var(--radius-md);
-  border: 1px solid var(--border-dim);
-  background: var(--bg-surface-soft);
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-card);
+}
+
+.pathwayBody {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
 }
 
 .pathwayTrade {
-  border-color: var(--color-buy-a35);
+  border-color: var(--buy-border);
 }
 
 .pathwayTighten {
-  border-color: var(--accent-purple-a35);
+  border-color: var(--accent-border);
 }
 
 .pathwayTitle {
   margin: 0;
-  font-family: var(--font-display);
-  font-weight: 800;
+  font-weight: 700;
   font-size: var(--text-base);
+  letter-spacing: -0.01em;
   color: var(--text-primary);
 }
 
@@ -93,16 +107,18 @@
 }
 
 .pathwayMaker {
-  color: var(--accent-purple);
-  font-weight: 700;
+  color: var(--accent-hover);
+  font-weight: 600;
 }
 
+/* ── "or" divider ────────────────────────────────────────────── */
 .pathwayDivider {
   display: flex;
   align-items: center;
   justify-content: center;
+  font-family: var(--font-mono);
   font-size: var(--text-xs);
-  letter-spacing: 0.18em;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--text-muted);
 }
@@ -112,16 +128,11 @@
   content: "";
   flex: 1;
   height: 1px;
-  background: var(--border-dim);
+  background: var(--border-subtle);
 }
 
-.pathwayDivider::before {
-  margin-right: var(--space-sm);
-}
-
-.pathwayDivider::after {
-  margin-left: var(--space-sm);
-}
+.pathwayDivider::before { margin-right: var(--space-sm); }
+.pathwayDivider::after  { margin-left: var(--space-sm);  }
 
 @media (min-width: 768px) {
   .pathways {
@@ -130,6 +141,7 @@
 
   .pathwayDivider {
     flex-direction: column;
+    padding: 0 var(--space-xs);
   }
 
   .pathwayDivider::before,
@@ -139,11 +151,6 @@
     flex: 1;
   }
 
-  .pathwayDivider::before {
-    margin: 0 0 var(--space-sm);
-  }
-
-  .pathwayDivider::after {
-    margin: var(--space-sm) 0 0;
-  }
+  .pathwayDivider::before { margin: 0 0 var(--space-sm); }
+  .pathwayDivider::after  { margin: var(--space-sm) 0 0;  }
 }

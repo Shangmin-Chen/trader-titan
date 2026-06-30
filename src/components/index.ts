@@ -15,3 +15,4 @@ export * from "./CopyButton";
 export * from "./TurnBanner";
 export * from "./PhaseStepper";
 export * from "./StepperInput";
+export * from "./ThemeToggle";
