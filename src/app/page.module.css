@@ -1,0 +1,17 @@
+/*
+ * page.module.css — net-new layout styles for page.tsx only.
+ * All game-component styles live in globals.css.
+ */
+
+/** Explainer text rendered below a disabled "Start game" button. */
+.startHint {
+  font-size: 0.75rem;
+  color: var(--color-muted, #888);
+  margin-top: 0.25rem;
+  line-height: 1.4;
+}
+
+/** Wrapper used so PhaseStepper + TurnBanner stack flush above play content. */
+.gameViewStack {
+  display: contents;
+}

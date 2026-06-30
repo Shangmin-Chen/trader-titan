@@ -1,0 +1,28 @@
+/* GameShell — net-new structural styles only.
+ *
+ * The responsive layout grid, mobile-first single-column stacking, and the
+ * .collapsible-region / .bottom-sheet hooks all live in globals.css and are
+ * owned by the design system. This module intentionally does NOT redeclare any
+ * breakpoints or the .game-shell grid; it only adds the sticky status header
+ * that keeps the title + live status in view as the play area scrolls. */
+
+.stickyHeader {
+  position: sticky;
+  top: 0;
+  /* Sit above scrolling panels but below modal/bottom-sheet layers (>= 900). */
+  z-index: 800;
+  /* Opaque-ish surface so play-area content does not bleed through on scroll. */
+  background: var(--bg-deep);
+  background-image: var(--grad-surface);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
+}
+
+/* Respect users who opt out of motion/positional surprises: a sticky header is
+ * still useful, but drop the blur which can cause repaint jank. */
+@media (prefers-reduced-motion: reduce) {
+  .stickyHeader {
+    -webkit-backdrop-filter: none;
+    backdrop-filter: none;
+  }
+}

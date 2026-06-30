@@ -11,16 +11,22 @@ import {
 } from "react";
 import {
   ActionLog,
+  CopyButton,
   CustomAmazonQueryForm,
   CustomSelect,
   GameShell,
   ItemPanel,
+  LiveAnnouncerProvider,
   MarketRangeForm,
+  PhaseStepper,
   Scoreboard,
   SettlementPanel,
   SpreadWidthForm,
   TradeActionPanel,
+  TurnBanner,
   WidthNegotiationPanel,
+  useAnnouncer,
+  type PhaseStep,
 } from "../components";
 import {
   GAME_MODES,
@@ -57,6 +63,47 @@ import {
   type RoomSession,
   type RoomSocketMessage,
 } from "../lib/room-client";
+import styles from "./page.module.css";
+
+// ---------------------------------------------------------------------------
+// Round-flow phase stepper configuration
+// ---------------------------------------------------------------------------
+
+const ROUND_STEPS: PhaseStep[] = [
+  { id: "width", label: "Width" },
+  { id: "negotiate", label: "Negotiate" },
+  { id: "market", label: "Market" },
+  { id: "trade", label: "Trade" },
+  { id: "settle", label: "Settle" },
+];
+
+/**
+ * Maps a game phase to the corresponding round-flow step ID.
+ * Returns null for phases that are outside the per-round flow
+ * (setup, gameOver, unknown).
+ */
+function phaseToStepId(phase: string): string | null {
+  switch (phase) {
+    case "generatingItem":
+    case "proposingWidth":
+      return "width";
+    case "negotiatingWidth":
+      return "negotiate";
+    case "configuringMarket":
+      return "market";
+    case "choosingSide":
+      return "trade";
+    case "settling":
+    case "settlement":
+      return "settle";
+    default:
+      return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Types
+// ---------------------------------------------------------------------------
 
 type ConnectionStatus = "idle" | "connecting" | "connected" | "disconnected";
 type LoadStatus = "loading" | "ready";
@@ -74,7 +121,27 @@ type ClientCommandInput =
   | Readonly<{ type: "SUBMIT_MARKET_QUOTE"; quote: Quote }>
   | Readonly<{ type: "EXECUTE_TRADE"; side: TradeSide }>;
 
+// ---------------------------------------------------------------------------
+// Root export — wraps the tree in LiveAnnouncerProvider so every descendant
+// component (including HomeContent) can call useAnnouncer().
+// ---------------------------------------------------------------------------
+
 export default function Home() {
+  return (
+    <LiveAnnouncerProvider>
+      <HomeContent />
+    </LiveAnnouncerProvider>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// HomeContent — the real page logic (formerly the Home function body).
+// Lives inside LiveAnnouncerProvider so useAnnouncer() is safe to call here.
+// ---------------------------------------------------------------------------
+
+function HomeContent() {
+  const { announce } = useAnnouncer();
+
   const [room, setRoom] = useState<PublicRoomSnapshot | null>(null);
   const [preview, setPreview] = useState<PublicRoomInvitePreview | null>(null);
   const [session, setSession] = useState<RoomSession | null>(null);
@@ -89,6 +156,59 @@ export default function Home() {
   const socketRef = useRef<WebSocket | null>(null);
   const socketRoomId = room?.id ?? null;
   const socketToken = session?.token ?? null;
+
+  // ── Announce errors via the live region (in addition to role="alert") ──
+  useEffect(() => {
+    if (error) {
+      announce(error, "assertive");
+    }
+  }, [error, announce]);
+
+  // ── Announce game-phase transitions ──
+  const prevGamePhaseRef = useRef<string | undefined>(undefined);
+  useEffect(() => {
+    const phase = room?.game?.phase;
+    if (phase === prevGamePhaseRef.current) {
+      return;
+    }
+    const prevPhase = prevGamePhaseRef.current;
+    prevGamePhaseRef.current = phase;
+
+    // Skip the very first mount — no transition has occurred yet.
+    if (prevPhase === undefined) {
+      return;
+    }
+
+    switch (phase) {
+      case "setup":
+        announce("Lobby reset");
+        break;
+      case "generatingItem":
+        announce(`Round ${room?.game?.roundNumber ?? ""}: generating item`);
+        break;
+      case "proposingWidth":
+        announce("Market maker is proposing the spread width");
+        break;
+      case "negotiatingWidth":
+        announce("Trader: tighten or trade on the width");
+        break;
+      case "configuringMarket":
+        announce("Market maker is setting the fixed-width market");
+        break;
+      case "choosingSide":
+        announce("Trader: choose buy or sell");
+        break;
+      case "settling":
+        announce("Trade executed — settling the round");
+        break;
+      case "settlement":
+        announce(`Round ${room?.game?.roundNumber ?? ""} settled`);
+        break;
+      case "gameOver":
+        announce("Game over");
+        break;
+    }
+  }, [room, announce]);
 
   useEffect(() => {
     let cancelled = false;
@@ -310,12 +430,14 @@ export default function Home() {
         saveRoomSession(window.sessionStorage, nextSession);
         setSession(nextSession);
         setConnectionStatus("connecting");
+        announce("Room created. Share the invite link with player B.");
       } else {
         setRoom(null);
         setPreview(response.room);
         const storedSession = loadRoomSession(window.sessionStorage, response.room.id);
         setSession(storedSession);
         setConnectionStatus(storedSession === null ? "idle" : "connecting");
+        announce("Rejoined your existing room.");
       }
 
       window.history.replaceState(
@@ -348,6 +470,7 @@ export default function Home() {
       setConnectionStatus("connecting");
       setRoom(response.room);
       setPreview(previewFromSnapshot(response.room));
+      announce(`Joined room as ${guestName}. Waiting for the host to start the game.`);
     } catch (caughtError) {
       setError(errorMessage(caughtError, "Room could not be joined."));
     } finally {
@@ -450,6 +573,7 @@ export default function Home() {
             canHostControl={canHostControl}
             canStartRoom={canStartRoom}
             connectionStatus={connectionStatus}
+            guestPresent={guestPresent}
             inviteLink={inviteLink}
             isCommanding={isCommanding}
             isHost={isHost}
@@ -509,6 +633,10 @@ export default function Home() {
     </GameShell>
   );
 }
+
+// ---------------------------------------------------------------------------
+// CreateRoomPanel
+// ---------------------------------------------------------------------------
 
 type CreateRoomConfig = Readonly<{
   hostName: string;
@@ -684,6 +812,10 @@ function CreateRoomPanel({ disabled, error, onCreate }: CreateRoomPanelProps) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// JoinRoomPanel
+// ---------------------------------------------------------------------------
+
 type JoinRoomPanelProps = Readonly<{
   disabled: boolean;
   error: string | null;
@@ -776,10 +908,16 @@ function JoinRoomPanel({ disabled, error, room, onJoin }: JoinRoomPanelProps) {
   );
 }
 
+// ---------------------------------------------------------------------------
+// RoomControls
+// ---------------------------------------------------------------------------
+
 type RoomControlsProps = Readonly<{
   canHostControl: boolean;
   canStartRoom: boolean;
   connectionStatus: ConnectionStatus;
+  /** Whether a guest is currently occupying the guest seat. */
+  guestPresent: boolean;
   inviteLink: string;
   isCommanding: boolean;
   isHost: boolean;
@@ -795,6 +933,7 @@ function RoomControls({
   canHostControl,
   canStartRoom,
   connectionStatus,
+  guestPresent,
   inviteLink,
   isCommanding,
   isHost,
@@ -805,9 +944,16 @@ function RoomControls({
   onReset,
   onStart,
 }: RoomControlsProps) {
+  const startHintId = useId();
   const guestLabel = room.seats.guest.occupied
     ? room.seats.guest.displayName
     : "Waiting for player B";
+
+  // Show a hint explaining why Start is disabled when the guest hasn't joined.
+  // Only show the "waiting for player B" copy; don't mention the commanding
+  // state (transient, not user-actionable).
+  const showStartHint =
+    isHost && room.lifecycle === "lobby" && !canStartRoom && !guestPresent;
 
   return (
     <section className="room-controls" data-testid="room-controls">
@@ -828,28 +974,33 @@ function RoomControls({
 
       {isHost ? (
         <div className="invite-box">
-          <label className="form-field__label" htmlFor="room-invite-link">
-            Invite link
-          </label>
-          <input
-            className="form-field__control"
-            id="room-invite-link"
-            readOnly
+          <p className="form-field__label">Invite link</p>
+          <CopyButton
             value={inviteLink}
+            label="Copy invite link"
+            shareTitle="Join my Trader Titan room"
           />
         </div>
       ) : null}
 
       <div className="room-actions">
         {isHost && room.lifecycle === "lobby" ? (
-          <button
-            className="primary-button"
-            disabled={!canStartRoom}
-            onClick={onStart}
-            type="button"
-          >
-            Start game
-          </button>
+          <div>
+            <button
+              aria-describedby={showStartHint ? startHintId : undefined}
+              className="primary-button"
+              disabled={!canStartRoom}
+              onClick={onStart}
+              type="button"
+            >
+              Start game
+            </button>
+            {showStartHint ? (
+              <p className={styles.startHint} id={startHintId}>
+                Waiting for player B to join
+              </p>
+            ) : null}
+          </div>
         ) : null}
 
         {isHost ? (
@@ -887,6 +1038,10 @@ function RoomControls({
   );
 }
 
+// ---------------------------------------------------------------------------
+// RoomGameView
+// ---------------------------------------------------------------------------
+
 type RoomGameViewProps = Readonly<{
   actor: PlayerId | null;
   game: PublicRoomGameState;
@@ -918,6 +1073,13 @@ function RoomGameView({
   onTightenWidth,
   onTradeOnWidth,
 }: RoomGameViewProps) {
+  // Pre-compute the phase stepper element (null for phases outside the round flow).
+  const stepId = phaseToStepId(game.phase);
+  const stepper =
+    stepId !== null ? (
+      <PhaseStepper steps={ROUND_STEPS} currentStepId={stepId} />
+    ) : null;
+
   if (game.phase === "setup") {
     return (
       <section className="phase-panel" data-testid="lobby-panel">
@@ -931,131 +1093,179 @@ function RoomGameView({
   if (game.phase === "generatingItem") {
     if (game.mode === "Amazon" && game.customAmazonQuery === true) {
       return (
-        <CustomAmazonQueryForm
-          disabled={isGeneratingCustomItem || actor !== game.roles.trader}
-          generatorName={game.players[game.roles.trader].name}
-          onSubmit={onCustomAmazonQuerySubmit}
-        />
+        <>
+          {stepper}
+          <CustomAmazonQueryForm
+            disabled={isGeneratingCustomItem || actor !== game.roles.trader}
+            generatorName={game.players[game.roles.trader].name}
+            onSubmit={onCustomAmazonQuerySubmit}
+          />
+        </>
       );
     }
 
     return (
-      <section className="phase-panel" data-testid="generation-panel">
-        <p className="eyebrow">Generating item</p>
-        <h2>Preparing a quantitative market</h2>
-        <p>
-          {game.players[game.roles.marketMaker].name} will propose the first
-          spread width.
-        </p>
-        <div className="loading-line" aria-label="Loading" />
-      </section>
+      <>
+        {stepper}
+        <section className="phase-panel" data-testid="generation-panel">
+          <p className="eyebrow">Generating item</p>
+          <h2>Preparing a quantitative market</h2>
+          <p>
+            {game.players[game.roles.marketMaker].name} will propose the first
+            spread width.
+          </p>
+          <div className="loading-line" aria-label="Loading" />
+        </section>
+      </>
     );
   }
 
   if (game.phase === "proposingWidth") {
+    const isYourTurn = actor === game.roles.marketMaker;
+    const waitingForName = !isYourTurn
+      ? game.players[game.roles.marketMaker].name
+      : undefined;
+
     return (
-      <div className="play-stack">
-        <ItemPanel item={game.item} />
-        <section className="phase-panel">
-          <p className="eyebrow">Opening width</p>
-          <h2>{game.players[game.roles.marketMaker].name}</h2>
-          <SpreadWidthForm
-            disabled={isCommanding || actor !== game.roles.marketMaker}
-            onSubmit={onSubmitInitialWidth}
-            submitLabel="Propose width"
-          />
-          <LastError game={game} />
-        </section>
-      </div>
+      <>
+        {stepper}
+        <TurnBanner isYourTurn={isYourTurn} waitingForName={waitingForName} />
+        <div className="play-stack">
+          <ItemPanel item={game.item} />
+          <section className="phase-panel">
+            <p className="eyebrow">Opening width</p>
+            <h2>{game.players[game.roles.marketMaker].name}</h2>
+            <SpreadWidthForm
+              disabled={isCommanding || actor !== game.roles.marketMaker}
+              onSubmit={onSubmitInitialWidth}
+              submitLabel="Propose width"
+            />
+            <LastError game={game} />
+          </section>
+        </div>
+      </>
     );
   }
 
   if (game.phase === "negotiatingWidth") {
+    const isYourTurn = actor === game.roles.trader;
+    const waitingForName = !isYourTurn
+      ? game.players[game.roles.trader].name
+      : undefined;
+
     return (
-      <div className="play-stack">
-        <ItemPanel item={game.item} />
-        <WidthNegotiationPanel
-          disabled={isCommanding || actor !== game.roles.trader}
-          onTighten={onTightenWidth}
-          onTrade={onTradeOnWidth}
-          players={game.players}
-          roles={game.roles}
-          spreadWidth={game.spreadWidth}
-        />
-        <LastError game={game} />
-      </div>
+      <>
+        {stepper}
+        <TurnBanner isYourTurn={isYourTurn} waitingForName={waitingForName} />
+        <div className="play-stack">
+          <ItemPanel item={game.item} />
+          <WidthNegotiationPanel
+            disabled={isCommanding || actor !== game.roles.trader}
+            onTighten={onTightenWidth}
+            onTrade={onTradeOnWidth}
+            players={game.players}
+            roles={game.roles}
+            spreadWidth={game.spreadWidth}
+          />
+          <LastError game={game} />
+        </div>
+      </>
     );
   }
 
   if (game.phase === "configuringMarket") {
+    const isYourTurn = actor === game.roles.marketMaker;
+    const waitingForName = !isYourTurn
+      ? game.players[game.roles.marketMaker].name
+      : undefined;
+
     return (
-      <div className="play-stack">
-        <ItemPanel item={game.item} />
-        <section className="phase-panel">
-          <p className="eyebrow">Set fixed-width market</p>
-          <h2>{game.players[game.roles.marketMaker].name}</h2>
-          <p>
-            {game.players[game.roles.trader].name} chose to trade on width{" "}
-            {game.spreadWidth}. Set either bid or ask; the other side is
-            generated automatically.
-          </p>
-          <MarketRangeForm
-            disabled={isCommanding || actor !== game.roles.marketMaker}
-            onSubmit={onSubmitMarketQuote}
-            spreadWidth={game.spreadWidth}
-          />
-          <LastError game={game} />
-        </section>
-      </div>
+      <>
+        {stepper}
+        <TurnBanner isYourTurn={isYourTurn} waitingForName={waitingForName} />
+        <div className="play-stack">
+          <ItemPanel item={game.item} />
+          <section className="phase-panel">
+            <p className="eyebrow">Set fixed-width market</p>
+            <h2>{game.players[game.roles.marketMaker].name}</h2>
+            <p>
+              {game.players[game.roles.trader].name} chose to trade on width{" "}
+              {game.spreadWidth}. Set either bid or ask; the other side is
+              generated automatically.
+            </p>
+            <MarketRangeForm
+              disabled={isCommanding || actor !== game.roles.marketMaker}
+              onSubmit={onSubmitMarketQuote}
+              spreadWidth={game.spreadWidth}
+            />
+            <LastError game={game} />
+          </section>
+        </div>
+      </>
     );
   }
 
   if (game.phase === "choosingSide") {
+    const isYourTurn = actor === game.roles.trader;
+    const waitingForName = !isYourTurn
+      ? game.players[game.roles.trader].name
+      : undefined;
+
     return (
-      <div className="play-stack">
-        <ItemPanel item={game.item} />
-        <TradeActionPanel
-          disabled={isCommanding || actor !== game.roles.trader}
-          onBuy={() => onExecuteTrade("BUY")}
-          onSell={() => onExecuteTrade("SELL")}
-          players={game.players}
-          quote={game.quote}
-          roles={game.roles}
-        />
-        <LastError game={game} />
-      </div>
+      <>
+        {stepper}
+        <TurnBanner isYourTurn={isYourTurn} waitingForName={waitingForName} />
+        <div className="play-stack">
+          <ItemPanel item={game.item} />
+          <TradeActionPanel
+            disabled={isCommanding || actor !== game.roles.trader}
+            onBuy={() => onExecuteTrade("BUY")}
+            onSell={() => onExecuteTrade("SELL")}
+            players={game.players}
+            quote={game.quote}
+            roles={game.roles}
+          />
+          <LastError game={game} />
+        </div>
+      </>
     );
   }
 
   if (game.phase === "settling") {
     return (
-      <div className="play-stack">
-        <ItemPanel item={game.item} />
-        <section className="phase-panel" data-testid="settling-panel">
-          <p className="eyebrow">Settling trade</p>
-          <h2>
-            {game.players[game.roles.trader].name} chose{" "}
-            {game.pendingSide === "BUY" ? "Buy" : "Sell"}
-          </h2>
-          <p>The server is revealing the true value and computing PnL.</p>
-          <div className="loading-line" aria-label="Loading" />
-        </section>
-      </div>
+      <>
+        {stepper}
+        <div className="play-stack">
+          <ItemPanel item={game.item} />
+          <section className="phase-panel" data-testid="settling-panel">
+            <p className="eyebrow">Settling trade</p>
+            <h2>
+              {game.players[game.roles.trader].name} chose{" "}
+              {game.pendingSide === "BUY" ? "Buy" : "Sell"}
+            </h2>
+            <p>The server is revealing the true value and computing PnL.</p>
+            <div className="loading-line" aria-label="Loading" />
+          </section>
+        </div>
+      </>
     );
   }
 
   if (game.phase === "settlement") {
     return (
-      <div className="play-stack">
-        <ItemPanel item={game.item} revealTrueValue />
-        <SettlementPanel
-          disabled={isCommanding || !isHost}
-          isFinalRound={game.roundNumber >= game.totalRounds}
-          onContinue={onAdvanceRound}
-          players={game.players}
-          settlement={game.settlement}
-        />
-      </div>
+      <>
+        {stepper}
+        <div className="play-stack">
+          <ItemPanel item={game.item} revealTrueValue />
+          <SettlementPanel
+            disabled={isCommanding || !isHost}
+            isFinalRound={game.roundNumber >= game.totalRounds}
+            onContinue={onAdvanceRound}
+            players={game.players}
+            settlement={game.settlement}
+          />
+        </div>
+      </>
     );
   }
 
@@ -1111,6 +1321,10 @@ function RoomGameView({
   );
 }
 
+// ---------------------------------------------------------------------------
+// LastError
+// ---------------------------------------------------------------------------
+
 type LastErrorProps = Readonly<{
   game: PublicRoomGameState;
 }>;
@@ -1122,6 +1336,10 @@ function LastError({ game }: LastErrorProps) {
     </p>
   ) : null;
 }
+
+// ---------------------------------------------------------------------------
+// Pure helpers
+// ---------------------------------------------------------------------------
 
 function buildStartPayload(input: {
   hostName: string;

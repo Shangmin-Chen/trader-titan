@@ -3,6 +3,7 @@ import {
   type PublicGeneratedItem,
   type SettledGeneratedItem,
 } from "../lib/game";
+import styles from "./ItemPanel.module.css";
 
 export type ItemPanelProps = {
   item: PublicGeneratedItem | SettledGeneratedItem;
@@ -54,6 +55,7 @@ export function ItemPanel({ item, revealTrueValue = false }: ItemPanelProps) {
                 target="_blank"
                 rel="noopener noreferrer"
                 className="amazon-link"
+                aria-label="View Amazon search for this item (opens in a new tab)"
               >
                 View Search on Amazon
               </a>
@@ -62,16 +64,22 @@ export function ItemPanel({ item, revealTrueValue = false }: ItemPanelProps) {
         ) : null}
 
         {scrapedItems && scrapedItems.length > 0 ? (
-          <div className="item-panel__detail" style={{ flexDirection: "column", alignItems: "stretch" }}>
+          <div className={`item-panel__detail ${styles.scrapedDetail}`}>
             <dt>Scraped Listings (First Is Source Of Truth)</dt>
             <dd>
-              <ul className="scraped-items-list">
+              <ul
+                className="scraped-items-list"
+                aria-label="Scraped Amazon listings, first item is the source of truth"
+              >
                 {scrapedItems.map((scraped, i) => (
-                  <li key={i} className={i === 0 ? "source-of-truth" : ""}>
+                  <li
+                    key={i}
+                    className={`${styles.scrapedItem} ${i === 0 ? "source-of-truth" : ""}`}
+                  >
                     <span className="scraped-item-title" title={scraped.title}>
                       {scraped.title}
                     </span>
-                    <span style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                    <span className={styles.priceGroup}>
                       <span className="scraped-item-price">
                         ${formatPreciseNumber(scraped.price)}
                       </span>

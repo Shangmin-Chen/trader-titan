@@ -1,0 +1,124 @@
+/* SettlementPanel — prominent, instantly legible win/loss readout.
+   Outcome is conveyed by MULTIPLE redundant cues (sign + word + icon + color),
+   never color alone. */
+
+.result {
+  display: flex;
+  align-items: center;
+  gap: var(--space-md);
+  padding: var(--space-md) var(--space-lg);
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--border-mid);
+  background: var(--bg-surface-soft);
+}
+
+.result[data-outcome="win"] {
+  border-color: rgba(16, 185, 129, 0.45);
+  background: var(--color-buy-glow);
+  box-shadow: var(--glow-buy);
+}
+
+.result[data-outcome="loss"] {
+  border-color: rgba(244, 63, 94, 0.45);
+  background: var(--color-sell-glow);
+  box-shadow: var(--glow-sell);
+}
+
+.result[data-outcome="even"] {
+  border-color: var(--border-mid);
+  background: var(--bg-surface-soft);
+}
+
+.resultIcon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: var(--radius-pill);
+  font-size: 1.25rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.result[data-outcome="win"] .resultIcon {
+  color: var(--color-buy);
+  background: rgba(16, 185, 129, 0.15);
+}
+
+.result[data-outcome="loss"] .resultIcon {
+  color: var(--color-sell);
+  background: rgba(244, 63, 94, 0.15);
+}
+
+.result[data-outcome="even"] .resultIcon {
+  color: var(--color-warn);
+  background: rgba(245, 158, 11, 0.15);
+}
+
+.resultBody {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.resultLabel {
+  margin: 0;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--text-secondary);
+}
+
+.resultValue {
+  margin: 0;
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-xs);
+  flex-wrap: wrap;
+}
+
+.resultWord {
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  font-weight: 700;
+}
+
+.resultAmount {
+  font-family: var(--font-mono);
+  font-size: var(--text-xl);
+  font-weight: 700;
+}
+
+.result[data-outcome="win"] .resultWord,
+.result[data-outcome="win"] .resultAmount {
+  color: var(--color-buy);
+}
+
+.result[data-outcome="loss"] .resultWord,
+.result[data-outcome="loss"] .resultAmount {
+  color: var(--color-sell);
+}
+
+.result[data-outcome="even"] .resultWord,
+.result[data-outcome="even"] .resultAmount {
+  color: var(--text-primary);
+}
+
+/* Directional glyph on PnL detail rows: a non-color sign cue that survives
+   the player-identity (cyan/magenta) coloring applied in globals.css. */
+.pnlArrow {
+  font-size: 0.85em;
+  margin-right: 4px;
+  vertical-align: baseline;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .result {
+    box-shadow: none;
+  }
+}

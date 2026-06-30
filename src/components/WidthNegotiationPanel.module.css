@@ -1,0 +1,149 @@
+/* Width negotiation: make the current width prominent and clearly split the
+   trader's two pathways (trade now vs. tighten and hand back to the maker). */
+
+.widthSpotlight {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2xs);
+  padding: var(--space-md) var(--space-lg);
+  border-radius: var(--radius-lg);
+  border: 1px solid rgba(0, 210, 255, 0.18);
+  background: rgba(0, 210, 255, 0.07);
+  text-align: center;
+}
+
+.widthSpotlightLabel {
+  font-size: var(--text-xs);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.widthSpotlightValue {
+  font-family: var(--font-mono);
+  font-weight: 800;
+  font-size: var(--text-2xl);
+  line-height: 1.1;
+  color: var(--accent-cyan);
+}
+
+.widthSpotlightHint {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+.prompt {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: var(--text-md);
+  color: var(--text-primary);
+}
+
+.waitNotice {
+  margin: 0;
+  padding: var(--space-sm) var(--space-md);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-mid);
+  background: var(--bg-surface-soft);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+/* Two clearly separated decision paths. */
+.pathways {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--space-sm);
+  align-items: stretch;
+}
+
+.pathway {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-sm);
+  padding: var(--space-md);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-dim);
+  background: var(--bg-surface-soft);
+}
+
+.pathwayTrade {
+  border-color: rgba(16, 185, 129, 0.35);
+}
+
+.pathwayTighten {
+  border-color: rgba(139, 92, 246, 0.35);
+}
+
+.pathwayTitle {
+  margin: 0;
+  font-family: var(--font-display);
+  font-weight: 800;
+  font-size: var(--text-base);
+  color: var(--text-primary);
+}
+
+.pathwayCopy {
+  margin: 0;
+  font-size: var(--text-sm);
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.pathwayMaker {
+  color: var(--accent-purple);
+  font-weight: 700;
+}
+
+.pathwayDivider {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--text-xs);
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.pathwayDivider::before,
+.pathwayDivider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: var(--border-dim);
+}
+
+.pathwayDivider::before {
+  margin-right: var(--space-sm);
+}
+
+.pathwayDivider::after {
+  margin-left: var(--space-sm);
+}
+
+@media (min-width: 720px) {
+  .pathways {
+    grid-template-columns: 1fr auto 1fr;
+  }
+
+  .pathwayDivider {
+    flex-direction: column;
+  }
+
+  .pathwayDivider::before,
+  .pathwayDivider::after {
+    width: 1px;
+    height: auto;
+    flex: 1;
+  }
+
+  .pathwayDivider::before {
+    margin: 0 0 var(--space-sm);
+  }
+
+  .pathwayDivider::after {
+    margin: var(--space-sm) 0 0;
+  }
+}
