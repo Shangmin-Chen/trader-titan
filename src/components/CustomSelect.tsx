@@ -211,15 +211,16 @@ export function CustomSelect({
 
   return (
     <div className="form-field form-field--custom-select" ref={containerRef}>
-      {/* Label linked to the visually hidden select element */}
-      <label id={labelId} className="form-field__label" htmlFor={id}>
+      {/* Label — not associated with the native select via htmlFor; AT labeling
+          is handled by aria-labelledby on the combobox trigger. */}
+      <label id={labelId} className="form-field__label">
         {label}
       </label>
 
       <div style={{ position: "relative" }}>
         {/* Visually hidden native select element for Playwright e2e tests & native forms */}
         <select
-          id={id}
+          id={`${baseId}-native`}
           name={name}
           value={value}
           onChange={(e) => onChange(e.target.value)}
@@ -288,7 +289,6 @@ export function CustomSelect({
                 ref={listboxRef}
                 className="custom-select__listbox"
                 aria-label={label}
-                aria-activedescendant={activeDescendantId}
               >
                 {options.map((opt, idx) => {
                   const isSelected = opt.value === value;

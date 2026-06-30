@@ -71,8 +71,6 @@ export function LiveAnnouncerProvider({ children }: LiveAnnouncerProviderProps) 
         {politeMessage}
       </div>
       <div
-        aria-live="assertive"
-        aria-atomic="true"
         role="alert"
         className="announcer"
         data-testid="announcer-assertive"

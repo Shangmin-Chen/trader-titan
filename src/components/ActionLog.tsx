@@ -31,7 +31,7 @@ export function ActionLog({
 
   return (
     <section className="action-log" data-testid="action-log">
-      <h2 className={`action-log__title ${styles.title}`}>Action log</h2>
+      <h2 className={`action-log__title ${styles.title}`} aria-hidden="true">Action log</h2>
 
       <button
         type="button"
@@ -45,12 +45,6 @@ export function ActionLog({
           {expanded ? "▾" : "▸"}
         </span>
       </button>
-
-      {/* Polite live region: announces only the newest entry, kept separate
-          from the visible list so the whole list is never re-read. */}
-      <div className="sr-only" aria-live="polite" aria-atomic="true">
-        {latest ? describeEntry(latest) : ""}
-      </div>
 
       <div
         id={bodyId}
@@ -70,6 +64,14 @@ export function ActionLog({
         ) : (
           <p className="action-log__empty">{emptyMessage}</p>
         )}
+      </div>
+
+      {/* Polite live region: announces only the newest entry, kept separate
+          from the visible list so the whole list is never re-read.
+          Positioned after the body so it does not break the adjacent-sibling
+          selector `.collapsible-region__toggle[aria-expanded="false"] + .collapsible-region__body`. */}
+      <div className="sr-only" aria-live="polite" aria-atomic="true">
+        {latest ? describeEntry(latest) : ""}
       </div>
     </section>
   );

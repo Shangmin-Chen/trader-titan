@@ -14,7 +14,7 @@
 }
 
 .chevron {
-  font-size: 0.85em;
+  font-size: var(--text-xs);
   line-height: 1;
   color: var(--text-secondary);
 }
@@ -38,7 +38,7 @@
 
   /* Override the global collapse rule so the body is always visible. */
   .body {
-    display: block !important;
+    display: block;
     margin-top: 0;
   }
 }

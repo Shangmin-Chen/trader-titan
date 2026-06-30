@@ -85,6 +85,44 @@ test.describe("Cloudflare room invite flow", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// Mobile viewport + a11y smoke tests
+// These are network-independent page-load assertions; they require the dev
+// server to be running (same as the suite above) but do not execute any game
+// flow steps.
+// ---------------------------------------------------------------------------
+test.describe("Mobile viewport and a11y smoke", () => {
+  test("main lobby panel is visible on a 375×812 mobile viewport", async ({
+    browser,
+    baseURL,
+  }) => {
+    const context = await browser.newContext({
+      baseURL,
+      viewport: { width: 375, height: 812 },
+      userAgent:
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 15_0 like Mac OS X) " +
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) " +
+        "Version/15.0 Mobile/15E148 Safari/604.1",
+    });
+    const page = await context.newPage();
+    await page.goto("/");
+    // The create-room form is the primary panel visible to a first-time visitor
+    // on mobile; its presence confirms the shell renders correctly at 375 px.
+    await expect(page.getByTestId("create-room-form")).toBeVisible();
+    await context.close();
+  });
+
+  test("a11y smoke: a skip-navigation link is present after page load", async ({
+    page,
+  }) => {
+    await page.goto("/");
+    // The skip link allows keyboard/AT users to bypass repeated nav content.
+    // It must exist in the DOM regardless of whether it is visually hidden.
+    const skipLink = page.locator(".skip-link");
+    await expect(skipLink).toHaveCount(1);
+  });
+});
+
 async function createAndJoinRoom(
   browser: Browser,
   baseURL: string | undefined,

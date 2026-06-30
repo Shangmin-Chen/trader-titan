@@ -99,6 +99,7 @@ export function CopyButton({
     if (nav && typeof nav.share === "function") {
       try {
         await nav.share({ title: shareTitle, text: shareTitle, url: value });
+        flagCopied();
         return;
       } catch {
         // User cancelled or share failed — fall through to clipboard copy.

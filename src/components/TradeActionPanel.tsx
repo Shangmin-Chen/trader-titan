@@ -1,5 +1,6 @@
 "use client";
 
+import { useId } from "react";
 import {
   formatNumber,
   formatQuote,
@@ -27,6 +28,10 @@ export function TradeActionPanel({
   quote,
   roles,
 }: TradeActionPanelProps) {
+  const descBase = useId();
+  const buyDescId = `${descBase}-buy`;
+  const sellDescId = `${descBase}-sell`;
+
   const traderName = players[roles.trader].name;
   const askLabel = formatNumber(quote.ask);
   const bidLabel = formatNumber(quote.bid);
@@ -62,10 +67,10 @@ export function TradeActionPanel({
       </div>
 
       {/* Hidden descriptions tie each button to its quote side for assistive tech */}
-      <span id="trade-action-buy-desc" className={styles.srOnly}>
+      <span id={buyDescId} className="sr-only">
         Buy at the ask price of {askLabel}.
       </span>
-      <span id="trade-action-sell-desc" className={styles.srOnly}>
+      <span id={sellDescId} className="sr-only">
         Sell at the bid price of {bidLabel}.
       </span>
 
@@ -80,8 +85,8 @@ export function TradeActionPanel({
         aria-label="Trading actions"
       >
         <button
-          aria-describedby="trade-action-sell-desc"
-          className={`trading-panel__button trading-panel__button--sell ${styles.button} ${styles.buttonSell}`}
+          aria-describedby={sellDescId}
+          className={`trading-panel__button trading-panel__button--sell ${styles.button}`}
           disabled={disabled}
           onClick={onSell}
           type="button"
@@ -103,8 +108,8 @@ export function TradeActionPanel({
           </span>
         </button>
         <button
-          aria-describedby="trade-action-buy-desc"
-          className={`trading-panel__button trading-panel__button--buy ${styles.button} ${styles.buttonBuy}`}
+          aria-describedby={buyDescId}
+          className={`trading-panel__button trading-panel__button--buy ${styles.button}`}
           disabled={disabled}
           onClick={onBuy}
           type="button"

@@ -51,6 +51,7 @@ export function TurnBanner({
       role="status"
       aria-live="polite"
       aria-atomic="true"
+      data-testid="turn-banner"
       data-your-turn={isYourTurn ? "true" : "false"}
     >
       <span aria-hidden="true">{icon}</span>

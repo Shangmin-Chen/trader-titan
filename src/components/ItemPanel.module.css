@@ -11,7 +11,7 @@
 .priceGroup {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-xs);
 }
 
 /* Allow each listing row to wrap so the title can truncate while the
@@ -21,7 +21,7 @@
   gap: var(--space-xs);
 }
 
-@media (max-width: 480px) {
+@media (max-width: 767px) {
   /* Stack title above the price group; price + badge remain on their
      own line and stay fully visible even as the title truncates. */
   .priceGroup {

@@ -201,9 +201,20 @@ function HomeContent() {
       case "settling":
         announce("Trade executed — settling the round");
         break;
-      case "settlement":
-        announce(`Round ${room?.game?.roundNumber ?? ""} settled`);
+      case "settlement": {
+        const g = room?.game;
+        if (g?.phase === "settlement") {
+          const traderName = g.players[g.settlement.trader].name;
+          const pnl = g.settlement.traderPnL;
+          const outcome = pnl > 0 ? "Profit" : pnl < 0 ? "Loss" : "Break even";
+          announce(
+            `Round ${g.roundNumber} settled. ${traderName} trader: ${outcome} ${formatSignedNumber(pnl)}`,
+          );
+        } else {
+          announce(`Round ${room?.game?.roundNumber ?? ""} settled`);
+        }
         break;
+      }
       case "gameOver":
         announce("Game over");
         break;
@@ -512,7 +523,7 @@ function HomeContent() {
   }
 
   const status = (
-    <div className="status-strip" aria-live="polite">
+    <div className="status-strip">
       <span className={`phase-chip phase-chip--${game?.phase ?? "setup"}`}>
         {phaseLabel(game?.phase ?? "setup")}
       </span>

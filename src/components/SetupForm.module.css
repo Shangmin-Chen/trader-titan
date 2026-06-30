@@ -1,20 +1,5 @@
 /* SetupForm — scoped styles for the legacy SetupForm component. */
 
-/* Checkbox row: spans both grid columns and lays its children out inline. */
-.checkboxRow {
-  grid-column: span 2;
-  flex-direction: row;
-  align-items: center;
-  gap: 10px;
-}
-
-/* Checkbox control sizing and pointer cursor. */
-.checkboxInput {
-  width: 20px;
-  height: 20px;
-  cursor: pointer;
-}
-
 /* Checkbox label — inline flex so it vertically centres against the control. */
 .checkboxLabel {
   cursor: pointer;

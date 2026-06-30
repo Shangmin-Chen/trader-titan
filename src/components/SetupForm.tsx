@@ -190,13 +190,13 @@ export function SetupForm({
           ) : null}
 
           {mode === "Amazon" ? (
-            <div className={`form-field form-field--checkbox ${styles.checkboxRow}`}>
+            <div className="form-field room-checkbox-field">
               <input
                 id={`${formId}-custom-amazon`}
                 type="checkbox"
                 checked={customAmazonQuery}
                 onChange={(e) => setCustomAmazonQuery(e.target.checked)}
-                className={`form-field__checkbox ${styles.checkboxInput}`}
+                className="form-field__checkbox"
               />
               <label className={`form-field__label ${styles.checkboxLabel}`} htmlFor={`${formId}-custom-amazon`}>
                 Player-entered Amazon product query (instead of Gemini)

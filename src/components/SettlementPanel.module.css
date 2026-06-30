@@ -34,10 +34,10 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 40px;
-  height: 40px;
+  width: 40px; /* --size-icon-md: 40px -- no token yet */
+  height: 40px; /* --size-icon-md: 40px -- no token yet */
   border-radius: var(--radius-pill);
-  font-size: 1.25rem;
+  font-size: var(--text-lg);
   font-weight: 700;
   line-height: 1;
 }
@@ -112,7 +112,7 @@
 /* Directional glyph on PnL detail rows: a non-color sign cue that survives
    the player-identity (cyan/magenta) coloring applied in globals.css. */
 .pnlArrow {
-  font-size: 0.85em;
+  font-size: var(--text-xs);
   margin-right: 4px;
   vertical-align: baseline;
 }
