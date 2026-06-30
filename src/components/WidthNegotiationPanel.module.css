@@ -70,11 +70,11 @@
 }
 
 .pathwayTrade {
-  border-color: rgba(16, 185, 129, 0.35);
+  border-color: var(--color-buy-a35);
 }
 
 .pathwayTighten {
-  border-color: rgba(139, 92, 246, 0.35);
+  border-color: var(--accent-purple-a35);
 }
 
 .pathwayTitle {
