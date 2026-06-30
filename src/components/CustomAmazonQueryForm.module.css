@@ -1,0 +1,19 @@
+/* CustomAmazonQueryForm — net-new presentational styles only.
+ *
+ * The form scaffolding (.setup-form, .form-field, .setup-form__grid--single,
+ * .setup-form__submit, .eyebrow) lives in globals.css and is owned by the
+ * design system. This module only de-inlines the handful of one-off overrides
+ * that were previously applied via inline style props, so the component renders
+ * with zero inline styles while staying mobile-first and single-column. */
+
+/* "Other player should look away" privacy notice. Rendered with role="note"
+ * so assistive tech announces it as an aside. Magenta keeps it visually
+ * distinct from the cyan eyebrow default. */
+.notice {
+  color: var(--accent-magenta);
+  margin-bottom: var(--space-md);
+}
+
+.submit {
+  margin-top: var(--space-lg);
+}

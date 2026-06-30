@@ -10,6 +10,8 @@ import {
   type Quote,
   type ValidationResult,
 } from "../lib/game";
+import { StepperInput } from "./StepperInput";
+import styles from "./MarketRangeForm.module.css";
 
 export type MarketRangeFormProps = {
   disabled?: boolean;
@@ -72,40 +74,45 @@ export function MarketRangeForm({
           Set {formatNumber(spreadWidth)} wide market
         </legend>
 
-        <div className="market-maker-form__grid">
-          <div className="form-field">
-            <label className="form-field__label" htmlFor={`${formId}-bid`}>
-              Bid
-            </label>
-            <input
-              aria-describedby={validation.ok ? undefined : errorId}
-              aria-invalid={!validation.ok}
-              className="form-field__control"
-              id={`${formId}-bid`}
-              inputMode="decimal"
-              name="bid"
-              onChange={(event) => setFromBid(event.target.value)}
-              type="number"
-              value={bidInput}
-            />
+        {/* Spread linkage banner — visual connector showing Bid and Ask share
+            a fixed spread width, with a hint that editing one auto-fills the other */}
+        <div className={styles.spreadBanner}>
+          <div className={styles.spreadBannerRow}>
+            <span className={styles.spreadBannerLine} aria-hidden="true" />
+            <span className={styles.spreadBannerLabel}>
+              Spread width: {formatNumber(spreadWidth)}
+            </span>
+            <span className={styles.spreadBannerLine} aria-hidden="true" />
           </div>
+          <p className={styles.spreadHint}>
+            Setting one side auto-fills the other
+          </p>
+        </div>
 
-          <div className="form-field">
-            <label className="form-field__label" htmlFor={`${formId}-ask`}>
-              Ask
-            </label>
-            <input
-              aria-describedby={validation.ok ? undefined : errorId}
-              aria-invalid={!validation.ok}
-              className="form-field__control"
-              id={`${formId}-ask`}
-              inputMode="decimal"
-              name="ask"
-              onChange={(event) => setFromAsk(event.target.value)}
-              type="number"
-              value={askInput}
-            />
-          </div>
+        <div className="market-maker-form__grid">
+          <StepperInput
+            label="Bid"
+            id={`${formId}-bid`}
+            name="bid"
+            value={bidInput}
+            onChange={setFromBid}
+            inputMode="decimal"
+            ariaDescribedby={validation.ok ? undefined : errorId}
+            ariaInvalid={!validation.ok}
+            disabled={disabled}
+          />
+
+          <StepperInput
+            label="Ask"
+            id={`${formId}-ask`}
+            name="ask"
+            value={askInput}
+            onChange={setFromAsk}
+            inputMode="decimal"
+            ariaDescribedby={validation.ok ? undefined : errorId}
+            ariaInvalid={!validation.ok}
+            disabled={disabled}
+          />
         </div>
 
         {!validation.ok ? (

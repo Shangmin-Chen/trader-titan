@@ -1,0 +1,65 @@
+/* ============================================================
+   MarketRangeForm — S9: linked Bid/Ask with live derivation
+   Net-new styles only. Grid layout stays in globals.css under
+   .market-maker-form__grid.
+   ============================================================ */
+
+/* ---- Spread linkage banner ----------------------------------- */
+
+/*
+ * A horizontal row: gradient-line ─── [Spread width: X badge] ─── gradient-line
+ * Sits between the legend and the two field columns, spanning full width,
+ * making it obvious that Bid and Ask share a fixed spread.
+ */
+.spreadBanner {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--space-2xs);
+  margin-bottom: var(--space-sm);
+}
+
+.spreadBannerRow {
+  display: flex;
+  align-items: center;
+  width: 100%;
+  gap: var(--space-xs);
+}
+
+/* Gradient fade lines extending from the badge to each edge */
+.spreadBannerLine {
+  flex: 1;
+  height: 1px;
+}
+
+.spreadBannerLine:first-child {
+  background: linear-gradient(to right, transparent, var(--border-mid));
+}
+
+.spreadBannerLine:last-child {
+  background: linear-gradient(to left, transparent, var(--border-mid));
+}
+
+/* Pill badge showing the spread width value */
+.spreadBannerLabel {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--accent-cyan);
+  white-space: nowrap;
+  padding: 2px var(--space-xs);
+  border: 1px solid var(--accent-cyan-a30);
+  border-radius: var(--radius-pill);
+  background: var(--accent-cyan-a08);
+  letter-spacing: 0.04em;
+}
+
+/* Smaller italic hint explaining auto-fill behaviour */
+.spreadHint {
+  font-size: var(--text-xs);
+  color: var(--text-muted);
+  text-align: center;
+  font-style: italic;
+  margin: 0;
+  line-height: 1.4;
+}

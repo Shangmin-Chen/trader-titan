@@ -10,6 +10,7 @@ import {
   type StartGamePayload,
 } from "../lib/game";
 import { CustomSelect } from "./CustomSelect";
+import styles from "./SetupForm.module.css";
 
 type SetupFieldErrors = Partial<
   Record<"playerAName" | "playerBName" | "mode" | "totalRounds", string>
@@ -189,16 +190,15 @@ export function SetupForm({
           ) : null}
 
           {mode === "Amazon" ? (
-            <div className="form-field form-field--checkbox" style={{ gridColumn: "span 2", flexDirection: "row", alignItems: "center", gap: "10px" }}>
+            <div className="form-field room-checkbox-field">
               <input
                 id={`${formId}-custom-amazon`}
                 type="checkbox"
                 checked={customAmazonQuery}
                 onChange={(e) => setCustomAmazonQuery(e.target.checked)}
                 className="form-field__checkbox"
-                style={{ width: "20px", height: "20px", cursor: "pointer" }}
               />
-              <label className="form-field__label" htmlFor={`${formId}-custom-amazon`} style={{ cursor: "pointer", userSelect: "none", display: "flex", alignItems: "center", height: "100%" }}>
+              <label className={`form-field__label ${styles.checkboxLabel}`} htmlFor={`${formId}-custom-amazon`}>
                 Player-entered Amazon product query (instead of Gemini)
               </label>
             </div>

@@ -6,40 +6,40 @@
   --bg-surface: #0f1324;
   --bg-surface-soft: #161d33;
   --bg-surface-elevated: #1f2845;
-  
+
   --border-dim: #1d263b;
   --border-mid: #2a3759;
   --border-focus: #00d2ff;
-  
-  /* Text colors */
+
+  /* Text colors (tuned for WCAG AA body text on dark surfaces) */
   --text-primary: #f8fafc;
-  --text-secondary: #94a3b8;
-  --text-muted: #8097b6;
-  
+  --text-secondary: #a8b4c8;
+  --text-muted: #9aa7bd;
+
   /* Accent colors */
   --accent-cyan: #00d2ff;
   --accent-blue: #3b82f6;
   --accent-magenta: #ec4899;
   --accent-purple: #8b5cf6;
-  
+
   /* Trading colors */
   --color-buy: #10b981;
   --color-buy-hover: #059669;
   --color-buy-glow: rgba(16, 185, 129, 0.2);
-  
+
   --color-sell: #f43f5e;
   --color-sell-hover: #e11d48;
   --color-sell-glow: rgba(244, 63, 94, 0.2);
-  
+
   --color-warn: #f59e0b;
-  
+
   /* Gradients */
   --grad-cyan-blue: linear-gradient(135deg, #00d2ff 0%, #3b82f6 100%);
   --grad-magenta-purple: linear-gradient(135deg, #ec4899 0%, #8b5cf6 100%);
   --grad-surface: linear-gradient(180deg, #111729 0%, #080c18 100%);
   --grad-buy: linear-gradient(135deg, #10b981 0%, #059669 100%);
   --grad-sell: linear-gradient(135deg, #f43f5e 0%, #be123c 100%);
-  
+
   /* Shadows & Glows */
   --shadow-sm: 0 4px 12px rgba(0, 0, 0, 0.4);
   --shadow-md: 0 12px 32px rgba(0, 0, 0, 0.6);
@@ -47,11 +47,69 @@
   --glow-cyan: 0 0 16px rgba(0, 210, 255, 0.2);
   --glow-buy: 0 0 20px rgba(16, 185, 129, 0.25);
   --glow-sell: 0 0 20px rgba(244, 63, 94, 0.25);
-  
+
   /* Typography */
   --font-display: 'Outfit', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --font-sans: 'Space Grotesk', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   --font-mono: 'JetBrains Mono', monospace;
+
+  /* Spacing scale (mobile-first, used throughout) */
+  --space-2xs: 4px;
+  --space-xs: 8px;
+  --space-sm: 12px;
+  --space-md: 16px;
+  --space-lg: 24px;
+  --space-xl: 32px;
+  --space-2xl: 48px;
+
+  /* Fluid type scale via clamp() so type scales down on phones */
+  --text-2xs: clamp(0.65rem, 0.62rem + 0.1vw, 0.72rem);
+  --text-xs: clamp(0.68rem, 0.66rem + 0.1vw, 0.75rem);
+  --text-sm: clamp(0.8rem, 0.77rem + 0.15vw, 0.875rem);
+  --text-base: clamp(0.9rem, 0.86rem + 0.2vw, 1rem);
+  --text-md: clamp(1rem, 0.95rem + 0.25vw, 1.1rem);
+  --text-lg: clamp(1.1rem, 1.02rem + 0.4vw, 1.35rem);
+  --text-xl: clamp(1.25rem, 1.12rem + 0.6vw, 1.6rem);
+  --text-2xl: clamp(1.5rem, 1.25rem + 1.1vw, 2.2rem);
+  --text-display: clamp(1.8rem, 1.4rem + 2vw, 2.6rem);
+
+  /* Radii */
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-pill: 99px;
+
+  /* Minimum interactive target (WCAG 2.5.5 / mobile ergonomics) */
+  --tap-target: 44px;
+  --size-icon-md: 40px;
+
+  /* Motion */
+  --transition-fast: 0.15s cubic-bezier(0.4, 0, 0.2, 1);
+  --transition-base: 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* Safe-area insets (notches / home indicators) */
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-right: env(safe-area-inset-right, 0px);
+  --safe-bottom: env(safe-area-inset-bottom, 0px);
+  --safe-left: env(safe-area-inset-left, 0px);
+
+  /* Alpha-variant tokens for module use */
+  --color-sell-a08: rgba(244, 63, 94, 0.08);
+  --color-sell-a15: rgba(244, 63, 94, 0.15);
+  --color-sell-a40: rgba(244, 63, 94, 0.40);
+  --color-sell-a45: rgba(244, 63, 94, 0.45);
+  --color-buy-a08: rgba(16, 185, 129, 0.08);
+  --color-buy-a15: rgba(16, 185, 129, 0.15);
+  --color-buy-a35: rgba(16, 185, 129, 0.35);
+  --color-buy-a40: rgba(16, 185, 129, 0.40);
+  --color-buy-a45: rgba(16, 185, 129, 0.45);
+  --accent-purple-a15: rgba(139, 92, 246, 0.15);
+  --accent-purple-a35: rgba(139, 92, 246, 0.35);
+  --color-warn-a15: rgba(245, 158, 11, 0.15);
+  --accent-cyan-a07: rgba(0, 210, 255, 0.07);
+  --accent-cyan-a08: rgba(0, 210, 255, 0.08);
+  --accent-cyan-a18: rgba(0, 210, 255, 0.18);
+  --accent-cyan-a30: rgba(0, 210, 255, 0.30);
 }
 
 * {
@@ -63,6 +121,8 @@ html {
   background: var(--bg-deep);
   color-scheme: dark;
   scroll-behavior: smooth;
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 body {
@@ -71,6 +131,7 @@ body {
   color: var(--text-primary);
   background: radial-gradient(circle at 50% 0%, #10162e 0%, var(--bg-deep) 70%);
   font-family: var(--font-sans);
+  font-size: var(--text-base);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }
@@ -87,11 +148,13 @@ button,
 input,
 select {
   font-family: var(--font-sans);
+  font-size: var(--text-base);
 }
 
 button {
   cursor: pointer;
-  transition: all 0.2s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: transform var(--transition-base), box-shadow var(--transition-base),
+    background-color var(--transition-base), border-color var(--transition-base), color var(--transition-base);
 }
 
 button:disabled,
@@ -115,38 +178,77 @@ dd {
   margin-inline-start: 0;
 }
 
-/* Keyboard A11y Focus Indicators */
+/* Keyboard A11y Focus Indicators (consolidated) */
 button:focus-visible,
 input:focus-visible,
 select:focus-visible,
-a:focus-visible {
+a:focus-visible,
+[tabindex]:focus-visible,
+.custom-select__trigger:focus-visible,
+.copy-button:focus-visible,
+.quick-chip:focus-visible,
+.stepper-input__button:focus-visible,
+.sticky-action-bar button:focus-visible {
   outline: 2px solid var(--accent-cyan) !important;
   outline-offset: 3px !important;
   box-shadow: 0 0 0 4px rgba(0, 210, 255, 0.25) !important;
 }
 
+/* Skip link - visually hidden until focused */
+.skip-link {
+  position: absolute;
+  top: var(--space-xs);
+  left: var(--space-xs);
+  z-index: 2000;
+  padding: 10px 16px;
+  min-height: var(--tap-target);
+  display: inline-flex;
+  align-items: center;
+  border-radius: var(--radius-md);
+  background: var(--bg-surface-elevated);
+  border: 1px solid var(--border-focus);
+  color: var(--text-primary);
+  font-family: var(--font-display);
+  font-weight: 700;
+  text-decoration: none;
+  box-shadow: var(--shadow-md);
+  transform: translateY(calc(-100% - var(--space-md)));
+  opacity: 0;
+  pointer-events: none;
+  transition: transform var(--transition-base), opacity var(--transition-base);
+}
+
+.skip-link:focus,
+.skip-link:focus-visible {
+  transform: translateY(0);
+  opacity: 1;
+  pointer-events: auto;
+}
+
 /* Layout Framework */
 .game-shell {
-  width: min(1400px, calc(100% - 48px));
+  width: min(1400px, calc(100% - var(--space-xl)));
   min-height: 100vh;
   margin: 0 auto;
-  padding: 40px 0;
+  /* Mobile-first padding with safe-area insets for notches / home indicator */
+  padding: calc(var(--space-lg) + var(--safe-top)) var(--safe-right)
+    calc(var(--space-lg) + var(--safe-bottom)) var(--safe-left);
   display: flex;
   flex-direction: column;
-  gap: 24px;
+  gap: var(--space-lg);
 }
 
 .game-shell__header {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 24px;
-  padding-bottom: 24px;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-sm);
+  padding-bottom: var(--space-lg);
   border-bottom: 1px solid var(--border-dim);
 }
 
 .game-shell__title {
-  font-size: 2.2rem;
+  font-size: var(--text-2xl);
   font-weight: 900;
   background: var(--grad-cyan-blue);
   -webkit-background-clip: text;
@@ -155,29 +257,23 @@ a:focus-visible {
   letter-spacing: -0.03em;
 }
 
+/* Mobile-first: single column, sidebars stack below main content */
 .game-shell__layout {
   display: grid;
   grid-template-columns: 1fr;
-  gap: 24px;
+  gap: var(--space-lg);
   align-items: start;
 }
 
-.game-shell__layout.game-shell__layout--has-scoreboard {
-  grid-template-columns: 300px 1fr;
-}
-
-.game-shell__layout.game-shell__layout--has-action-log {
-  grid-template-columns: 1fr 340px;
-}
-
-.game-shell__layout.game-shell__layout--has-scoreboard.game-shell__layout--has-action-log {
-  grid-template-columns: 300px 1fr 340px;
+/* On mobile, surface the main play area above the stacked sidebars */
+.game-shell__layout--has-scoreboard .game-shell__main {
+  order: -1;
 }
 
 /* Center main area when there are no sidebars (e.g. Game Setup phase) */
 .game-shell__layout:not(.game-shell__layout--has-scoreboard):not(.game-shell__layout--has-action-log) .game-shell__main {
   max-width: 640px;
-  margin: 32px auto;
+  margin: 0 auto;
   width: 100%;
   box-shadow: var(--shadow-lg);
 }
@@ -193,16 +289,16 @@ a:focus-visible {
 .scoreboard,
 .action-log {
   border: 1px solid var(--border-dim);
-  border-radius: 16px;
+  border-radius: var(--radius-lg);
   background: var(--bg-surface);
   background-image: var(--grad-surface);
   box-shadow: var(--shadow-md);
-  padding: 24px;
+  padding: var(--space-lg);
   transition: border-color 0.25s ease, box-shadow 0.25s ease;
 }
 
 .game-shell__main {
-  min-height: 580px;
+  min-height: 420px;
   display: flex;
   flex-direction: column;
   justify-content: stretch;
@@ -215,16 +311,17 @@ a:focus-visible {
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 24px;
+  gap: var(--space-lg);
 }
 
 /* Status Strip & Chips */
 .status-strip {
   display: flex;
   align-items: center;
-  gap: 12px;
+  flex-wrap: wrap;
+  gap: var(--space-sm);
   color: var(--text-secondary);
-  font-size: 0.95rem;
+  font-size: var(--text-sm);
   font-weight: 600;
 }
 
@@ -234,12 +331,12 @@ a:focus-visible {
   justify-content: center;
   min-height: 28px;
   padding: 4px 14px;
-  border-radius: 99px;
+  border-radius: var(--radius-pill);
   background: rgba(0, 210, 255, 0.1);
   border: 1px solid rgba(0, 210, 255, 0.2);
   color: var(--accent-cyan);
   font-family: var(--font-mono);
-  font-size: 0.8rem;
+  font-size: var(--text-xs);
   text-transform: uppercase;
   letter-spacing: 0.05em;
   box-shadow: var(--glow-cyan);
@@ -268,21 +365,21 @@ a:focus-visible {
 
 .play-stack {
   display: grid;
-  gap: 20px;
+  gap: var(--space-md);
 }
 
 .room-controls {
   display: grid;
-  gap: 18px;
-  padding: 18px;
+  gap: var(--space-md);
+  padding: var(--space-md);
   border: 1px solid var(--border-dim);
-  border-radius: 16px;
+  border-radius: var(--radius-lg);
   background: var(--bg-surface-soft);
 }
 
 .room-controls__summary {
   display: grid;
-  gap: 8px;
+  gap: var(--space-xs);
 }
 
 .room-controls__summary h2,
@@ -291,7 +388,7 @@ a:focus-visible {
 }
 
 .room-controls__summary h2 {
-  font-size: 1.35rem;
+  font-size: var(--text-lg);
 }
 
 .room-controls__summary p,
@@ -302,7 +399,7 @@ a:focus-visible {
 
 .invite-box {
   display: grid;
-  gap: 8px;
+  gap: var(--space-xs);
 }
 
 .room-actions {
@@ -323,8 +420,10 @@ a:focus-visible {
 }
 
 .form-field__checkbox {
-  width: 20px;
-  height: 20px;
+  width: var(--tap-target);
+  height: var(--tap-target);
+  max-width: 24px;
+  max-height: 24px;
   accent-color: var(--accent-cyan);
   cursor: pointer;
 }
@@ -336,13 +435,13 @@ a:focus-visible {
 /* Phase Panels & Containers */
 .phase-panel {
   display: grid;
-  gap: 20px;
+  gap: var(--space-md);
   align-content: center;
   justify-content: stretch;
 }
 
 .phase-panel h2 {
-  font-size: 1.6rem;
+  font-size: var(--text-xl);
   line-height: 1.25;
   margin: 0;
 }
@@ -350,7 +449,7 @@ a:focus-visible {
 .eyebrow {
   color: var(--accent-cyan);
   font-family: var(--font-mono);
-  font-size: 0.75rem;
+  font-size: var(--text-xs);
   font-weight: 700;
   letter-spacing: 0.1em;
   text-transform: uppercase;
@@ -369,44 +468,45 @@ a:focus-visible {
 
 .setup-form__legend {
   font-family: var(--font-display);
-  font-size: 1.6rem;
+  font-size: var(--text-xl);
   font-weight: 800;
   letter-spacing: -0.01em;
-  margin-bottom: 12px;
+  margin-bottom: var(--space-sm);
   background: var(--grad-cyan-blue);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
 }
 
+/* Mobile-first: single column form, promotes to 2 columns on tablet+ */
 .setup-form__grid {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 20px;
+  grid-template-columns: 1fr;
+  gap: var(--space-md);
 }
 
 .form-field {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-xs);
 }
 
 .form-field__label {
   color: var(--text-secondary);
-  font-size: 0.85rem;
+  font-size: var(--text-sm);
   font-weight: 600;
   letter-spacing: 0.02em;
 }
 
 .form-field__control {
   width: 100%;
-  min-height: 48px;
+  min-height: var(--tap-target);
   padding: 12px 16px;
   border: 1px solid var(--border-dim);
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   background: var(--bg-surface-soft);
   color: var(--text-primary);
-  font-size: 0.95rem;
-  transition: all 0.2s ease;
+  font-size: max(16px, var(--text-base)); /* >=16px avoids iOS input zoom */
+  transition: border-color var(--transition-base), background-color var(--transition-base), box-shadow var(--transition-base);
 }
 
 .form-field__control:hover {
@@ -431,7 +531,8 @@ select.form-field__control {
 }
 
 /* Custom Select styling */
-.sr-only {
+.sr-only,
+.announcer {
   position: absolute !important;
   width: 1px !important;
   height: 1px !important;
@@ -446,7 +547,7 @@ select.form-field__control {
 .form-field--custom-select {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-xs);
 }
 
 .custom-select__trigger {
@@ -454,15 +555,15 @@ select.form-field__control {
   align-items: center;
   justify-content: space-between;
   width: 100%;
-  min-height: 48px;
+  min-height: var(--tap-target);
   padding: 12px 16px;
   border: 1px solid var(--border-dim);
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   background: var(--bg-surface-soft);
   color: var(--text-primary);
-  font-size: 0.95rem;
+  font-size: var(--text-base);
   text-align: left;
-  transition: all 0.2s ease;
+  transition: border-color var(--transition-base), background-color var(--transition-base), box-shadow var(--transition-base);
   outline: none;
   cursor: pointer;
   box-shadow: var(--shadow-sm);
@@ -490,14 +591,18 @@ select.form-field__control {
   width: 16px;
   height: 16px;
   stroke: var(--text-secondary);
-  transition: transform 0.2s ease;
+  transition: transform var(--transition-base);
   flex-shrink: 0;
-  margin-left: 8px;
+  margin-left: var(--space-xs);
 }
 
 .custom-select__trigger[aria-expanded="true"] .custom-select__arrow {
   transform: rotate(180deg);
   stroke: var(--accent-cyan);
+}
+
+.custom-select__popover-anchor {
+  position: relative;
 }
 
 .custom-select__popover-wrapper {
@@ -512,7 +617,7 @@ select.form-field__control {
 .custom-select__popover {
   background: var(--bg-surface-elevated);
   border: 1px solid var(--border-mid);
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   box-shadow: var(--shadow-lg);
   overflow: hidden;
   width: 100%;
@@ -543,17 +648,18 @@ select.form-field__control {
 }
 
 .custom-select__item {
-  padding: 10px 14px;
-  border-radius: 8px;
+  padding: 12px 14px;
+  min-height: var(--tap-target);
+  border-radius: var(--radius-sm);
   color: var(--text-primary);
-  font-size: 0.95rem;
+  font-size: var(--text-base);
   font-family: var(--font-sans);
   cursor: pointer;
   outline: none;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  transition: all 0.15s ease;
+  transition: background-color var(--transition-fast), color var(--transition-fast);
 }
 
 .custom-select__item[data-hovered="true"] {
@@ -583,12 +689,12 @@ select.form-field__control {
 .spread-width-form__error,
 .state-error {
   color: var(--color-sell);
-  font-size: 0.85rem;
+  font-size: var(--text-sm);
   font-weight: 500;
   display: flex;
   align-items: center;
   gap: 6px;
-  margin-top: 4px;
+  margin-top: var(--space-2xs);
 }
 
 .form-field__error::before,
@@ -597,7 +703,7 @@ select.form-field__control {
 .spread-width-form__error::before,
 .state-error::before {
   content: "⚠️";
-  font-size: 0.9rem;
+  font-size: var(--text-sm);
 }
 
 /* Custom Interactive Buttons */
@@ -608,18 +714,18 @@ select.form-field__control {
 .primary-button,
 .secondary-button,
 .danger-button {
-  min-height: 48px;
+  min-height: var(--tap-target);
   padding: 12px 24px;
   border: none;
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   font-family: var(--font-display);
   font-weight: 700;
-  font-size: 1rem;
+  font-size: var(--text-md);
   letter-spacing: 0.01em;
   background: var(--grad-cyan-blue);
   color: var(--bg-deep);
   box-shadow: 0 4px 14px rgba(0, 210, 255, 0.3);
-  margin-top: 8px;
+  margin-top: var(--space-xs);
 }
 
 .secondary-button {
@@ -666,9 +772,9 @@ select.form-field__control {
   overflow: hidden;
   width: 100%;
   height: 6px;
-  border-radius: 99px;
+  border-radius: var(--radius-pill);
   background: var(--bg-surface-soft);
-  margin: 16px 0;
+  margin: var(--space-md) 0;
 }
 
 .loading-line::after {
@@ -695,7 +801,7 @@ select.form-field__control {
 .scoreboard {
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: var(--space-md);
 }
 
 .scoreboard__header {
@@ -703,18 +809,18 @@ select.form-field__control {
   align-items: center;
   justify-content: space-between;
   border-bottom: 1px solid var(--border-dim);
-  padding-bottom: 12px;
+  padding-bottom: var(--space-sm);
 }
 
 .scoreboard__title {
-  font-size: 1.25rem;
+  font-size: var(--text-lg);
   margin: 0;
 }
 
 .scoreboard__round {
   color: var(--text-secondary);
   font-family: var(--font-mono);
-  font-size: 0.8rem;
+  font-size: var(--text-xs);
   font-weight: 500;
   background: var(--bg-surface-soft);
   padding: 3px 8px;
@@ -728,7 +834,7 @@ select.form-field__control {
 .item-panel__details,
 .final-score {
   display: grid;
-  gap: 12px;
+  gap: var(--space-sm);
   margin: 0;
 }
 
@@ -741,12 +847,12 @@ select.form-field__control {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  gap: 12px;
+  gap: var(--space-sm);
   padding: 14px 16px;
   border: 1px solid var(--border-dim);
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   background: var(--bg-surface-soft);
-  transition: all 0.2s ease;
+  transition: border-color var(--transition-base), background-color var(--transition-base);
 }
 
 .scoreboard__player--leading {
@@ -756,14 +862,14 @@ select.form-field__control {
 
 .scoreboard__leader-badge {
   font-family: var(--font-mono);
-  font-size: 0.65rem;
+  font-size: var(--text-2xs);
   font-weight: 700;
   color: var(--color-buy);
   background: rgba(16, 185, 129, 0.15);
   border: 1px solid rgba(16, 185, 129, 0.25);
   padding: 1px 6px;
   border-radius: 4px;
-  margin-left: 8px;
+  margin-left: var(--space-xs);
   text-transform: uppercase;
   letter-spacing: 0.05em;
   vertical-align: middle;
@@ -785,7 +891,7 @@ select.form-field__control {
 .item-panel dt,
 .final-score dt {
   color: var(--text-secondary);
-  font-size: 0.85rem;
+  font-size: var(--text-sm);
   font-weight: 500;
 }
 
@@ -796,12 +902,12 @@ select.form-field__control {
 .final-score dd {
   font-family: var(--font-mono);
   font-weight: 700;
-  font-size: 0.95rem;
+  font-size: var(--text-base);
   color: var(--text-primary);
   margin: 0;
 }
 
-/* Color Coding Scores */
+/* Color Coding Scores (cyan = player 1, magenta = player 2) */
 .scoreboard__scores .scoreboard__player:nth-child(1) dd {
   color: var(--accent-cyan);
 }
@@ -813,7 +919,7 @@ select.form-field__control {
 .item-panel {
   display: flex;
   flex-direction: column;
-  gap: 18px;
+  gap: var(--space-md);
   position: relative;
   overflow: hidden;
 }
@@ -837,7 +943,7 @@ select.form-field__control {
 .item-panel__category {
   color: var(--accent-cyan);
   font-family: var(--font-mono);
-  font-size: 0.75rem;
+  font-size: var(--text-xs);
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 0.08em;
@@ -845,7 +951,7 @@ select.form-field__control {
 }
 
 .item-panel__title {
-  font-size: 1.45rem;
+  font-size: var(--text-lg);
   font-weight: 800;
   line-height: 1.2;
   margin: 0;
@@ -856,19 +962,19 @@ select.form-field__control {
   flex-direction: column;
   align-items: flex-start;
   gap: 6px;
-  padding: 16px;
+  padding: var(--space-md);
 }
 
 .item-panel__detail dt {
   color: var(--text-secondary);
-  font-size: 0.8rem;
+  font-size: var(--text-xs);
   text-transform: uppercase;
   letter-spacing: 0.05em;
 }
 
 .item-panel__detail dd {
   font-family: var(--font-sans);
-  font-size: 1.05rem;
+  font-size: var(--text-md);
   font-weight: 500;
   line-height: 1.4;
   color: var(--text-primary);
@@ -877,7 +983,7 @@ select.form-field__control {
 
 .item-panel__details .item-panel__detail:nth-child(2) dd {
   font-family: var(--font-mono);
-  font-size: 1.3rem;
+  font-size: var(--text-lg);
   color: var(--accent-cyan);
   font-weight: 700;
 }
@@ -891,21 +997,22 @@ select.form-field__control {
   box-shadow: none;
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--space-md);
 }
 
 .market-maker-form__legend {
   font-family: var(--font-display);
-  font-size: 1.25rem;
+  font-size: var(--text-lg);
   font-weight: 700;
   color: var(--text-primary);
-  margin-bottom: 8px;
+  margin-bottom: var(--space-xs);
 }
 
+/* Mobile-first: single column, promotes to 2 columns on tablet+ */
 .market-maker-form__grid {
   display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 16px;
+  grid-template-columns: 1fr;
+  gap: var(--space-md);
 }
 
 /* Trading Panel */
@@ -913,26 +1020,28 @@ select.form-field__control {
 .trading-panel {
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: var(--space-md);
 }
 
 .trading-panel__header {
   display: flex;
   align-items: center;
   justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-xs);
   border-bottom: 1px solid var(--border-dim);
   padding-bottom: 14px;
 }
 
 .trading-panel__title {
-  font-size: 1.35rem;
+  font-size: var(--text-lg);
   margin: 0;
 }
 
 .trading-panel__quote {
   font-family: var(--font-mono);
   font-weight: 700;
-  font-size: 1.05rem;
+  font-size: var(--text-md);
   color: var(--accent-cyan);
   background: rgba(0, 210, 255, 0.1);
   padding: 4px 10px;
@@ -940,30 +1049,31 @@ select.form-field__control {
   border: 1px solid rgba(0, 210, 255, 0.15);
 }
 
+/* Mobile-first: stacked actions, becomes side-by-side where space allows */
 .trading-panel__actions {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-  gap: 12px;
+  grid-template-columns: 1fr;
+  gap: var(--space-sm);
 }
 
 .spread-width-form {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--space-md);
 }
 
 .trading-panel__button {
   min-height: 52px;
-  border-radius: 12px;
+  border-radius: var(--radius-md);
   border: none;
   font-family: var(--font-display);
   font-weight: 800;
-  font-size: 1.05rem;
+  font-size: var(--text-md);
   box-shadow: var(--shadow-sm);
   display: flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
+  gap: var(--space-xs);
 }
 
 .trading-panel__button--buy {
@@ -992,7 +1102,7 @@ select.form-field__control {
 .settlement-panel {
   display: flex;
   flex-direction: column;
-  gap: 20px;
+  gap: var(--space-md);
 }
 
 .settlement-panel__header {
@@ -1006,13 +1116,13 @@ select.form-field__control {
 .settlement-panel__round {
   color: var(--accent-magenta);
   font-family: var(--font-mono);
-  font-size: 0.8rem;
+  font-size: var(--text-xs);
   font-weight: 700;
   text-transform: uppercase;
 }
 
 .settlement-panel__title {
-  font-size: 1.35rem;
+  font-size: var(--text-lg);
   margin: 0;
 }
 
@@ -1028,21 +1138,21 @@ select.form-field__control {
 .action-log {
   display: flex;
   flex-direction: column;
-  gap: 16px;
+  gap: var(--space-md);
   max-height: 600px;
 }
 
 .action-log__title {
-  font-size: 1.25rem;
+  font-size: var(--text-lg);
   margin: 0;
   border-bottom: 1px solid var(--border-dim);
-  padding-bottom: 12px;
+  padding-bottom: var(--space-sm);
 }
 
 .action-log__list {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--space-sm);
   overflow-y: auto;
   max-height: 480px;
   margin: 0;
@@ -1064,12 +1174,12 @@ select.form-field__control {
 .action-log__item {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  padding: 12px;
+  gap: var(--space-2xs);
+  padding: var(--space-sm);
   border: 1px solid var(--border-dim);
   border-radius: 10px;
   background: var(--bg-surface-soft);
-  transition: all 0.2s ease;
+  transition: border-color var(--transition-base), background-color var(--transition-base);
 }
 
 .action-log__item:hover {
@@ -1079,14 +1189,14 @@ select.form-field__control {
 
 .action-log__meta {
   font-family: var(--font-mono);
-  font-size: 0.72rem;
+  font-size: var(--text-2xs);
   font-weight: 600;
   color: var(--accent-cyan);
   text-transform: uppercase;
 }
 
 .action-log__message {
-  font-size: 0.9rem;
+  font-size: var(--text-base);
   line-height: 1.4;
   color: var(--text-primary);
   margin: 0;
@@ -1094,27 +1204,27 @@ select.form-field__control {
 
 .action-log__empty {
   color: var(--text-secondary);
-  font-size: 0.9rem;
+  font-size: var(--text-base);
   text-align: center;
-  padding: 32px 0;
+  padding: var(--space-xl) 0;
 }
 
 /* Final Score / Game Over styles */
 .final-score {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
-  gap: 16px;
-  margin-bottom: 16px;
+  gap: var(--space-md);
+  margin-bottom: var(--space-md);
 }
 
 .final-score dt {
-  font-size: 0.8rem;
+  font-size: var(--text-xs);
   text-transform: uppercase;
-  margin-bottom: 4px;
+  margin-bottom: var(--space-2xs);
 }
 
 .final-score dd {
-  font-size: 1.4rem;
+  font-size: var(--text-xl);
   color: var(--accent-cyan);
   font-weight: 900;
 }
@@ -1123,47 +1233,354 @@ select.form-field__control {
   color: var(--accent-magenta);
 }
 
-/* Responsiveness adjustments */
-@media (max-width: 1080px) {
-  .game-shell__layout {
-    grid-template-columns: 1fr;
-    gap: 24px;
-  }
-  
-  .game-shell__sidebar {
-    flex-direction: row;
-    display: grid;
-    grid-template-columns: repeat(2, 1fr);
-    gap: 24px;
-  }
+/* ============================================================
+   Reusable primitive style hooks (CSS only — markup added by
+   other slices). Consistent with the betting/gambling feel:
+   instant, tactile, obvious, low cognitive load.
+   ============================================================ */
+
+/* Turn banner — bold "it's your move" indicator */
+.turn-banner {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--space-sm);
+  width: 100%;
+  min-height: var(--tap-target);
+  padding: 10px 16px;
+  border-radius: var(--radius-md);
+  background: rgba(0, 210, 255, 0.1);
+  border: 1px solid rgba(0, 210, 255, 0.25);
+  color: var(--accent-cyan);
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: var(--text-md);
+  letter-spacing: 0.01em;
+  text-align: center;
+  box-shadow: var(--glow-cyan);
 }
 
-@media (max-width: 768px) {
-  .game-shell {
-    width: min(100% - 32px, 1400px);
-    padding: 24px 0;
-  }
-
-  .game-shell__sidebar {
-    grid-template-columns: 1fr;
-  }
-  
-  .setup-form__grid {
-    grid-template-columns: 1fr;
-  }
-  
-  .game-shell__header {
-    flex-direction: column;
-    align-items: flex-start;
-    gap: 12px;
-  }
-  
-  .trading-panel__actions {
-    grid-template-columns: 1fr;
-  }
+.turn-banner--waiting {
+  background: var(--bg-surface-soft);
+  border-color: var(--border-mid);
+  color: var(--text-secondary);
+  box-shadow: none;
 }
 
-/* Amazon Search link & Scraped Items list styling */
+.turn-banner--buy {
+  background: rgba(16, 185, 129, 0.12);
+  border-color: rgba(16, 185, 129, 0.3);
+  color: var(--color-buy);
+  box-shadow: var(--glow-buy);
+}
+
+.turn-banner--sell {
+  background: rgba(244, 63, 94, 0.12);
+  border-color: rgba(244, 63, 94, 0.3);
+  color: var(--color-sell);
+  box-shadow: var(--glow-sell);
+}
+
+/* Phase stepper — shows progress through game phases */
+.phase-stepper {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-xs);
+  padding: 0;
+  margin: 0;
+  list-style: none;
+}
+
+.phase-stepper__step {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 32px;
+  padding: 4px 12px;
+  border-radius: var(--radius-pill);
+  background: var(--bg-surface-soft);
+  border: 1px solid var(--border-dim);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  transition: border-color var(--transition-base), background-color var(--transition-base), color var(--transition-base);
+}
+
+.phase-stepper__step[data-state="active"],
+.phase-stepper__step[aria-current="step"] {
+  background: rgba(0, 210, 255, 0.12);
+  border-color: rgba(0, 210, 255, 0.3);
+  color: var(--accent-cyan);
+  box-shadow: var(--glow-cyan);
+}
+
+.phase-stepper__step[data-state="complete"] {
+  background: rgba(16, 185, 129, 0.1);
+  border-color: rgba(16, 185, 129, 0.25);
+  color: var(--color-buy);
+}
+
+/* Stepper input — +/- numeric control with large tap targets */
+.stepper-input {
+  display: inline-flex;
+  align-items: stretch;
+  gap: 0;
+  border: 1px solid var(--border-dim);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface-soft);
+  overflow: hidden;
+}
+
+.stepper-input__button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: var(--tap-target);
+  min-height: var(--tap-target);
+  border: none;
+  background: transparent;
+  color: var(--accent-cyan);
+  font-family: var(--font-display);
+  font-size: var(--text-lg);
+  font-weight: 800;
+  line-height: 1;
+}
+
+.stepper-input__button:hover {
+  background: var(--bg-surface-elevated);
+}
+
+.stepper-input__button:active {
+  background: rgba(0, 210, 255, 0.12);
+}
+
+.stepper-input__field {
+  width: 100%;
+  min-width: 56px;
+  min-height: var(--tap-target);
+  border: none;
+  border-left: 1px solid var(--border-dim);
+  border-right: 1px solid var(--border-dim);
+  background: transparent;
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: max(16px, var(--text-md));
+  font-weight: 700;
+  text-align: center;
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+.stepper-input__field::-webkit-outer-spin-button,
+.stepper-input__field::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+
+/* Copy button — for invite codes / share links */
+.copy-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: var(--tap-target);
+  min-width: var(--tap-target);
+  padding: 0 16px;
+  border: 1px solid var(--border-mid);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface-elevated);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-weight: 600;
+  font-size: var(--text-sm);
+  box-shadow: var(--shadow-sm);
+}
+
+.copy-button:hover {
+  border-color: var(--border-focus);
+  background: var(--bg-surface-soft);
+}
+
+.copy-button[data-copied="true"] {
+  border-color: rgba(16, 185, 129, 0.4);
+  color: var(--color-buy);
+}
+
+/* Quick chip — fast preset selectors (bet sizes, presets) */
+.quick-chip {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: var(--tap-target);
+  padding: 8px 16px;
+  border-radius: var(--radius-pill);
+  border: 1px solid var(--border-mid);
+  background: var(--bg-surface-soft);
+  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.quick-chip:hover {
+  border-color: var(--border-focus);
+  background: var(--bg-surface-elevated);
+}
+
+.quick-chip[aria-pressed="true"],
+.quick-chip[data-active="true"] {
+  background: var(--grad-cyan-blue);
+  border-color: transparent;
+  color: var(--bg-deep);
+  font-weight: 700;
+}
+
+.quick-chip-group {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-xs);
+}
+
+/* Toast / live announcer — feedback + a11y live region */
+.toast {
+  display: flex;
+  align-items: center;
+  gap: var(--space-sm);
+  padding: 12px 16px;
+  border-radius: var(--radius-md);
+  background: var(--bg-surface-elevated);
+  border: 1px solid var(--border-mid);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  box-shadow: var(--shadow-md);
+}
+
+.toast--success {
+  border-color: rgba(16, 185, 129, 0.4);
+  color: var(--color-buy);
+}
+
+.toast--error {
+  border-color: rgba(244, 63, 94, 0.4);
+  color: var(--color-sell);
+}
+
+.toast-region {
+  position: fixed;
+  left: 50%;
+  bottom: calc(var(--space-lg) + var(--safe-bottom));
+  transform: translateX(-50%);
+  z-index: 1500;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-xs);
+  width: min(420px, calc(100% - var(--space-xl)));
+  pointer-events: none;
+}
+
+.toast-region > * {
+  pointer-events: auto;
+}
+
+/* ============================================================
+   Collapsible / bottom-sheet region for scoreboard & action-log
+   on small screens. Markup hooks consumed by other slices.
+   ============================================================ */
+.collapsible-region__toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-sm);
+  width: 100%;
+  min-height: var(--tap-target);
+  padding: 10px 16px;
+  border: 1px solid var(--border-mid);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface-soft);
+  color: var(--text-primary);
+  font-family: var(--font-display);
+  font-weight: 700;
+  font-size: var(--text-md);
+}
+
+.collapsible-region__toggle[aria-expanded="false"] + .collapsible-region__body {
+  display: none;
+}
+
+.collapsible-region__body {
+  margin-top: var(--space-sm);
+}
+
+/* Bottom-sheet variant: slides up from the bottom of the viewport */
+.bottom-sheet {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 1400;
+  max-height: 80vh;
+  overflow-y: auto;
+  padding: var(--space-lg) var(--space-lg) calc(var(--space-lg) + var(--safe-bottom));
+  border-top-left-radius: var(--radius-lg);
+  border-top-right-radius: var(--radius-lg);
+  border-top: 1px solid var(--border-mid);
+  background: var(--bg-surface);
+  background-image: var(--grad-surface);
+  box-shadow: var(--shadow-lg);
+  transform: translateY(100%);
+  transition: transform 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+}
+
+.bottom-sheet[data-open="true"],
+.bottom-sheet.is-open {
+  transform: translateY(0);
+}
+
+.bottom-sheet__handle {
+  width: 40px;
+  height: 4px;
+  margin: 0 auto var(--space-md);
+  border-radius: var(--radius-pill);
+  background: var(--border-mid);
+}
+
+.bottom-sheet__backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 1390;
+  background: rgba(7, 9, 19, 0.6);
+  backdrop-filter: blur(2px);
+}
+
+/* ============================================================
+   Sticky bottom action bar (Buy/Sell & primary CTAs on mobile)
+   ============================================================ */
+.sticky-action-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 900;
+  display: flex;
+  gap: var(--space-sm);
+  width: 100%;
+  padding: var(--space-sm) var(--space-md) calc(var(--space-sm) + var(--safe-bottom));
+  margin-top: var(--space-md);
+  background: linear-gradient(180deg, rgba(7, 9, 19, 0) 0%, var(--bg-deep) 35%);
+  border-top: 1px solid var(--border-dim);
+}
+
+.sticky-action-bar > * {
+  flex: 1 1 0;
+  margin-top: 0;
+}
+
+/* ============================================================
+   Amazon Search link & Scraped Items list styling
+   ============================================================ */
 .amazon-link {
   color: var(--accent-cyan);
   text-decoration: none;
@@ -1171,7 +1588,7 @@ select.form-field__control {
   display: inline-flex;
   align-items: center;
   gap: 6px;
-  transition: color 0.2s ease, text-shadow 0.2s ease;
+  transition: color var(--transition-base), text-shadow var(--transition-base);
 }
 
 .amazon-link:hover {
@@ -1183,11 +1600,11 @@ select.form-field__control {
 .scraped-items-list {
   list-style: none;
   padding: 0;
-  margin: 8px 0 0 0;
+  margin: var(--space-xs) 0 0 0;
   width: 100%;
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-xs);
 }
 
 .scraped-items-list li {
@@ -1195,10 +1612,10 @@ select.form-field__control {
   justify-content: space-between;
   align-items: center;
   padding: 10px 14px;
-  border-radius: 8px;
+  border-radius: var(--radius-sm);
   background: var(--bg-surface-soft);
   border: 1px solid var(--border-dim);
-  font-size: 0.9rem;
+  font-size: var(--text-base);
   font-family: var(--font-sans);
   color: var(--text-secondary);
 }
@@ -1230,7 +1647,7 @@ select.form-field__control {
 
 .source-badge {
   font-family: var(--font-mono);
-  font-size: 0.65rem;
+  font-size: var(--text-2xs);
   font-weight: 700;
   color: var(--accent-cyan);
   background: rgba(0, 210, 255, 0.15);
@@ -1239,5 +1656,131 @@ select.form-field__control {
   border-radius: 4px;
   text-transform: uppercase;
   letter-spacing: 0.05em;
-  margin-left: 8px;
+  margin-left: var(--space-xs);
+}
+
+/* ============================================================
+   Responsive promotion (mobile-first -> tablet -> desktop)
+   ============================================================ */
+
+/* Tablet and up: two-up forms, header goes horizontal, sidebars pair up */
+@media (min-width: 768px) {
+  .game-shell {
+    width: min(1400px, calc(100% - var(--space-2xl)));
+    padding: calc(var(--space-xl) + var(--safe-top)) var(--safe-right)
+      calc(var(--space-xl) + var(--safe-bottom)) var(--safe-left);
+  }
+
+  .game-shell__header {
+    flex-direction: row;
+    align-items: center;
+    justify-content: space-between;
+    gap: var(--space-lg);
+  }
+
+  .setup-form__grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .setup-form__grid--single {
+    grid-template-columns: 1fr;
+  }
+
+  .market-maker-form__grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+
+  .trading-panel__actions {
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  }
+
+  /* Two-column where a single sidebar is present */
+  .game-shell__layout--has-scoreboard {
+    grid-template-columns: 280px 1fr;
+  }
+
+  .game-shell__layout--has-action-log {
+    grid-template-columns: 1fr 320px;
+  }
+
+  /* Main no longer needs to jump above the scoreboard once columned */
+  .game-shell__layout--has-scoreboard .game-shell__main {
+    order: 0;
+  }
+}
+
+/* Desktop: full multi-column layout incl. the 3-column variant */
+@media (min-width: 1080px) {
+  .game-shell {
+    width: min(1400px, calc(100% - var(--space-2xl)));
+  }
+
+  .game-shell__title {
+    font-size: var(--text-2xl);
+  }
+
+  .game-shell__layout--has-scoreboard {
+    grid-template-columns: 300px 1fr;
+  }
+
+  .game-shell__layout--has-action-log {
+    grid-template-columns: 1fr 340px;
+  }
+
+  .game-shell__layout--has-scoreboard.game-shell__layout--has-action-log {
+    grid-template-columns: 300px 1fr 340px;
+  }
+
+  .game-shell__main {
+    min-height: 580px;
+  }
+
+  .game-shell__layout:not(.game-shell__layout--has-scoreboard):not(.game-shell__layout--has-action-log) .game-shell__main {
+    margin: 32px auto;
+  }
+}
+
+/* ============================================================
+   Reduced motion: neutralize transforms & animations
+   ============================================================ */
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .setup-form__submit:hover,
+  .market-maker-form__submit:hover,
+  .spread-width-form__submit:hover,
+  .settlement-panel__continue:hover,
+  .primary-button:hover,
+  .secondary-button:hover,
+  .danger-button:hover,
+  .trading-panel__button--buy:hover,
+  .trading-panel__button--sell:hover {
+    transform: none;
+  }
+
+  .loading-line::after {
+    animation: none;
+    width: 100%;
+    opacity: 0.6;
+  }
+
+  .custom-select__popover {
+    animation: none;
+  }
+
+  .bottom-sheet,
+  .skip-link {
+    transition: none;
+  }
 }

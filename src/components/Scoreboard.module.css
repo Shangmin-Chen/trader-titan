@@ -1,0 +1,27 @@
+/*
+ * Scoreboard.module.css
+ *
+ * Scoped enhancements layered on top of the global `.scoreboard*` styles in
+ * globals.css. These rules are strictly ADDITIVE: they only set properties the
+ * global stylesheet leaves at their defaults (e.g. grid-template-columns), so
+ * load order between this module and globals.css does not matter, and the
+ * cyan/magenta `nth-child` mapping in globals.css is untouched.
+ */
+
+/*
+ * Compact two-up score layout on small screens: render the two players
+ * side-by-side as stacked cards (name over score) instead of full-width rows.
+ * globals.css leaves `.scoreboard__scores` at its default single column, so
+ * only setting the column template here avoids any conflict.
+ */
+@media (max-width: 767px) {
+  .scoresTwoUp {
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .scoresTwoUp .playerCompact {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 4px;
+  }
+}

@@ -1,0 +1,10 @@
+/* SetupForm — scoped styles for the legacy SetupForm component. */
+
+/* Checkbox label — inline flex so it vertically centres against the control. */
+.checkboxLabel {
+  cursor: pointer;
+  user-select: none;
+  display: flex;
+  align-items: center;
+  height: 100%;
+}

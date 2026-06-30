@@ -1,0 +1,32 @@
+/* Scoped styles for ItemPanel. These replace formerly inline style objects
+   and add responsive + a11y behavior on top of the shared global classes. */
+
+/* Was inline: { flexDirection: "column", alignItems: "stretch" } */
+.scrapedDetail {
+  flex-direction: column;
+  align-items: stretch;
+}
+
+/* Was inline: { display: "flex", alignItems: "center", gap: "8px" } */
+.priceGroup {
+  display: flex;
+  align-items: center;
+  gap: var(--space-xs);
+}
+
+/* Allow each listing row to wrap so the title can truncate while the
+   price and source-of-truth badge stay visible on narrow screens. */
+.scrapedItem {
+  flex-wrap: wrap;
+  gap: var(--space-xs);
+}
+
+@media (max-width: 767px) {
+  /* Stack title above the price group; price + badge remain on their
+     own line and stay fully visible even as the title truncates. */
+  .priceGroup {
+    width: 100%;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+  }
+}

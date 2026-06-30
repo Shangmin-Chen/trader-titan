@@ -1,0 +1,127 @@
+/* ============================================================
+   TradeActionPanel — tactile Buy/Sell (S6)
+   Net-new styling only. Shared visuals stay in globals.css under
+   .trading-panel / .trading-panel__button--buy|--sell.
+   ============================================================ */
+
+/* ---- Prominent live quote board ---------------------------- */
+.quoteBoard {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-sm);
+  margin-top: var(--space-md);
+}
+
+.quoteSide {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: var(--space-sm) var(--space-md);
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-dim);
+  background: var(--bg-surface-soft);
+}
+
+.quoteSideSell {
+  border-color: var(--color-sell-a40);
+  background: var(--color-sell-a08);
+}
+
+.quoteSideBuy {
+  border-color: var(--color-buy-a40);
+  background: var(--color-buy-a08);
+}
+
+.quoteLabel {
+  font-size: var(--text-xs);
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted);
+}
+
+.quoteValue {
+  font-family: var(--font-mono);
+  font-size: var(--text-xl);
+  font-weight: 800;
+  line-height: 1;
+  color: var(--text-primary);
+}
+
+/* ---- Buy/Sell buttons: larger, icon + label + price -------- */
+.button {
+  /* Bigger tap target than the shared base for thumb-zone tapping */
+  min-height: 68px;
+  flex-direction: row;
+  gap: var(--space-sm);
+  padding: 0 var(--space-md);
+  transition:
+    transform 120ms ease,
+    box-shadow 120ms ease,
+    filter 120ms ease;
+}
+
+.button:active:not(:disabled) {
+  transform: translateY(1px) scale(0.99);
+}
+
+.button:disabled {
+  cursor: not-allowed;
+  filter: grayscale(0.5);
+  opacity: 0.55;
+  box-shadow: none;
+}
+
+.icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  line-height: 0;
+}
+
+.label {
+  font-size: var(--text-md);
+  font-weight: 800;
+  letter-spacing: 0.02em;
+}
+
+.price {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: 700;
+  opacity: 0.85;
+}
+
+/* ---- Disabled / not-your-turn notice ----------------------- */
+.turnNotice {
+  margin: var(--space-sm) 0 0;
+  padding: var(--space-sm) var(--space-md);
+  border-radius: var(--radius-md);
+  border: 1px dashed var(--border-mid);
+  background: var(--bg-surface-soft);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  text-align: center;
+}
+
+.turnNotice strong {
+  color: var(--text-primary);
+}
+
+/* ---- Mobile sticky thumb-zone bar -------------------------- */
+/* On phones the actions ride the shared .sticky-action-bar utility so
+   Buy/Sell stay pinned in the thumb zone. On wider screens we relax the
+   utility back into the normal card flow. The compound selector beats the
+   single-class utility regardless of stylesheet order. */
+.actions {
+  margin-top: var(--space-md);
+}
+
+@media (min-width: 768px) {
+  .actions:global(.sticky-action-bar) {
+    position: static;
+    padding: 0;
+    border-top: none;
+    background: none;
+  }
+}

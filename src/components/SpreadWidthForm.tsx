@@ -7,6 +7,7 @@ import {
   validateTightenedWidth,
   type ValidationResult,
 } from "../lib/game";
+import { StepperInput } from "./StepperInput";
 
 export type SpreadWidthFormProps = {
   currentWidth?: number;
@@ -53,22 +54,20 @@ export function SpreadWidthForm({
       onSubmit={handleSubmit}
     >
       <fieldset className="spread-width-form__fieldset" disabled={disabled}>
-        <div className="form-field">
-          <label className="form-field__label" htmlFor={`${formId}-width`}>
-            {label}
-          </label>
-          <input
-            aria-describedby={validation.ok ? undefined : errorId}
-            aria-invalid={!validation.ok}
-            className="form-field__control"
-            id={`${formId}-width`}
-            inputMode="decimal"
-            name="spreadWidth"
-            onChange={(event) => setWidthInput(event.target.value)}
-            type="number"
-            value={widthInput}
-          />
-        </div>
+        <StepperInput
+          label={label}
+          value={widthInput}
+          onChange={setWidthInput}
+          id={`${formId}-width`}
+          name="spreadWidth"
+          min={1}
+          step={1}
+          inputMode="decimal"
+          quickValues={[50, 100, 200, 500]}
+          ariaDescribedby={validation.ok ? undefined : errorId}
+          ariaInvalid={!validation.ok}
+          disabled={disabled}
+        />
 
         {!validation.ok ? (
           <p className="spread-width-form__error" id={errorId} role="alert">

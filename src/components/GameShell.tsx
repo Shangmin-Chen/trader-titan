@@ -1,5 +1,7 @@
 import type { ReactNode } from "react";
 
+import styles from "./GameShell.module.css";
+
 export type GameShellProps = {
   actionLog?: ReactNode;
   children: ReactNode;
@@ -24,16 +26,40 @@ export function GameShell({
     .join(" ");
 
   return (
-    <main className="game-shell">
-      <header className="game-shell__header">
+    <main
+      id="main-content"
+      className="game-shell"
+      aria-label={`${title} game`}
+    >
+      <header className={`game-shell__header ${styles.stickyHeader}`}>
         <h1 className="game-shell__title">{title}</h1>
-        {status ? <div className="game-shell__status">{status}</div> : null}
+        {status ? (
+          <div
+            className="game-shell__status"
+          >
+            {status}
+          </div>
+        ) : null}
       </header>
 
       <div className={layoutClassName}>
-        {scoreboard ? <div className="game-shell__sidebar">{scoreboard}</div> : null}
+        {scoreboard ? (
+          <aside
+            className="game-shell__sidebar"
+            aria-label="Scoreboard"
+          >
+            {scoreboard}
+          </aside>
+        ) : null}
         <div className="game-shell__main">{children}</div>
-        {actionLog ? <div className="game-shell__sidebar">{actionLog}</div> : null}
+        {actionLog ? (
+          <aside
+            className="game-shell__sidebar"
+            aria-label="Action log"
+          >
+            {actionLog}
+          </aside>
+        ) : null}
       </div>
     </main>
   );

@@ -36,7 +36,39 @@ export function CustomSelect({
   const triggerRef = useRef<HTMLButtonElement>(null);
   const listboxRef = useRef<HTMLUListElement>(null);
 
+  // Typeahead buffer + reset timer.
+  const typeaheadRef = useRef("");
+  const typeaheadTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Stable base id so listbox/option ids are valid even when `id` is omitted,
+  // without altering the public prop contract.
+  const reactId = React.useId();
+  const baseId = id ?? reactId;
+  const labelId = `${baseId}-label`;
+  const valueId = `${baseId}-value`;
+  const listboxId = `${baseId}-listbox`;
+  const optionId = (index: number) => `${baseId}-option-${index}`;
+
   const selectedOption = options.find((opt) => opt.value === value) || options[0];
+  const activeDescendantId =
+    isOpen && focusedIndex >= 0 && focusedIndex < options.length
+      ? optionId(focusedIndex)
+      : undefined;
+
+  const selectedIndex = () => options.findIndex((opt) => opt.value === value);
+
+  const openListbox = () => {
+    setIsOpen(true);
+    setFocusedIndex(selectedIndex());
+  };
+
+  const closeListbox = (returnFocus = true) => {
+    setIsOpen(false);
+    setFocusedIndex(-1);
+    if (returnFocus) {
+      triggerRef.current?.focus();
+    }
+  };
 
   // Close listbox on outside click
   useEffect(() => {
@@ -46,13 +78,44 @@ export function CustomSelect({
         !containerRef.current.contains(event.target as Node)
       ) {
         setIsOpen(false);
+        setFocusedIndex(-1);
       }
     }
     document.addEventListener("mousedown", handleClickOutside);
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
-  // Handle keyboard navigation for custom select
+  // Clear the typeahead timer on unmount.
+  useEffect(() => {
+    return () => {
+      if (typeaheadTimerRef.current) {
+        clearTimeout(typeaheadTimerRef.current);
+      }
+    };
+  }, []);
+
+  const runTypeahead = (char: string) => {
+    typeaheadRef.current += char.toLowerCase();
+    if (typeaheadTimerRef.current) {
+      clearTimeout(typeaheadTimerRef.current);
+    }
+    typeaheadTimerRef.current = setTimeout(() => {
+      typeaheadRef.current = "";
+    }, 500);
+
+    const query = typeaheadRef.current;
+    const matchIndex = options.findIndex((opt) =>
+      opt.label.toLowerCase().startsWith(query),
+    );
+    if (matchIndex >= 0) {
+      if (!isOpen) {
+        setIsOpen(true);
+      }
+      setFocusedIndex(matchIndex);
+    }
+  };
+
+  // Handle keyboard navigation for the combobox trigger.
   const handleKeyDown = (event: React.KeyboardEvent) => {
     if (disabled) return;
 
@@ -60,19 +123,35 @@ export function CustomSelect({
       case "ArrowDown":
         event.preventDefault();
         if (!isOpen) {
-          setIsOpen(true);
-          setFocusedIndex(options.findIndex((opt) => opt.value === value));
+          openListbox();
         } else {
-          setFocusedIndex((prev) => (prev + 1) % options.length);
+          setFocusedIndex((prev) =>
+            prev < 0 ? 0 : (prev + 1) % options.length,
+          );
         }
         break;
       case "ArrowUp":
         event.preventDefault();
         if (!isOpen) {
-          setIsOpen(true);
-          setFocusedIndex(options.findIndex((opt) => opt.value === value));
+          openListbox();
         } else {
-          setFocusedIndex((prev) => (prev - 1 + options.length) % options.length);
+          setFocusedIndex((prev) =>
+            prev < 0
+              ? options.length - 1
+              : (prev - 1 + options.length) % options.length,
+          );
+        }
+        break;
+      case "Home":
+        if (isOpen) {
+          event.preventDefault();
+          setFocusedIndex(0);
+        }
+        break;
+      case "End":
+        if (isOpen) {
+          event.preventDefault();
+          setFocusedIndex(options.length - 1);
         }
         break;
       case "Enter":
@@ -82,34 +161,41 @@ export function CustomSelect({
           if (focusedIndex >= 0 && focusedIndex < options.length) {
             onChange(options[focusedIndex].value);
           }
-          setIsOpen(false);
-          triggerRef.current?.focus();
+          closeListbox();
         } else {
-          setIsOpen(true);
-          setFocusedIndex(options.findIndex((opt) => opt.value === value));
+          openListbox();
         }
         break;
       case "Escape":
         if (isOpen) {
           event.preventDefault();
-          setIsOpen(false);
-          triggerRef.current?.focus();
+          closeListbox();
         }
         break;
       case "Tab":
         if (isOpen) {
+          // Let focus move naturally; just collapse the popup.
           setIsOpen(false);
+          setFocusedIndex(-1);
         }
         break;
       default:
+        if (
+          event.key.length === 1 &&
+          !event.metaKey &&
+          !event.ctrlKey &&
+          !event.altKey
+        ) {
+          event.preventDefault();
+          runTypeahead(event.key);
+        }
         break;
     }
   };
 
   const handleOptionClick = (val: string) => {
     onChange(val);
-    setIsOpen(false);
-    triggerRef.current?.focus();
+    closeListbox();
   };
 
   // Adjust scroll position of focused item
@@ -125,15 +211,16 @@ export function CustomSelect({
 
   return (
     <div className="form-field form-field--custom-select" ref={containerRef}>
-      {/* Label linked to the visually hidden select element */}
-      <label className="form-field__label" htmlFor={id}>
+      {/* Label — not associated with the native select via htmlFor; AT labeling
+          is handled by aria-labelledby on the combobox trigger. */}
+      <label id={labelId} className="form-field__label">
         {label}
       </label>
 
-      <div style={{ position: "relative" }}>
+      <div className="custom-select__popover-anchor">
         {/* Visually hidden native select element for Playwright e2e tests & native forms */}
         <select
-          id={id}
+          id={`${baseId}-native`}
           name={name}
           value={value}
           onChange={(e) => onChange(e.target.value)}
@@ -154,21 +241,31 @@ export function CustomSelect({
         <button
           ref={triggerRef}
           type="button"
+          role="combobox"
           aria-haspopup="listbox"
           aria-expanded={isOpen}
-          aria-controls={`${id}-listbox`}
+          aria-controls={listboxId}
+          aria-activedescendant={activeDescendantId}
+          aria-labelledby={`${labelId} ${valueId}`}
+          aria-describedby={ariaDescribedby}
+          aria-invalid={ariaInvalid}
           disabled={disabled}
           onKeyDown={handleKeyDown}
           onClick={() => {
-            if (!disabled) {
-              setIsOpen(!isOpen);
-              setFocusedIndex(options.findIndex((opt) => opt.value === value));
+            if (disabled) return;
+            if (isOpen) {
+              setIsOpen(false);
+              setFocusedIndex(-1);
+            } else {
+              openListbox();
             }
           }}
           className="custom-select__trigger"
           data-focused={isOpen ? "true" : "false"}
         >
-          <span className="custom-select__value">{selectedOption?.label}</span>
+          <span id={valueId} className="custom-select__value">
+            {selectedOption?.label}
+          </span>
           <svg
             className="custom-select__arrow"
             xmlns="http://www.w3.org/2000/svg"
@@ -187,7 +284,7 @@ export function CustomSelect({
           <div className="custom-select__popover-wrapper">
             <div className="custom-select__popover">
               <ul
-                id={`${id}-listbox`}
+                id={listboxId}
                 role="listbox"
                 ref={listboxRef}
                 className="custom-select__listbox"
@@ -199,8 +296,10 @@ export function CustomSelect({
                   return (
                     <li
                       key={opt.value}
+                      id={optionId(idx)}
                       role="option"
                       aria-selected={isSelected}
+                      onMouseDown={(e) => e.preventDefault()}
                       onClick={() => handleOptionClick(opt.value)}
                       className="custom-select__item"
                       data-selected={isSelected ? "true" : "false"}

@@ -2,6 +2,8 @@
 
 import { useId, useState, type FormEvent } from "react";
 
+import styles from "./CustomAmazonQueryForm.module.css";
+
 export type CustomAmazonQueryFormProps = {
   generatorName: string;
   disabled?: boolean;
@@ -41,11 +43,11 @@ export function CustomAmazonQueryForm({
         <legend className="setup-form__legend">
           {generatorName}, enter Amazon product query
         </legend>
-        <p className="eyebrow" style={{ color: "var(--accent-magenta)", marginBottom: "16px" }}>
+        <p className={`eyebrow ${styles.notice}`} role="note">
           ⚠️ Other player should look away!
         </p>
 
-        <div className="setup-form__grid" style={{ gridTemplateColumns: "1fr" }}>
+        <div className="setup-form__grid setup-form__grid--single">
           <div className="form-field">
             <label className="form-field__label" htmlFor={`${formId}-query`}>
               Search Term / Product Name
@@ -69,7 +71,7 @@ export function CustomAmazonQueryForm({
           </div>
         </div>
 
-        <button className="setup-form__submit" type="submit" style={{ marginTop: "24px" }}>
+        <button className={`setup-form__submit ${styles.submit}`} type="submit">
           Submit & Scrape Price
         </button>
       </fieldset>
