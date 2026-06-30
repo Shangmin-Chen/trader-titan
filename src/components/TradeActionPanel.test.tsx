@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, fireEvent } from "@testing-library/react";
 import React from "react";
 import { describe, it, expect, vi } from "vitest";
 import { TradeActionPanel } from "./TradeActionPanel";
@@ -68,5 +68,31 @@ describe("TradeActionPanel", () => {
     const sellDesc = document.getElementById(sellDescId!);
     expect(sellDesc).not.toBeNull();
     expect(sellDesc).toHaveTextContent(/100/); // bid price
+  });
+
+  it("T31: enabled state — Buy and Sell buttons are enabled, onClick callbacks fire", () => {
+    const onBuy = vi.fn();
+    const onSell = vi.fn();
+    render(
+      <TradeActionPanel
+        onBuy={onBuy}
+        onSell={onSell}
+        players={players}
+        quote={quote}
+        roles={roles}
+      />
+    );
+
+    const buyBtn = screen.getByRole("button", { name: "Buy" });
+    const sellBtn = screen.getByRole("button", { name: "Sell" });
+
+    expect(buyBtn).not.toBeDisabled();
+    expect(sellBtn).not.toBeDisabled();
+
+    fireEvent.click(buyBtn);
+    expect(onBuy).toHaveBeenCalledOnce();
+
+    fireEvent.click(sellBtn);
+    expect(onSell).toHaveBeenCalledOnce();
   });
 });

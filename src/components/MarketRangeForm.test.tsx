@@ -41,4 +41,18 @@ describe("MarketRangeForm", () => {
     expect(screen.getByRole("alert")).toBeInTheDocument();
     expect(onSubmit).not.toHaveBeenCalled();
   });
+
+  it("T30: valid bid+ask submission — onSubmit called with correct Quote when spread is consistent", () => {
+    const onSubmit = vi.fn();
+    render(<MarketRangeForm spreadWidth={100} onSubmit={onSubmit} />);
+
+    // Type 200 into Bid; setFromBid auto-fills Ask to 300 (200 + 100)
+    fireEvent.change(screen.getByLabelText("Bid"), { target: { value: "200" } });
+
+    fireEvent.click(screen.getByRole("button", { name: "Commit market" }));
+
+    expect(onSubmit).toHaveBeenCalledOnce();
+    expect(onSubmit).toHaveBeenCalledWith({ bid: 200, ask: 300 });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
 });

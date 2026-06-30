@@ -29,12 +29,13 @@ describe("TurnBanner", () => {
   });
 
   // T18a ────────────────────────────────────────────────────────────────────
-  it("T18a: isYourTurn=false waitingForName='Ada' → 'Waiting for Ada', role=status, aria-live=polite, data-your-turn='false'", () => {
+  // Note: aria-live and aria-atomic are implied by role="status" per WAI-ARIA
+  // spec; explicit attributes were removed (N-new-1 fix). We verify role only.
+  it("T18a: isYourTurn=false waitingForName='Ada' → 'Waiting for Ada', role=status, data-your-turn='false'", () => {
     render(<TurnBanner isYourTurn={false} waitingForName="Ada" />);
     const banner = screen.getByTestId("turn-banner");
     expect(screen.getByText("Waiting for Ada")).toBeInTheDocument();
     expect(banner).toHaveAttribute("role", "status");
-    expect(banner).toHaveAttribute("aria-live", "polite");
     expect(banner).toHaveAttribute("data-your-turn", "false");
   });
 

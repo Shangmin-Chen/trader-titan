@@ -13,13 +13,13 @@
 }
 
 .result[data-outcome="win"] {
-  border-color: rgba(16, 185, 129, 0.45);
+  border-color: var(--color-buy-a45);
   background: var(--color-buy-glow);
   box-shadow: var(--glow-buy);
 }
 
 .result[data-outcome="loss"] {
-  border-color: rgba(244, 63, 94, 0.45);
+  border-color: var(--color-sell-a45);
   background: var(--color-sell-glow);
   box-shadow: var(--glow-sell);
 }
@@ -34,8 +34,8 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 40px; /* --size-icon-md: 40px -- no token yet */
-  height: 40px; /* --size-icon-md: 40px -- no token yet */
+  width: var(--size-icon-md);
+  height: var(--size-icon-md);
   border-radius: var(--radius-pill);
   font-size: var(--text-lg);
   font-weight: 700;
@@ -44,17 +44,17 @@
 
 .result[data-outcome="win"] .resultIcon {
   color: var(--color-buy);
-  background: rgba(16, 185, 129, 0.15);
+  background: var(--color-buy-a15);
 }
 
 .result[data-outcome="loss"] .resultIcon {
   color: var(--color-sell);
-  background: rgba(244, 63, 94, 0.15);
+  background: var(--color-sell-a15);
 }
 
 .result[data-outcome="even"] .resultIcon {
   color: var(--color-warn);
-  background: rgba(245, 158, 11, 0.15);
+  background: var(--color-warn-a15);
 }
 
 .resultBody {

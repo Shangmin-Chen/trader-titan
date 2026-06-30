@@ -48,9 +48,9 @@
   color: var(--accent-cyan);
   white-space: nowrap;
   padding: 2px var(--space-xs);
-  border: 1px solid rgba(0, 210, 255, 0.3);
+  border: 1px solid var(--accent-cyan-a30);
   border-radius: var(--radius-pill);
-  background: rgba(0, 210, 255, 0.08);
+  background: var(--accent-cyan-a08);
   letter-spacing: 0.04em;
 }
 

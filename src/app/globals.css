@@ -63,6 +63,7 @@
   --space-2xl: 48px;
 
   /* Fluid type scale via clamp() so type scales down on phones */
+  --text-2xs: clamp(0.65rem, 0.62rem + 0.1vw, 0.72rem);
   --text-xs: clamp(0.68rem, 0.66rem + 0.1vw, 0.75rem);
   --text-sm: clamp(0.8rem, 0.77rem + 0.15vw, 0.875rem);
   --text-base: clamp(0.9rem, 0.86rem + 0.2vw, 1rem);
@@ -80,6 +81,7 @@
 
   /* Minimum interactive target (WCAG 2.5.5 / mobile ergonomics) */
   --tap-target: 44px;
+  --size-icon-md: 40px;
 
   /* Motion */
   --transition-fast: 0.15s cubic-bezier(0.4, 0, 0.2, 1);
@@ -92,9 +94,11 @@
   --safe-left: env(safe-area-inset-left, 0px);
 
   /* Alpha-variant tokens for module use */
+  --color-sell-a08: rgba(244, 63, 94, 0.08);
   --color-sell-a15: rgba(244, 63, 94, 0.15);
   --color-sell-a40: rgba(244, 63, 94, 0.40);
   --color-sell-a45: rgba(244, 63, 94, 0.45);
+  --color-buy-a08: rgba(16, 185, 129, 0.08);
   --color-buy-a15: rgba(16, 185, 129, 0.15);
   --color-buy-a35: rgba(16, 185, 129, 0.35);
   --color-buy-a40: rgba(16, 185, 129, 0.40);
@@ -184,7 +188,6 @@ a:focus-visible,
 .copy-button:focus-visible,
 .quick-chip:focus-visible,
 .stepper-input__button:focus-visible,
-.phase-stepper__step:focus-visible,
 .sticky-action-bar button:focus-visible {
   outline: 2px solid var(--accent-cyan) !important;
   outline-offset: 3px !important;
@@ -528,7 +531,8 @@ select.form-field__control {
 }
 
 /* Custom Select styling */
-.sr-only {
+.sr-only,
+.announcer {
   position: absolute !important;
   width: 1px !important;
   height: 1px !important;
@@ -595,6 +599,10 @@ select.form-field__control {
 .custom-select__trigger[aria-expanded="true"] .custom-select__arrow {
   transform: rotate(180deg);
   stroke: var(--accent-cyan);
+}
+
+.custom-select__popover-anchor {
+  position: relative;
 }
 
 .custom-select__popover-wrapper {
@@ -695,7 +703,7 @@ select.form-field__control {
 .spread-width-form__error::before,
 .state-error::before {
   content: "⚠️";
-  font-size: 0.9rem;
+  font-size: var(--text-sm);
 }
 
 /* Custom Interactive Buttons */
@@ -854,7 +862,7 @@ select.form-field__control {
 
 .scoreboard__leader-badge {
   font-family: var(--font-mono);
-  font-size: 0.65rem;
+  font-size: var(--text-2xs);
   font-weight: 700;
   color: var(--color-buy);
   background: rgba(16, 185, 129, 0.15);
@@ -1181,7 +1189,7 @@ select.form-field__control {
 
 .action-log__meta {
   font-family: var(--font-mono);
-  font-size: 0.72rem;
+  font-size: var(--text-2xs);
   font-weight: 600;
   color: var(--accent-cyan);
   text-transform: uppercase;
@@ -1479,19 +1487,6 @@ select.form-field__control {
   pointer-events: auto;
 }
 
-/* Visually-hidden polite/assertive announcer (screen readers only) */
-.announcer {
-  position: absolute !important;
-  width: 1px !important;
-  height: 1px !important;
-  padding: 0 !important;
-  margin: -1px !important;
-  overflow: hidden !important;
-  clip: rect(0, 0, 0, 0) !important;
-  white-space: nowrap !important;
-  border: 0 !important;
-}
-
 /* ============================================================
    Collapsible / bottom-sheet region for scoreboard & action-log
    on small screens. Markup hooks consumed by other slices.
@@ -1652,7 +1647,7 @@ select.form-field__control {
 
 .source-badge {
   font-family: var(--font-mono);
-  font-size: 0.65rem;
+  font-size: var(--text-2xs);
   font-weight: 700;
   color: var(--accent-cyan);
   background: rgba(0, 210, 255, 0.15);

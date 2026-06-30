@@ -31,7 +31,7 @@ export function ActionLog({
 
   return (
     <section className="action-log" data-testid="action-log">
-      <h2 className={`action-log__title ${styles.title}`} aria-hidden="true">Action log</h2>
+      <h2 className={`action-log__title ${styles.title}`}>Action log</h2>
 
       <button
         type="button"

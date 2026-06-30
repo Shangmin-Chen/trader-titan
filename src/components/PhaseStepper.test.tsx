@@ -47,4 +47,22 @@ describe("PhaseStepper", () => {
       expect(item).not.toHaveAttribute("aria-current");
     }
   });
+
+  // T35a ────────────────────────────────────────────────────────────────────
+  it("T35a: default ariaLabel — nav has accessible name 'Round progress'", () => {
+    render(<PhaseStepper steps={STEPS} currentStepId="w" />);
+    expect(
+      screen.getByRole("navigation", { name: "Round progress" })
+    ).toBeInTheDocument();
+  });
+
+  // T35b ────────────────────────────────────────────────────────────────────
+  it("T35b: custom ariaLabel prop — nav has the custom accessible name", () => {
+    render(
+      <PhaseStepper steps={STEPS} currentStepId="w" ariaLabel="Game phases" />
+    );
+    expect(
+      screen.getByRole("navigation", { name: "Game phases" })
+    ).toBeInTheDocument();
+  });
 });

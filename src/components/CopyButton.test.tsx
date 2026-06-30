@@ -142,4 +142,29 @@ describe("CopyButton", () => {
       expect(btn).toBeInTheDocument();
     });
   });
+
+  describe("disabled state", () => {
+    afterEach(() => {
+      clearClipboard();
+    });
+
+    it("T33: disabled=true — button has disabled attribute, clipboard.writeText not called on click", async () => {
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      stubClipboard(writeText);
+
+      render(<CopyButton value="https://example.com" disabled />);
+      const btn = screen.getByRole("button");
+
+      expect(btn).toBeDisabled();
+
+      fireEvent.click(btn);
+
+      // Allow any microtasks to flush
+      await act(async () => {
+        await Promise.resolve();
+      });
+
+      expect(writeText).not.toHaveBeenCalled();
+    });
+  });
 });

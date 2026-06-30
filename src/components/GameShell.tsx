@@ -36,8 +36,6 @@ export function GameShell({
         {status ? (
           <div
             className="game-shell__status"
-            role="status"
-            aria-live="polite"
           >
             {status}
           </div>

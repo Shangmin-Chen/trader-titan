@@ -123,4 +123,14 @@ describe("StepperInput", () => {
     expect(chip100).toHaveAttribute("aria-pressed", "true");
     expect(chip50).toHaveAttribute("aria-pressed", "false");
   });
+
+  // T34 ─────────────────────────────────────────────────────────────────────
+  it("T34: - button at min value clamps to min, does not go below", () => {
+    const onChange = vi.fn();
+    render(<Controlled initialValue="1" min={1} onChange={onChange} />);
+    const decBtn = screen.getByRole("button", { name: "Decrease Amount" });
+    fireEvent.click(decBtn);
+    // clamp(1 + (-1) * 1) = clamp(0) = Math.max(1, 0) = 1
+    expect(onChange).toHaveBeenCalledWith("1");
+  });
 });

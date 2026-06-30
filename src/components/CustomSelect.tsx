@@ -217,7 +217,7 @@ export function CustomSelect({
         {label}
       </label>
 
-      <div style={{ position: "relative" }}>
+      <div className="custom-select__popover-anchor">
         {/* Visually hidden native select element for Playwright e2e tests & native forms */}
         <select
           id={`${baseId}-native`}

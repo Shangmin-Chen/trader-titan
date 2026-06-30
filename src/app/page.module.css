@@ -5,13 +5,8 @@
 
 /** Explainer text rendered below a disabled "Start game" button. */
 .startHint {
-  font-size: 0.75rem;
-  color: var(--color-muted, #888);
-  margin-top: 0.25rem;
+  font-size: var(--text-sm);
+  color: var(--text-muted);
+  margin-top: var(--space-2xs);
   line-height: 1.4;
-}
-
-/** Wrapper used so PhaseStepper + TurnBanner stack flush above play content. */
-.gameViewStack {
-  display: contents;
 }

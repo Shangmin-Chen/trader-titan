@@ -65,8 +65,6 @@ export function SettlementPanel({
         data-outcome={traderOutcome}
         data-testid="settlement-result"
         role="status"
-        aria-live="polite"
-        aria-atomic="true"
       >
         <span className={styles.resultIcon} aria-hidden="true">
           {OUTCOME_ICON[traderOutcome]}

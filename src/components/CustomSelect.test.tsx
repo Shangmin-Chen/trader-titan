@@ -157,4 +157,49 @@ describe("CustomSelect", () => {
     // sr-only selects are removed from tab order so they don't confuse AT.
     expect(select).toHaveAttribute("tabindex", "-1");
   });
+
+  it("T32a: aria-expanded is false when closed, true when open, false when closed again", () => {
+    render(<Controlled />);
+    const trigger = getTrigger();
+
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+
+    fireEvent.click(trigger);
+    expect(trigger.getAttribute("aria-expanded")).toBe("true");
+
+    fireEvent.click(trigger);
+    expect(trigger.getAttribute("aria-expanded")).toBe("false");
+  });
+
+  it("T32b: disabled=true — trigger is disabled, listbox does not open", () => {
+    const onChange = vi.fn();
+    render(
+      <CustomSelect
+        label="Fruit"
+        value="apple"
+        onChange={onChange}
+        options={OPTIONS}
+        disabled={true}
+      />
+    );
+
+    const trigger = screen.getByRole("combobox", { name: /Fruit/ });
+    expect(trigger).toBeDisabled();
+
+    fireEvent.click(trigger);
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+  });
+
+  it("T32c: Tab key closes open listbox without calling onChange", () => {
+    const onChange = vi.fn();
+    render(<Controlled onChange={onChange} />);
+    const trigger = getTrigger();
+
+    fireEvent.click(trigger);
+    expect(screen.getByRole("listbox")).toBeInTheDocument();
+
+    fireEvent.keyDown(trigger, { key: "Tab" });
+    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+    expect(onChange).not.toHaveBeenCalled();
+  });
 });

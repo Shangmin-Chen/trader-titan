@@ -23,13 +23,13 @@
 }
 
 .quoteSideSell {
-  border-color: rgba(244, 63, 94, 0.4);
-  background: rgba(244, 63, 94, 0.08);
+  border-color: var(--color-sell-a40);
+  background: var(--color-sell-a08);
 }
 
 .quoteSideBuy {
-  border-color: rgba(16, 185, 129, 0.4);
-  background: rgba(16, 185, 129, 0.08);
+  border-color: var(--color-buy-a40);
+  background: var(--color-buy-a08);
 }
 
 .quoteLabel {

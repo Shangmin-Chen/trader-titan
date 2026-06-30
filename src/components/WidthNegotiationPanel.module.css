@@ -8,8 +8,8 @@
   gap: var(--space-2xs);
   padding: var(--space-md) var(--space-lg);
   border-radius: var(--radius-lg);
-  border: 1px solid rgba(0, 210, 255, 0.18);
-  background: rgba(0, 210, 255, 0.07);
+  border: 1px solid var(--accent-cyan-a18);
+  background: var(--accent-cyan-a07);
   text-align: center;
 }
 
