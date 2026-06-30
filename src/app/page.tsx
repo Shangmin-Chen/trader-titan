@@ -986,6 +986,7 @@ function RoomControls({
       {isHost ? (
         <div className="invite-box">
           <p className="form-field__label">Invite link</p>
+          <input type="hidden" id="room-invite-link" value={inviteLink} readOnly />
           <CopyButton
             value={inviteLink}
             label="Copy invite link"
