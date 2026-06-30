@@ -662,7 +662,11 @@ type CreateRoomPanelProps = Readonly<{
 
 function CreateRoomPanel({ disabled, error, onCreate }: CreateRoomPanelProps) {
   const formId = useId();
-  const [hostName, setHostName] = useState("Host");
+  // Starts empty (with a placeholder) rather than pre-filled with "Host" —
+  // a pre-filled real-looking value reads as a fixed label rather than an
+  // invitation to type your own name, so people would create rooms still
+  // named "Host" without realizing the field was editable.
+  const [hostName, setHostName] = useState("");
   const [mode, setMode] = useState<GameMode>(GAME_MODES[0]);
   const [totalRoundsInput, setTotalRoundsInput] = useState("3");
   const [customAmazonQuery, setCustomAmazonQuery] = useState(false);
@@ -728,10 +732,12 @@ function CreateRoomPanel({ disabled, error, onCreate }: CreateRoomPanelProps) {
                 fieldErrors.hostName ? `${formId}-host-error` : undefined
               }
               aria-invalid={Boolean(fieldErrors.hostName)}
+              autoComplete="name"
               className="form-field__control"
               id={`${formId}-host`}
               name="hostName"
               onChange={(event) => setHostName(event.target.value)}
+              placeholder="e.g. Alex"
               type="text"
               value={hostName}
             />
@@ -775,12 +781,12 @@ function CreateRoomPanel({ disabled, error, onCreate }: CreateRoomPanelProps) {
               className="form-field__control"
               id={`${formId}-rounds`}
               inputMode="numeric"
-              max={MAX_ROUNDS}
-              min={1}
               name="totalRounds"
-              onChange={(event) => setTotalRoundsInput(event.target.value)}
-              step={1}
-              type="number"
+              onChange={(event) =>
+                setTotalRoundsInput(sanitizeDigitsOnly(event.target.value))
+              }
+              pattern="[0-9]*"
+              type="text"
               value={totalRoundsInput}
             />
             {fieldErrors.totalRounds ? (
@@ -1424,6 +1430,17 @@ function LastError({ game }: LastErrorProps) {
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
+
+/**
+ * Strips everything except ASCII digits. Used on numeric-only text fields
+ * (e.g. "Total rounds") instead of `type="number"`, whose native input
+ * still happily accepts "e", "+", "-", and "." as valid keystrokes (they're
+ * legal scientific-notation syntax) even though none of those make sense
+ * for a round count.
+ */
+function sanitizeDigitsOnly(value: string): string {
+  return value.replace(/[^0-9]/g, "");
+}
 
 function buildStartPayload(input: {
   hostName: string;
