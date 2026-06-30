@@ -1,10 +1,6 @@
-/* ActionLog: mobile collapse behavior layered on the design-system
-   .collapsible-region hooks. Mobile-first: the toggle disclosure is shown
-   and the global `[aria-expanded="false"] + .collapsible-region__body`
-   rule drives the collapse. On desktop the panel is always open and the
-   heading replaces the toggle. */
+/* ActionLog — mobile-first collapsible, always-open on desktop */
 
-/* Mobile (default): hide the static heading, the toggle is the header. */
+/* Mobile: hide the static heading; the toggle is the header */
 .title {
   display: none;
 }
@@ -16,17 +12,19 @@
 .chevron {
   font-size: var(--text-xs);
   line-height: 1;
-  color: var(--text-secondary);
+  color: var(--text-muted);
+  transition: transform var(--transition-fast), color var(--transition-fast);
+}
+
+.toggle[aria-expanded="true"] .chevron {
+  color: var(--accent-hover);
 }
 
 .body {
-  /* Inherit the collapsible-region__body spacing from globals; nothing
-     extra needed on mobile. */
   min-height: 0;
 }
 
-/* Desktop: no collapsing. Show the heading, hide the toggle, and force the
-   body open even if it was collapsed on a smaller viewport. */
+/* Desktop: no collapsing — show heading, hide toggle, force body open */
 @media (min-width: 768px) {
   .title {
     display: block;
@@ -36,7 +34,6 @@
     display: none;
   }
 
-  /* Override the global collapse rule so the body is always visible. */
   .body {
     display: block;
     margin-top: 0;
