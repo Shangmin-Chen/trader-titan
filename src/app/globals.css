@@ -123,6 +123,7 @@ html {
   scroll-behavior: smooth;
   -webkit-text-size-adjust: 100%;
   text-size-adjust: 100%;
+  overflow-wrap: break-word;
 }
 
 body {
@@ -304,6 +305,15 @@ a:focus-visible,
   justify-content: stretch;
 }
 
+@media (max-width: 767px) {
+  .game-shell__main {
+    border: none;
+    background: none;
+    box-shadow: none;
+    padding: 0;
+  }
+}
+
 .game-shell__sidebar {
   background: transparent;
   box-shadow: none;
@@ -375,6 +385,8 @@ a:focus-visible,
   border: 1px solid var(--border-dim);
   border-radius: var(--radius-lg);
   background: var(--bg-surface-soft);
+  word-break: break-all;
+  overflow-wrap: break-word;
 }
 
 .room-controls__summary {
@@ -404,8 +416,26 @@ a:focus-visible,
 
 .room-actions {
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
   gap: 10px;
+  width: 100%;
+}
+
+.room-actions > *,
+.room-actions button {
+  width: 100%;
+}
+
+@media (min-width: 768px) {
+  .room-actions {
+    flex-direction: row;
+    flex-wrap: wrap;
+    align-items: center;
+  }
+  .room-actions > *,
+  .room-actions button {
+    width: auto;
+  }
 }
 
 .room-error {
