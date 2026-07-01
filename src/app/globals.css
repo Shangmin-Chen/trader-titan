@@ -639,6 +639,38 @@ a:focus-visible,
   line-height: 1.5;
 }
 
+.room-controls__presence {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-xs);
+}
+
+.room-controls__presence-pill {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 4px 10px;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-pill);
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  line-height: 1.2;
+}
+
+.room-controls__presence-pill[data-state="connected"] {
+  border-color: var(--buy-border);
+  background: var(--buy-dim);
+  color: var(--buy);
+}
+
+.room-controls__presence-pill[data-state="disconnected"] {
+  border-color: var(--sell-border);
+  background: var(--sell-dim);
+  color: var(--sell);
+}
+
 .invite-box {
   display: grid;
   gap: var(--space-xs);
@@ -1419,6 +1451,13 @@ select.form-field__control {
   font-size: var(--text-lg);
   font-weight: 600;
   margin: 0;
+}
+
+.settlement-panel__disabled-reason {
+  margin: calc(-1 * var(--space-xs)) 0 0;
+  color: var(--warn);
+  font-size: var(--text-sm);
+  line-height: 1.45;
 }
 
 /* PnL row colors — player A / player B */

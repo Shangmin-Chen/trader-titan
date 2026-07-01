@@ -43,6 +43,12 @@ const SNAPSHOT = {
       displayName: null,
     },
   },
+  presence: {
+    players: {
+      A: true,
+      B: false,
+    },
+  },
   game: {
     phase: "setup",
     mode: "Chaos Quant",

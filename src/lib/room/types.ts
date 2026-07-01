@@ -12,6 +12,9 @@ export const PLAYER_DISPLAY_NAME_MAX_LENGTH = 80;
 
 export type UnixTimeMs = number;
 export type RoomLifecycle = "lobby" | "active" | "finished";
+export type RoomPresence = Readonly<{
+  players: Readonly<Record<PlayerId, boolean>>;
+}>;
 
 export type RoomGameConfig = Readonly<{
   mode: GameMode;
@@ -70,6 +73,7 @@ export type RoomDomainErrorCode =
   | "guest_slot_full"
   | "guest_slot_empty"
   | "guest_required"
+  | "player_offline"
   | "invalid_config"
   | "invalid_game_phase"
   | "persistence_invalid"

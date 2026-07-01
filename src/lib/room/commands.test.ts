@@ -21,6 +21,7 @@ import {
   type RoomCapabilityToken,
   type RoomCommandResult,
   type RoomId,
+  type RoomPresence,
   type RoomState,
   type TokenHash,
   type TokenVerifier,
@@ -31,6 +32,18 @@ const ROOM_ID_VALUE = "room_commands_0001";
 const HOST_SECRET = "host_secret_100000000001";
 const GUEST_SECRET = "guest_secret_100000000001";
 const NEXT_GUEST_SECRET = "guest_secret_100000000002";
+const LIVE_PRESENCE = {
+  players: {
+    A: true,
+    B: true,
+  },
+} satisfies RoomPresence;
+const GUEST_OFFLINE_PRESENCE = {
+  players: {
+    A: true,
+    B: false,
+  },
+} satisfies RoomPresence;
 
 const item: GeneratedItem = {
   round_id: "round-commands-1",
@@ -53,6 +66,7 @@ describe("room commands", () => {
     const started = expectOk(
       startRoom(configured, {
         credential: present(hostToken),
+        presence: LIVE_PRESENCE,
         verifyToken,
         nowMs: NOW_MS + 3,
       }),
@@ -109,6 +123,7 @@ describe("room commands", () => {
     const finished = expectOk(
       advanceRoomRound(settled, {
         credential: present(hostToken),
+        presence: LIVE_PRESENCE,
         verifyToken,
         nowMs: NOW_MS + 11,
       }),
@@ -117,6 +132,84 @@ describe("room commands", () => {
     expect(finished.lifecycle).toBe("finished");
     expect(finished.game.phase).toBe("gameOver");
     expect(finished.game.scores.A + finished.game.scores.B).toBe(0);
+  });
+
+  it("rejects starting a joined room while Player B is offline", () => {
+    const { room, hostToken } = joinedRoom();
+    const result = startRoom(room, {
+      credential: present(hostToken),
+      presence: GUEST_OFFLINE_PRESENCE,
+      verifyToken,
+      nowMs: NOW_MS + 2,
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      room,
+      error: {
+        code: "player_offline",
+        message: "Player B must be connected before the room can continue.",
+      },
+    });
+  });
+
+  it("rejects non-final round advance while Player B is offline", () => {
+    const { room, hostToken } = settlingRoom();
+    const settled = expectOk(
+      receiveRoomSettlement(room, settledItemFor(room.game, 1_200), NOW_MS + 10),
+    );
+    const result = advanceRoomRound(settled, {
+      credential: present(hostToken),
+      presence: GUEST_OFFLINE_PRESENCE,
+      verifyToken,
+      nowMs: NOW_MS + 11,
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      room: settled,
+      error: {
+        code: "player_offline",
+        message: "Player B must be connected before the room can continue.",
+      },
+    });
+  });
+
+  it("allows final round advance to game over while Player B is offline", () => {
+    const { room, hostToken } = settlingRoom(1);
+    const settled = expectOk(
+      receiveRoomSettlement(room, settledItemFor(room.game, 1_200), NOW_MS + 10),
+    );
+    const finished = expectOk(
+      advanceRoomRound(settled, {
+        credential: present(hostToken),
+        presence: GUEST_OFFLINE_PRESENCE,
+        verifyToken,
+        nowMs: NOW_MS + 11,
+      }),
+    );
+
+    expect(finished.lifecycle).toBe("finished");
+    expect(finished.game.phase).toBe("gameOver");
+  });
+
+  it("keeps Player B as round 2 market maker when both players are live", () => {
+    const { room, hostToken } = settlingRoom();
+    const settled = expectOk(
+      receiveRoomSettlement(room, settledItemFor(room.game, 1_200), NOW_MS + 10),
+    );
+    const round2 = expectOk(
+      advanceRoomRound(settled, {
+        credential: present(hostToken),
+        presence: LIVE_PRESENCE,
+        verifyToken,
+        nowMs: NOW_MS + 11,
+      }),
+    );
+
+    expect(round2.game.phase).toBe("generatingItem");
+    expect(round2.game.roundNumber).toBe(2);
+    expect(round2.game.roles).toEqual({ marketMaker: "B", trader: "A" });
   });
 
   it("computes settlement server-side from the active settling room", () => {
@@ -157,6 +250,7 @@ describe("room commands", () => {
     );
     const earlyAdvance = advanceRoomRound(room, {
       credential: present(hostToken),
+      presence: LIVE_PRESENCE,
       verifyToken,
       nowMs: NOW_MS + 11,
     });
@@ -260,6 +354,7 @@ describe("room commands", () => {
     const started = expectOk(
       startRoom(room, {
         credential: present(hostToken),
+        presence: LIVE_PRESENCE,
         verifyToken,
         nowMs: NOW_MS + 3,
       }),
@@ -297,17 +392,29 @@ describe("room commands", () => {
   });
 });
 
-function activeRoom(): {
+function activeRoom(totalRounds?: number): {
   room: RoomState;
   hostToken: RoomCapabilityToken;
   guestToken: RoomCapabilityToken;
 } {
   const { room, hostToken, guestToken } = joinedRoom();
+  const configured =
+    totalRounds === undefined
+      ? room
+      : expectOk(
+          configureRoom(room, {
+            credential: present(hostToken),
+            verifyToken,
+            nowMs: NOW_MS + 1,
+            config: { totalRounds },
+          }),
+        );
 
   return {
     room: expectOk(
-      startRoom(room, {
+      startRoom(configured, {
         credential: present(hostToken),
+        presence: LIVE_PRESENCE,
         verifyToken,
         nowMs: NOW_MS + 2,
       }),
@@ -317,12 +424,12 @@ function activeRoom(): {
   };
 }
 
-function settlingRoom(): {
+function settlingRoom(totalRounds?: number): {
   room: RoomState & { game: Extract<RoomState["game"], { phase: "settling" }> };
   hostToken: RoomCapabilityToken;
   guestToken: RoomCapabilityToken;
 } {
-  const { room, hostToken, guestToken } = activeRoom();
+  const { room, hostToken, guestToken } = activeRoom(totalRounds);
   const withItem = expectOk(receiveRoomItem(room, item, NOW_MS + 4));
   const opened = expectOk(
     submitInitialWidth(withItem, 200, {

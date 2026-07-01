@@ -17,7 +17,12 @@ import {
 } from "./commands";
 import type { ClientRoomCommand, SystemRoomEvent } from "./protocol";
 import type { TokenVerifier } from "./tokens";
-import type { RoomCommandResult, RoomState } from "./types";
+import type { RoomCommandResult, RoomPresence, RoomState } from "./types";
+
+export type RoomCommandDispatchContext = Readonly<{
+  presence: RoomPresence;
+  verifyToken: TokenVerifier;
+}>;
 
 /**
  * Durable Objects can share one command execution path after protocol decoding,
@@ -26,7 +31,7 @@ import type { RoomCommandResult, RoomState } from "./types";
 export function dispatchRoomCommand(
   room: RoomState,
   command: ClientRoomCommand,
-  verifyToken: TokenVerifier,
+  context: RoomCommandDispatchContext,
 ): RoomCommandResult {
   switch (command.type) {
     case "JOIN_ROOM":
@@ -39,61 +44,63 @@ export function dispatchRoomCommand(
       return configureRoom(room, {
         credential: command.credential,
         config: command.config,
-        verifyToken,
+        verifyToken: context.verifyToken,
         nowMs: command.nowMs,
       });
     case "START_ROOM":
       return startRoom(room, {
         credential: command.credential,
-        verifyToken,
+        presence: context.presence,
+        verifyToken: context.verifyToken,
         nowMs: command.nowMs,
       });
     case "RESET_TO_LOBBY":
       return resetRoomToLobby(room, {
         credential: command.credential,
-        verifyToken,
+        verifyToken: context.verifyToken,
         nowMs: command.nowMs,
       });
     case "KICK_GUEST":
       return kickGuest(room, {
         credential: command.credential,
-        verifyToken,
+        verifyToken: context.verifyToken,
         nowMs: command.nowMs,
       });
     case "ADVANCE_ROUND":
       return advanceRoomRound(room, {
         credential: command.credential,
-        verifyToken,
+        presence: context.presence,
+        verifyToken: context.verifyToken,
         nowMs: command.nowMs,
       });
     case "SUBMIT_INITIAL_WIDTH":
       return submitInitialWidth(room, command.width, {
         credential: command.credential,
-        verifyToken,
+        verifyToken: context.verifyToken,
         nowMs: command.nowMs,
       });
     case "TIGHTEN_WIDTH":
       return tightenWidth(room, command.width, {
         credential: command.credential,
-        verifyToken,
+        verifyToken: context.verifyToken,
         nowMs: command.nowMs,
       });
     case "TRADE_ON_WIDTH":
       return tradeOnWidth(room, {
         credential: command.credential,
-        verifyToken,
+        verifyToken: context.verifyToken,
         nowMs: command.nowMs,
       });
     case "SUBMIT_MARKET_QUOTE":
       return submitMarketQuote(room, command.quote, {
         credential: command.credential,
-        verifyToken,
+        verifyToken: context.verifyToken,
         nowMs: command.nowMs,
       });
     case "EXECUTE_TRADE":
       return executeTrade(room, command.side, {
         credential: command.credential,
-        verifyToken,
+        verifyToken: context.verifyToken,
         nowMs: command.nowMs,
       });
     default:

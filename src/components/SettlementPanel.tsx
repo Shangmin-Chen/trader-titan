@@ -1,3 +1,4 @@
+import { useId } from "react";
 import {
   formatNumber,
   formatSignedNumber,
@@ -10,6 +11,7 @@ import styles from "./SettlementPanel.module.css";
 
 export type SettlementPanelProps = {
   disabled?: boolean;
+  disabledReason?: string;
   isFinalRound?: boolean;
   onContinue: () => void;
   players: Record<PlayerId, Player>;
@@ -42,13 +44,19 @@ const OUTCOME_WORD: Record<Outcome, string> = {
 
 export function SettlementPanel({
   disabled = false,
+  disabledReason,
   isFinalRound = false,
   onContinue,
   players,
   settlement,
 }: SettlementPanelProps) {
+  const disabledReasonBaseId = useId();
   const trader = players[settlement.trader];
   const marketMaker = players[settlement.marketMaker];
+  const disabledReasonId =
+    disabledReason === undefined
+      ? undefined
+      : `${disabledReasonBaseId}-disabled-reason`;
 
   const traderOutcome = outcomeOf(settlement.traderPnL);
   const marketMakerOutcome = outcomeOf(settlement.marketMakerPnL);
@@ -119,6 +127,7 @@ export function SettlementPanel({
       </dl>
 
       <button
+        aria-describedby={disabledReasonId}
         className="settlement-panel__continue"
         disabled={disabled}
         onClick={onContinue}
@@ -126,6 +135,15 @@ export function SettlementPanel({
       >
         {isFinalRound ? "End game" : "Next round"}
       </button>
+      {disabledReason ? (
+        <p
+          className="settlement-panel__disabled-reason"
+          id={disabledReasonId}
+          role="status"
+        >
+          {disabledReason}
+        </p>
+      ) : null}
     </section>
   );
 }

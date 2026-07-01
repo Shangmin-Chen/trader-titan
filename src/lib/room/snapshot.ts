@@ -8,6 +8,7 @@ import type {
   GeneratingItemGameState,
   NegotiatingWidthGameState,
   Player,
+  PlayerId,
   RoundLogEntry,
   RoundSettlement,
   Scores,
@@ -22,6 +23,7 @@ import type { RoomId } from "./ids";
 import type {
   RoomGameConfig,
   RoomLifecycle,
+  RoomPresence,
   RoomState,
   UnixTimeMs,
 } from "./types";
@@ -77,6 +79,10 @@ export type PublicRoomGameState =
   | PublicGameOverState
   | PublicErrorGameState;
 
+export type PublicRoomPresence = Readonly<{
+  players: Readonly<Record<PlayerId, boolean>>;
+}>;
+
 export type PublicRoomSnapshot = Readonly<{
   id: RoomId;
   lifecycle: RoomLifecycle;
@@ -85,6 +91,7 @@ export type PublicRoomSnapshot = Readonly<{
     host: PublicRoomSeat;
     guest: PublicRoomSeat;
   }>;
+  presence: PublicRoomPresence;
   game: PublicRoomGameState;
   createdAtMs: UnixTimeMs;
   updatedAtMs: UnixTimeMs;
@@ -110,7 +117,10 @@ export type PublicRoomInvitePreview = Readonly<{
  * Snapshots are the only room shape intended for clients, so every credential
  * and persistence-only field is omitted here rather than relying on callers.
  */
-export function toPublicRoomSnapshot(room: RoomState): PublicRoomSnapshot {
+export function toPublicRoomSnapshot(
+  room: RoomState,
+  presence: RoomPresence,
+): PublicRoomSnapshot {
   return {
     id: room.id,
     lifecycle: room.lifecycle,
@@ -137,6 +147,7 @@ export function toPublicRoomSnapshot(room: RoomState): PublicRoomSnapshot {
               displayName: room.guest.displayName,
             },
     },
+    presence: toPublicRoomPresence(room, presence),
     game: toPublicGameState(room.game),
     createdAtMs: room.createdAtMs,
     updatedAtMs: room.updatedAtMs,
@@ -283,6 +294,18 @@ function publicScores(scores: Scores): Scores {
   return {
     A: scores.A,
     B: scores.B,
+  };
+}
+
+function toPublicRoomPresence(
+  room: RoomState,
+  presence: RoomPresence,
+): PublicRoomPresence {
+  return {
+    players: {
+      A: presence.players.A === true,
+      B: room.guest !== null && presence.players.B === true,
+    },
   };
 }
 

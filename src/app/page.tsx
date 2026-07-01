@@ -393,9 +393,10 @@ function HomeContent() {
   const actor = session === null ? null : actorPlayerId(session);
   const game = room?.game ?? null;
   const isHost = session?.role === "host";
-  const guestPresent = room?.seats.guest.occupied === true;
+  const guestSeatOccupied = room?.seats.guest.occupied === true;
+  const guestConnected = room?.presence.players.B === true;
   const canStartRoom =
-    isHost && room?.lifecycle === "lobby" && guestPresent && !isCommanding;
+    isHost && room?.lifecycle === "lobby" && guestConnected && !isCommanding;
   const canHostControl = isHost && room !== null && !isCommanding;
 
   const runCommand = useCallback(
@@ -584,7 +585,8 @@ function HomeContent() {
             canHostControl={canHostControl}
             canStartRoom={canStartRoom}
             connectionStatus={connectionStatus}
-            guestPresent={guestPresent}
+            guestConnected={guestConnected}
+            guestSeatOccupied={guestSeatOccupied}
             inviteLink={inviteLink}
             isCommanding={isCommanding}
             isHost={isHost}
@@ -611,6 +613,7 @@ function HomeContent() {
           <RoomGameView
             actor={actor}
             game={game}
+            guestConnected={guestConnected}
             isCommanding={isCommanding}
             isGeneratingCustomItem={isGeneratingCustomItem}
             isHost={isHost}
@@ -933,8 +936,10 @@ type RoomControlsProps = Readonly<{
   canHostControl: boolean;
   canStartRoom: boolean;
   connectionStatus: ConnectionStatus;
-  /** Whether a guest is currently occupying the guest seat. */
-  guestPresent: boolean;
+  /** Whether player B currently has a live room connection. */
+  guestConnected: boolean;
+  /** Whether the guest seat is occupied, independent of live presence. */
+  guestSeatOccupied: boolean;
   inviteLink: string;
   isCommanding: boolean;
   isHost: boolean;
@@ -950,7 +955,8 @@ function RoomControls({
   canHostControl,
   canStartRoom,
   connectionStatus,
-  guestPresent,
+  guestConnected,
+  guestSeatOccupied,
   inviteLink,
   isCommanding,
   isHost,
@@ -966,12 +972,28 @@ function RoomControls({
   const guestLabel = room.seats.guest.occupied
     ? room.seats.guest.displayName
     : "Waiting for player B";
+  const localConnectionLabel = connectionStatusLabel(connectionStatus);
+  const playerBPresenceState = !guestSeatOccupied
+    ? "empty"
+    : guestConnected
+      ? "connected"
+      : "disconnected";
+  const playerBPresenceLabel = guestConnected ? "Connected" : "Disconnected";
+  const playerBPresenceText = guestSeatOccupied
+    ? `Player B: ${playerBPresenceLabel}`
+    : "Player B: No guest";
+  const startHint = !guestSeatOccupied
+    ? "Waiting for player B to join"
+    : "Player B is disconnected";
 
-  // Show a hint explaining why Start is disabled when the guest hasn't joined.
-  // Only show the "waiting for player B" copy; don't mention the commanding
-  // state (transient, not user-actionable).
+  // Show a hint explaining why Start is disabled for stable guest states.
+  // Do not mention the commanding state here; it is transient and not
+  // user-actionable.
   const showStartHint =
-    isHost && room.lifecycle === "lobby" && !canStartRoom && !guestPresent;
+    isHost &&
+    room.lifecycle === "lobby" &&
+    !canStartRoom &&
+    (!guestSeatOccupied || !guestConnected);
 
   // Room admin chrome (invite link, reset/kick/forget) is the primary task
   // in the lobby and on the game-over screen, so it starts expanded there.
@@ -1039,7 +1061,8 @@ function RoomControls({
         type="button"
       >
         <span>
-          Room settings · {connectionStatusLabel(connectionStatus)}
+          Room settings · This browser: {localConnectionLabel} ·{" "}
+          {playerBPresenceText}
         </span>
         <span aria-hidden="true">{expanded ? "▾" : "▸"}</span>
       </button>
@@ -1056,8 +1079,20 @@ function RoomControls({
           </h2>
           <p>
             Host: {room.seats.host.displayName} | Guest: {guestLabel} |{" "}
-            {connectionStatusLabel(connectionStatus)}
+            This browser: {localConnectionLabel}
           </p>
+          <div
+            className="room-controls__presence"
+            role="status"
+            aria-label="Player B presence"
+          >
+            <span
+              className="room-controls__presence-pill"
+              data-state={playerBPresenceState}
+            >
+              {playerBPresenceText}
+            </span>
+          </div>
         </div>
 
         {isHost ? (
@@ -1086,7 +1121,7 @@ function RoomControls({
               </button>
               {showStartHint ? (
                 <p className={styles.startHint} id={startHintId}>
-                  Waiting for player B to join
+                  {startHint}
                 </p>
               ) : null}
             </div>
@@ -1135,6 +1170,7 @@ function RoomControls({
 type RoomGameViewProps = Readonly<{
   actor: PlayerId | null;
   game: PublicRoomGameState;
+  guestConnected: boolean;
   isCommanding: boolean;
   isGeneratingCustomItem: boolean;
   isHost: boolean;
@@ -1151,6 +1187,7 @@ type RoomGameViewProps = Readonly<{
 function RoomGameView({
   actor,
   game,
+  guestConnected,
   isCommanding,
   isGeneratingCustomItem,
   isHost,
@@ -1342,14 +1379,22 @@ function RoomGameView({
   }
 
   if (game.phase === "settlement") {
+    const isFinalRound = game.roundNumber >= game.totalRounds;
+    const settlementDisabledReason = !isHost
+      ? "Only the host can advance rounds."
+      : !isFinalRound && !guestConnected
+        ? "Player B is disconnected. Waiting for Player B to reconnect before starting the next round."
+        : undefined;
+
     return (
       <>
         {stepper}
         <div className="play-stack">
           <ItemPanel item={game.item} revealTrueValue />
           <SettlementPanel
-            disabled={isCommanding || !isHost}
-            isFinalRound={game.roundNumber >= game.totalRounds}
+            disabled={isCommanding || settlementDisabledReason !== undefined}
+            disabledReason={settlementDisabledReason}
+            isFinalRound={isFinalRound}
             onContinue={onAdvanceRound}
             players={game.players}
             settlement={game.settlement}
@@ -1492,7 +1537,7 @@ function actorPlayerId(session: RoomSession): PlayerId {
   return session.role === "host" ? "A" : "B";
 }
 
-function parseRoomSocketMessage(data: unknown): RoomSocketMessage | null {
+export function parseRoomSocketMessage(data: unknown): RoomSocketMessage | null {
   if (typeof data !== "string") {
     return null;
   }
@@ -1503,7 +1548,8 @@ function parseRoomSocketMessage(data: unknown): RoomSocketMessage | null {
     if (
       isRecord(parsed) &&
       parsed.type === "ROOM_SNAPSHOT" &&
-      isRecord(parsed.room)
+      isRecord(parsed.room) &&
+      hasRequiredRoomPresence(parsed.room)
     ) {
       return parsed as RoomSocketMessage;
     }
@@ -1598,6 +1644,20 @@ function errorMessage(error: unknown, fallback: string): string {
 
 function isStaleGuestError(error: unknown): boolean {
   return error instanceof RoomClientRequestError && error.error.code === "stale_guest";
+}
+
+function hasRequiredRoomPresence(room: Record<string, unknown>): boolean {
+  if (!isRecord(room.presence)) {
+    return false;
+  }
+
+  const { players } = room.presence;
+
+  return (
+    isRecord(players) &&
+    typeof players.A === "boolean" &&
+    typeof players.B === "boolean"
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
