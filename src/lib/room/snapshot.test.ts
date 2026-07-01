@@ -17,6 +17,7 @@ import {
   type RoomCapabilityToken,
   type RoomCommandResult,
   type RoomId,
+  type RoomPresence,
   type RoomState,
   type TokenHash,
   type TokenVerifier,
@@ -26,6 +27,18 @@ const NOW_MS = 30_000;
 const ROOM_ID_VALUE = "room_snapshot_0001";
 const HOST_SECRET = "host_secret_200000000001";
 const GUEST_SECRET = "guest_secret_200000000001";
+const LIVE_PRESENCE = {
+  players: {
+    A: true,
+    B: true,
+  },
+} satisfies RoomPresence;
+const GUEST_OFFLINE_PRESENCE = {
+  players: {
+    A: true,
+    B: false,
+  },
+} satisfies RoomPresence;
 
 const item: GeneratedItem = {
   round_id: "round-snapshot-1",
@@ -37,7 +50,7 @@ const item: GeneratedItem = {
 describe("room snapshots", () => {
   it("omits raw tokens, token hashes, and persistence fields", () => {
     const { room, hostToken, guestToken } = joinedRoom();
-    const snapshotJson = JSON.stringify(toPublicRoomSnapshot(room));
+    const snapshotJson = JSON.stringify(toPublicRoomSnapshot(room, GUEST_OFFLINE_PRESENCE));
 
     expect(snapshotJson).not.toContain(hostToken.secret);
     expect(snapshotJson).not.toContain(guestToken.secret);
@@ -46,6 +59,21 @@ describe("room snapshots", () => {
     expect(snapshotJson).not.toContain("tokenHash");
     expect(snapshotJson).not.toContain("persistedAtMs");
     expect(snapshotJson).not.toContain("expiresAtMs");
+  });
+
+  it("exposes only public live presence booleans", () => {
+    const { room } = joinedRoom();
+    const snapshot = toPublicRoomSnapshot(room, GUEST_OFFLINE_PRESENCE);
+
+    expect(snapshot.presence).toEqual({
+      players: {
+        A: true,
+        B: false,
+      },
+    });
+    expect(JSON.stringify(snapshot.presence)).not.toContain("token");
+    expect(JSON.stringify(snapshot.presence)).not.toContain("secret");
+    expect(JSON.stringify(snapshot.presence)).not.toContain("hash");
   });
 
   it("redacts hidden true_value before settlement even if the game object is polluted", () => {
@@ -76,7 +104,7 @@ describe("room snapshots", () => {
       ...configuring,
       game: pollutedGame,
     };
-    const snapshotJson = JSON.stringify(toPublicRoomSnapshot(pollutedRoom));
+    const snapshotJson = JSON.stringify(toPublicRoomSnapshot(pollutedRoom, LIVE_PRESENCE));
 
     expect(snapshotJson).not.toContain("true_value");
     expect(snapshotJson).not.toContain("1000");
@@ -126,7 +154,7 @@ describe("room snapshots", () => {
         NOW_MS + 8,
       ),
     );
-    const snapshot = toPublicRoomSnapshot(settled);
+    const snapshot = toPublicRoomSnapshot(settled, LIVE_PRESENCE);
 
     expect(snapshot.game.phase).toBe("settlement");
 
@@ -149,6 +177,7 @@ function startedRoom(): {
     room: expectOk(
       startRoom(room, {
         credential: present(hostToken),
+        presence: LIVE_PRESENCE,
         verifyToken,
         nowMs: NOW_MS + 2,
       }),

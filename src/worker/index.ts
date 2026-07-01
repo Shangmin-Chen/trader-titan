@@ -25,6 +25,7 @@ import {
   type RoomDomainError,
   type RoomGameConfig,
   type RoomId,
+  type RoomPresence,
   type RoomProtocolDecodeError,
   type RoomState,
   type TokenHash,
@@ -197,6 +198,11 @@ type RoomSocketMessage =
       error: RoomSocketError;
     }>;
 
+type RoomSocketBroadcastOptions = Readonly<{
+  excludeRecipient?: WebSocket;
+  presence?: RoomPresence;
+}>;
+
 /**
  * Owns the private room state for one Cloudflare Durable Object id.
  *
@@ -305,7 +311,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       {
         ok: true,
         created: true,
-        room: toPublicRoomSnapshot(result.room),
+        room: this.publicRoomSnapshot(result.room),
         hostToken
       },
       201
@@ -353,7 +359,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
 
     return jsonResponse<AccessRoomResponse>({
       ok: true,
-      room: toPublicRoomSnapshot(loaded.room)
+      room: this.publicRoomSnapshot(loaded.room)
     });
   }
 
@@ -395,7 +401,10 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
           guestTokenHash,
           nowMs
         },
-        rejectTokenVerification
+        {
+          presence: this.currentRoomPresence(loaded.room),
+          verifyToken: rejectTokenVerification
+        }
       );
 
       if (!joined.ok) {
@@ -425,7 +434,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
 
     return jsonResponse<JoinRoomResponse>({
       ok: true,
-      room: toPublicRoomSnapshot(result.room),
+      room: this.publicRoomSnapshot(result.room),
       guestToken
     });
   }
@@ -453,7 +462,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
 
     return jsonResponse<CommandRoomResponse>({
       ok: true,
-      room: toPublicRoomSnapshot(result.room)
+      room: this.publicRoomSnapshot(result.room)
     });
   }
 
@@ -507,7 +516,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
 
     return jsonResponse<CustomAmazonItemResponse>({
       ok: true,
-      room: toPublicRoomSnapshot(result.room)
+      room: this.publicRoomSnapshot(result.room)
     });
   }
 
@@ -570,7 +579,13 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       tokenHash
     } satisfies RoomSocketAttachment);
     this.ctx.acceptWebSocket(server);
-    server.send(roomSnapshotSocketMessage(toPublicRoomSnapshot(loaded.room)));
+    const presence = this.currentRoomPresence(loaded.room);
+
+    server.send(roomSnapshotSocketMessage(toPublicRoomSnapshot(loaded.room, presence)));
+    this.broadcastRoomSnapshot(loaded.room, {
+      excludeRecipient: server,
+      presence
+    });
 
     return new Response(null, {
       headers: {
@@ -619,9 +634,13 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
     this.broadcastRoomSnapshot(result.room);
   }
 
-  webSocketClose(): void {}
+  async webSocketClose(ws: WebSocket): Promise<void> {
+    await this.broadcastPresenceChangeForSocket(ws);
+  }
 
-  webSocketError(): void {}
+  async webSocketError(ws: WebSocket): Promise<void> {
+    await this.broadcastPresenceChangeForSocket(ws);
+  }
 
   private async applyDecodedRoomCommand(
     command: DecodedRoomCommand,
@@ -645,7 +664,10 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       const commandResult = dispatchRoomCommand(
         loaded.room,
         command,
-        verifyToken
+        {
+          presence: this.currentRoomPresence(loaded.room),
+          verifyToken
+        }
       );
 
       if (!commandResult.ok) {
@@ -965,10 +987,18 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
     });
   }
 
-  private broadcastRoomSnapshot(room: RoomState): void {
-    const message = roomSnapshotSocketMessage(toPublicRoomSnapshot(room));
+  private broadcastRoomSnapshot(
+    room: RoomState,
+    options: RoomSocketBroadcastOptions = {}
+  ): void {
+    const presence = options.presence ?? this.currentRoomPresence(room);
+    const message = roomSnapshotSocketMessage(toPublicRoomSnapshot(room, presence));
 
     for (const socket of this.ctx.getWebSockets()) {
+      if (socket === options.excludeRecipient) {
+        continue;
+      }
+
       if (!socketCanReceiveRoomSnapshot(socket, room)) {
         closeSocketQuietly(socket, "Room seat changed.");
         continue;
@@ -976,6 +1006,66 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
 
       sendSocketMessage(socket, message);
     }
+  }
+
+  private async broadcastPresenceChangeForSocket(socket: WebSocket): Promise<void> {
+    const attachment = parseRoomSocketAttachment(socket.deserializeAttachment());
+
+    if (attachment === null) {
+      return;
+    }
+
+    const loaded = await this.loadStoredRoom(currentUnixTimeMs());
+
+    if (!loaded.ok || loaded.room.id !== attachment.roomId) {
+      return;
+    }
+
+    this.broadcastRoomSnapshot(loaded.room, {
+      excludeRecipient: socket,
+      presence: this.currentRoomPresence(loaded.room, socket)
+    });
+  }
+
+  private publicRoomSnapshot(room: RoomState): PublicRoomSnapshot {
+    return toPublicRoomSnapshot(room, this.currentRoomPresence(room));
+  }
+
+  private currentRoomPresence(
+    room: RoomState,
+    excludedSocket?: WebSocket
+  ): RoomPresence {
+    const players = {
+      A: false,
+      B: false
+    };
+
+    for (const socket of this.ctx.getWebSockets()) {
+      if (socket === excludedSocket) {
+        continue;
+      }
+
+      const attachment = parseRoomSocketAttachment(socket.deserializeAttachment());
+
+      if (attachment === null || attachment.roomId !== room.id) {
+        continue;
+      }
+
+      if (attachment.role === "host" && attachment.tokenHash === room.host.tokenHash) {
+        players.A = true;
+        continue;
+      }
+
+      if (
+        room.guest !== null &&
+        attachment.role === "guest" &&
+        attachment.tokenHash === room.guest.tokenHash
+      ) {
+        players.B = true;
+      }
+    }
+
+    return { players };
   }
 
   private async createOrLoadStoredRoom(
@@ -1824,6 +1914,7 @@ function statusForDomainError(error: RoomDomainError): number {
     case "guest_slot_full":
     case "guest_slot_empty":
     case "guest_required":
+    case "player_offline":
     case "invalid_game_phase":
       return 409;
     default:

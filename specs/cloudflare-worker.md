@@ -43,6 +43,19 @@ Implemented HTTP endpoints on the Durable Object stub:
 
 Private room state is stored through the room persistence envelope and loaded through the persistence decoder. Unauthenticated invite reads never include game state. Authenticated clients receive public snapshots only; persistence metadata and token hashes must never be returned. Capability token secrets and hashes are generated with Worker crypto, and Durable Object storage stores only hashes.
 
+## Room Presence
+
+The Durable Object is the authoritative source for live room presence:
+
+- Presence is public, non-secret, ephemeral data made only of live booleans for Player A and Player B.
+- Presence is computed from currently accepted hibernatable WebSockets. A socket counts only when its attachment has the current room id, the correct role, and a token hash matching the current host or guest seat.
+- Presence is never written to Durable Object storage or room persistence envelopes.
+- Seat occupancy is not live presence. An occupied guest seat means the room has a current guest token hash; it does not prove Player B has an accepted socket.
+- Every authenticated public room snapshot includes presence booleans. Presence-only snapshots can keep the same room revision because the room state did not mutate.
+- HTTP joins, HTTP commands, WebSocket commands, and authenticated access responses use the same `currentRoomPresence` source when dispatching commands or returning full public snapshots.
+
+`START_ROOM` is rejected with `player_offline` when Player B is disconnected. `ADVANCE_ROUND` is also rejected with `player_offline` for non-final settlements while Player B is disconnected. Final-round `ADVANCE_ROUND` that moves the room to `finished` with a `gameOver` game state remains allowed while Player B is disconnected.
+
 ## Private Item Storage And Effects
 
 The Durable Object is the gameplay authority for generated item values and settlement:
@@ -62,13 +75,15 @@ The Durable Object WebSocket transport is authoritative for live room updates. O
 { "type": "ROOM_SNAPSHOT", "room": "<public room snapshot>" }
 ```
 
+After accepting a valid socket, the Durable Object also rebroadcasts the updated public snapshot to remaining authorized sockets so they see the new presence state. WebSocket close and error events rebroadcast updated public snapshots with the departing socket excluded from presence. These presence rebroadcasts do not persist anything, can carry the same room revision, and must never expose capability secrets, token hashes, persistence envelopes, or private generated values.
+
 Incoming text messages are JSON client room commands with the same shape accepted by `POST /room/command`. `JOIN_ROOM` is rejected on WebSocket because `POST /room/join` generates the guest token. Malformed JSON, invalid protocol messages, authorization failures, and domain errors are sent only to the sender as:
 
 ```json
 { "type": "ROOM_ERROR", "error": { "code": "<code>", "message": "<message>" } }
 ```
 
-Successful WebSocket commands are dispatched through the room command layer, persisted as room persistence envelopes, and broadcast as `ROOM_SNAPSHOT` only to sockets whose attached token hash still matches the current host or guest seat. Stale kicked/reset/replaced guest sockets are closed before broadcast. Successful HTTP joins and HTTP commands also broadcast a new public snapshot so HTTP and WebSocket clients remain synchronized.
+Successful WebSocket commands are dispatched through the room command layer with the same presence source used by HTTP commands, persisted as room persistence envelopes, and broadcast as `ROOM_SNAPSHOT` only to sockets whose attached token hash still matches the current host or guest seat. Stale kicked/reset/replaced guest sockets are closed before broadcast. Successful HTTP joins and HTTP commands also broadcast a new public snapshot so HTTP and WebSocket clients remain synchronized.
 
 ## Environment
 

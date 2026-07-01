@@ -30,7 +30,9 @@ import {
   type GuestSeat,
   type RoomCommandFailure,
   type RoomCommandResult,
+  type RoomDomainErrorCode,
   type RoomGameConfig,
+  type RoomPresence,
   type RoomState,
   type UnixTimeMs,
 } from "./types";
@@ -54,6 +56,11 @@ export type AuthorizedCommandInput = Readonly<{
   verifyToken: TokenVerifier;
   nowMs: UnixTimeMs;
 }>;
+
+export type PresenceAwareCommandInput = AuthorizedCommandInput &
+  Readonly<{
+    presence: RoomPresence;
+  }>;
 
 export type ConfigureRoomInput = AuthorizedCommandInput &
   Readonly<{
@@ -170,7 +177,7 @@ export function configureRoom(
 
 export function startRoom(
   room: RoomState,
-  input: AuthorizedCommandInput,
+  input: PresenceAwareCommandInput,
 ): RoomCommandResult {
   const authorized = authorizeRoomAction(
     room,
@@ -191,6 +198,10 @@ export function startRoom(
     return commandFailure(room, "guest_required", "A guest must join before the room can start.");
   }
 
+  if (!isPlayerLive(input.presence, GUEST_PLAYER_ID)) {
+    return playerOfflineFailure(room);
+  }
+
   const payload = startPayloadForRoom(room);
   const validation = validateStartGame(payload);
 
@@ -198,7 +209,10 @@ export function startRoom(
     return commandFailure(room, "invalid_config", validation.error);
   }
 
-  const game = startGameReducer(buildLobbyGame(room.config, room.host.displayName, room.guest.displayName), payload);
+  const game = startGameReducer(
+    buildLobbyGame(room.config, room.host.displayName, room.guest.displayName),
+    payload,
+  );
 
   return {
     ok: true,
@@ -413,7 +427,7 @@ export function failRoomSettlement(
 
 export function advanceRoomRound(
   room: RoomState,
-  input: AuthorizedCommandInput,
+  input: PresenceAwareCommandInput,
 ): RoomCommandResult {
   const authorized = authorizeRoomAction(
     room,
@@ -432,6 +446,13 @@ export function advanceRoomRound(
 
   if (room.game.phase !== "settlement") {
     return commandFailure(room, "invalid_game_phase", "Rounds can only advance after settlement.");
+  }
+
+  if (
+    !isFinalRoundSettlement(room.game) &&
+    !isPlayerLive(input.presence, GUEST_PLAYER_ID)
+  ) {
+    return playerOfflineFailure(room);
   }
 
   return applySystemGameAction(room, { type: "NEXT_ROUND" }, input.nowMs);
@@ -517,6 +538,14 @@ function lifecycleForGame(game: GameState): RoomState["lifecycle"] {
   return game.phase === "gameOver" ? "finished" : "active";
 }
 
+function isFinalRoundSettlement(game: GameState): boolean {
+  return game.phase === "settlement" && game.roundNumber >= game.totalRounds;
+}
+
+function isPlayerLive(presence: RoomPresence, playerId: PlayerId): boolean {
+  return presence.players[playerId] === true;
+}
+
 function buildLobbyGame(
   config: RoomGameConfig,
   hostName: string,
@@ -583,7 +612,7 @@ function normalizeDisplayName(value: string, fallback: string): string {
 
 function commandFailure(
   room: RoomState,
-  code: RoomCommandFailure["error"]["code"],
+  code: RoomDomainErrorCode,
   message: string,
 ): RoomCommandFailure {
   return {
@@ -591,4 +620,12 @@ function commandFailure(
     room,
     error: roomDomainError(code, message),
   };
+}
+
+function playerOfflineFailure(room: RoomState): RoomCommandFailure {
+  return commandFailure(
+    room,
+    "player_offline",
+    "Player B must be connected before the room can continue.",
+  );
 }

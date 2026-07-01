@@ -15,6 +15,7 @@ import {
   type RoomCapabilityToken,
   type RoomCommandResult,
   type RoomId,
+  type RoomPresence,
   type RoomState,
   type TokenHash,
   type TokenVerifier,
@@ -26,6 +27,12 @@ const OTHER_ROOM_ID_VALUE = "room_auth_0002";
 const HOST_SECRET = "host_secret_000000000001";
 const GUEST_SECRET = "guest_secret_000000000001";
 const STALE_GUEST_SECRET = "guest_secret_000000000002";
+const LIVE_PRESENCE = {
+  players: {
+    A: true,
+    B: true,
+  },
+} satisfies RoomPresence;
 
 const item: GeneratedItem = {
   round_id: "round-auth-1",
@@ -182,6 +189,7 @@ function activeNegotiationRoom(): {
   const started = expectOk(
     startRoom(room, {
       credential: present(hostToken),
+      presence: LIVE_PRESENCE,
       verifyToken,
       nowMs: NOW_MS + 1,
     }),

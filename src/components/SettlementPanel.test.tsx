@@ -127,4 +127,27 @@ describe("SettlementPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: "Next round" }));
     expect(onContinue).toHaveBeenCalledOnce();
   });
+
+  it("T29g: disabledReason describes the disabled continue button through accessible status text", () => {
+    const disabledReason =
+      "Player B is disconnected. Waiting for Player B to reconnect before starting the next round.";
+
+    render(
+      <SettlementPanel
+        players={players}
+        settlement={makeSettlement(50, -50)}
+        onContinue={vi.fn()}
+        disabled
+        disabledReason={disabledReason}
+      />
+    );
+
+    const btn = screen.getByRole("button", { name: "Next round" });
+    const reason = screen.getByText(disabledReason);
+
+    expect(btn).toBeDisabled();
+    expect(reason).toHaveAttribute("role", "status");
+    expect(reason.id).not.toBe("");
+    expect(btn).toHaveAttribute("aria-describedby", reason.id);
+  });
 });

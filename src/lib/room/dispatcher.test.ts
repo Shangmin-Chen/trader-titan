@@ -24,12 +24,24 @@ import {
   type TokenHash,
   type TokenVerifier,
 } from "./tokens";
-import type { RoomCommandResult, RoomState, UnixTimeMs } from "./types";
+import type { RoomCommandResult, RoomPresence, RoomState, UnixTimeMs } from "./types";
 
 const NOW_MS = 40_000;
 const ROOM_ID_VALUE = "room_dispatch_0001";
 const HOST_SECRET = "host_secret_dispatch_0001";
 const GUEST_SECRET = "guest_secret_dispatch_0001";
+const LIVE_PRESENCE = {
+  players: {
+    A: true,
+    B: true,
+  },
+} satisfies RoomPresence;
+const GUEST_OFFLINE_PRESENCE = {
+  players: {
+    A: true,
+    B: false,
+  },
+} satisfies RoomPresence;
 
 const item: GeneratedItem = {
   round_id: "round-dispatch-1",
@@ -53,7 +65,7 @@ describe("room dispatcher", () => {
           },
           NOW_MS + 1,
         ),
-        verifyToken,
+        dispatchContext(LIVE_PRESENCE),
       ),
     );
     const configured = expectOk(
@@ -67,7 +79,7 @@ describe("room dispatcher", () => {
           },
           NOW_MS + 2,
         ),
-        verifyToken,
+        dispatchContext(LIVE_PRESENCE),
       ),
     );
     const started = expectOk(
@@ -80,7 +92,7 @@ describe("room dispatcher", () => {
           },
           NOW_MS + 3,
         ),
-        verifyToken,
+        dispatchContext(LIVE_PRESENCE),
       ),
     );
 
@@ -104,7 +116,7 @@ describe("room dispatcher", () => {
         },
         NOW_MS + 2,
       ),
-      verifyToken,
+      dispatchContext(LIVE_PRESENCE),
     );
 
     expect(result.ok).toBe(false);
@@ -117,6 +129,30 @@ describe("room dispatcher", () => {
     expect(result.error).toEqual({
       code: "host_control_denied",
       message: "Only the host can perform this room command.",
+    });
+  });
+
+  it("rejects start dispatch when Player B is offline in command context", () => {
+    const { room, hostToken } = joinedRoom();
+    const result = dispatchRoomCommand(
+      room,
+      mustClientCommand(
+        {
+          type: "START_ROOM",
+          credential: present(hostToken),
+        },
+        NOW_MS + 2,
+      ),
+      dispatchContext(GUEST_OFFLINE_PRESENCE),
+    );
+
+    expect(result).toEqual({
+      ok: false,
+      room,
+      error: {
+        code: "player_offline",
+        message: "Player B must be connected before the room can continue.",
+      },
     });
   });
 
@@ -203,6 +239,7 @@ function activeRoom(): {
     room: expectOk(
       startRoom(room, {
         credential: present(hostToken),
+        presence: LIVE_PRESENCE,
         verifyToken,
         nowMs: NOW_MS + 2,
       }),
@@ -302,6 +339,13 @@ function hashFor(token: RoomCapabilityToken): TokenHash {
 }
 
 const verifyToken: TokenVerifier = (token, expectedHash) => hashFor(token) === expectedHash;
+
+function dispatchContext(presence: RoomPresence) {
+  return {
+    presence,
+    verifyToken,
+  };
+}
 
 function present(token: RoomCapabilityToken): PresentedCapabilityToken {
   return {
