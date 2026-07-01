@@ -109,9 +109,27 @@
   margin-top: var(--space-md);
 }
 
+/* `.sticky-action-bar` (globals.css) sets `display: flex` with no wrap,
+   which — at equal specificity and later in source order — silently wins
+   over `.trading-panel__actions`'s `display: grid`. Flex-basis 0 with
+   default `min-width: auto` then refuses to shrink each button below its
+   own content's intrinsic width (icon + label + price), so on narrow
+   phones the two buttons together exceed the viewport and the Buy button
+   is pushed off-screen — the primary trade action becomes unreachable
+   without horizontal scrolling. Re-assert grid with the combined
+   `.actions:global(.sticky-action-bar)` selector (specificity 0,0,2,0),
+   which wins over the single-class global rule regardless of source
+   order, restoring the intended full-width stacked buttons on mobile. */
+.actions:global(.sticky-action-bar) {
+  display: grid;
+  grid-template-columns: 1fr;
+}
+
 /* Un-stick on desktop — buttons live in the card flow */
 @media (min-width: 768px) {
   .actions:global(.sticky-action-bar) {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
     position: static;
     padding: 0;
     border-top: none;
