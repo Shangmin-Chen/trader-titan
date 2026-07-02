@@ -43,7 +43,8 @@ export type HostRoomCommandType =
   | "START_ROOM"
   | "RESET_TO_LOBBY"
   | "KICK_GUEST"
-  | "ADVANCE_ROUND";
+  | "ADVANCE_ROUND"
+  | "RETRY_ITEM_GENERATION";
 
 export type PlayerRoomCommandType =
   | "SUBMIT_INITIAL_WIDTH"
@@ -67,7 +68,12 @@ export type HostRoomCommand =
       nowMs: UnixTimeMs;
     }>
   | Readonly<{
-      type: "START_ROOM" | "RESET_TO_LOBBY" | "KICK_GUEST" | "ADVANCE_ROUND";
+      type:
+        | "START_ROOM"
+        | "RESET_TO_LOBBY"
+        | "KICK_GUEST"
+        | "ADVANCE_ROUND"
+        | "RETRY_ITEM_GENERATION";
       credential: PresentedCapabilityToken;
       nowMs: UnixTimeMs;
     }>;
@@ -205,6 +211,7 @@ export function parseClientRoomCommand(
     case "RESET_TO_LOBBY":
     case "KICK_GUEST":
     case "ADVANCE_ROUND":
+    case "RETRY_ITEM_GENERATION":
       return decodeHostRoomCommand(value, type.value, now.value);
     case "SUBMIT_INITIAL_WIDTH":
     case "TIGHTEN_WIDTH":
@@ -472,6 +479,7 @@ function decodeClientCommandType(value: unknown): DecodeResult<ClientCommandType
     case "RESET_TO_LOBBY":
     case "KICK_GUEST":
     case "ADVANCE_ROUND":
+    case "RETRY_ITEM_GENERATION":
     case "SUBMIT_INITIAL_WIDTH":
     case "TIGHTEN_WIDTH":
     case "TRADE_ON_WIDTH":

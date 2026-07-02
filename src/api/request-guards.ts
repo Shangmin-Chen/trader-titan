@@ -16,10 +16,25 @@ export type BoundedRateLimiter = RequestPredicate &
 export const ITEM_GENERATION_RATE_LIMIT_WINDOW_MS = 60_000;
 export const ITEM_GENERATION_RATE_LIMIT_MAX_REQUESTS = 20;
 export const ITEM_GENERATION_RATE_LIMIT_MAX_BUCKETS = 500;
+export const ROOM_CREATION_RATE_LIMIT_WINDOW_MS = 60_000;
+export const ROOM_CREATION_RATE_LIMIT_MAX_REQUESTS = 10;
+export const ROOM_CREATION_RATE_LIMIT_MAX_BUCKETS = 500;
+export const ROOM_CUSTOM_AMAZON_RATE_LIMIT_WINDOW_MS = 60_000;
+export const ROOM_CUSTOM_AMAZON_RATE_LIMIT_MAX_REQUESTS = 20;
+export const ROOM_CUSTOM_AMAZON_RATE_LIMIT_MAX_BUCKETS = 500;
 
 export function isAllowedOrigin(request: Request): boolean {
   const origin = request.headers.get("origin");
-  return origin === null || origin === new URL(request.url).origin;
+
+  if (origin === null) {
+    return true;
+  }
+
+  try {
+    return new URL(origin).origin === new URL(request.url).origin;
+  } catch {
+    return false;
+  }
 }
 
 export async function readRequestJson(request: Request): Promise<unknown> {
@@ -37,6 +52,28 @@ export function createItemGenerationRateLimiter(
     windowMs: ITEM_GENERATION_RATE_LIMIT_WINDOW_MS,
     maxRequests: ITEM_GENERATION_RATE_LIMIT_MAX_REQUESTS,
     maxBuckets: ITEM_GENERATION_RATE_LIMIT_MAX_BUCKETS,
+    ...options,
+  });
+}
+
+export function createRoomCreationRateLimiter(
+  options: Partial<BoundedRateLimiterOptions> = {},
+): BoundedRateLimiter {
+  return createBoundedRateLimiter({
+    windowMs: ROOM_CREATION_RATE_LIMIT_WINDOW_MS,
+    maxRequests: ROOM_CREATION_RATE_LIMIT_MAX_REQUESTS,
+    maxBuckets: ROOM_CREATION_RATE_LIMIT_MAX_BUCKETS,
+    ...options,
+  });
+}
+
+export function createRoomCustomAmazonRateLimiter(
+  options: Partial<BoundedRateLimiterOptions> = {},
+): BoundedRateLimiter {
+  return createBoundedRateLimiter({
+    windowMs: ROOM_CUSTOM_AMAZON_RATE_LIMIT_WINDOW_MS,
+    maxRequests: ROOM_CUSTOM_AMAZON_RATE_LIMIT_MAX_REQUESTS,
+    maxBuckets: ROOM_CUSTOM_AMAZON_RATE_LIMIT_MAX_BUCKETS,
     ...options,
   });
 }

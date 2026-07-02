@@ -79,7 +79,13 @@ export function validateQuoteForWidth(quote: Quote, width: number): ValidationRe
     return quoteValidation;
   }
 
-  if (!Number.isFinite(width) || Math.abs(quote.ask - quote.bid - width) > 1e-9) {
+  const widthTolerance = Math.max(
+    1e-9,
+    Number.EPSILON *
+      Math.max(Math.abs(quote.bid), Math.abs(quote.ask), Math.abs(width), 1),
+  );
+
+  if (!Number.isFinite(width) || Math.abs(quote.ask - quote.bid - width) > widthTolerance) {
     return { ok: false, error: "Bid and ask must match the accepted spread width." };
   }
 

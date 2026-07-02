@@ -187,6 +187,7 @@ export type GameAction =
   | { type: "START_GAME"; payload: StartGamePayload }
   | { type: "ITEM_RECEIVED"; item: GeneratedItem }
   | { type: "ITEM_FAILED"; error: string }
+  | { type: "RETRY_ITEM_GENERATION" }
   | { type: "SUBMIT_INITIAL_WIDTH"; width: number }
   | { type: "TIGHTEN_WIDTH"; width: number }
   | { type: "TRADE_ON_WIDTH" }

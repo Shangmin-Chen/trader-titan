@@ -316,6 +316,32 @@ export function failRoomItem(
   return applySystemGameAction(room, { type: "ITEM_FAILED", error }, nowMs);
 }
 
+export function retryRoomItemGeneration(
+  room: RoomState,
+  input: AuthorizedCommandInput,
+): RoomCommandResult {
+  const authorized = authorizeRoomAction(
+    room,
+    input.credential,
+    { type: "hostControl" },
+    input.verifyToken,
+  );
+
+  if (!authorized.ok) {
+    return { ok: false, room, error: authorized.error };
+  }
+
+  if (room.lifecycle !== "active") {
+    return commandFailure(room, "room_not_active", "Only active rooms can retry item generation.");
+  }
+
+  if (room.game.phase !== "error" || room.game.previousPhase !== "generatingItem") {
+    return commandFailure(room, "invalid_game_phase", "Item generation can only be retried after an item generation failure.");
+  }
+
+  return applySystemGameAction(room, { type: "RETRY_ITEM_GENERATION" }, input.nowMs);
+}
+
 export function submitInitialWidth(
   room: RoomState,
   width: number,

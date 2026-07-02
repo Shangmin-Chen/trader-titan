@@ -4,6 +4,7 @@ import {
   configureRoom,
   createLobbyRoom,
   executeTrade,
+  failRoomItem,
   joinRoom,
   kickGuest,
   parseCapabilityToken,
@@ -12,6 +13,7 @@ import {
   receiveRoomItem,
   receiveRoomSettlement,
   resetRoomToLobby,
+  retryRoomItemGeneration,
   startRoom,
   submitInitialWidth,
   submitMarketQuote,
@@ -286,6 +288,65 @@ describe("room commands", () => {
     expect(result.game.scores).toEqual(room.game.scores);
     expect(result.game.lastError).toBe("Settlement did not match the active round.");
     expect(result.revision).toBe(room.revision + 1);
+  });
+
+  it("lets the host retry a failed item generation without changing game context", () => {
+    const { room, hostToken } = activeRoom();
+    const failed = expectOk(failRoomItem(room, "Provider timed out.", NOW_MS + 3));
+    const retried = expectOk(
+      retryRoomItemGeneration(failed, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 4,
+      }),
+    );
+
+    expect(retried.lifecycle).toBe("active");
+    expect(retried.revision).toBe(failed.revision + 1);
+    expect(retried.game.phase).toBe("generatingItem");
+    expect(retried.game.mode).toBe(failed.game.mode);
+    expect(retried.game.customAmazonQuery).toBe(failed.game.customAmazonQuery);
+    expect(retried.game.players).toEqual(failed.game.players);
+    expect(retried.game.scores).toEqual(failed.game.scores);
+    expect(retried.game.roles).toEqual(failed.game.roles);
+    expect(retried.game.roundNumber).toBe(failed.game.roundNumber);
+    expect(retried.game.totalRounds).toBe(failed.game.totalRounds);
+    expect(retried.game.lastError).toBeUndefined();
+    expect("error" in retried.game).toBe(false);
+    expect("previousPhase" in retried.game).toBe(false);
+    expect(retried.game.log.slice(0, -1)).toEqual(failed.game.log);
+  });
+
+  it("rejects item generation retries for guests and wrong phases without mutating", () => {
+    const { room, hostToken, guestToken } = activeRoom();
+    const failed = expectOk(failRoomItem(room, "Provider timed out.", NOW_MS + 3));
+    const guestRetry = retryRoomItemGeneration(failed, {
+      credential: present(guestToken),
+      verifyToken,
+      nowMs: NOW_MS + 4,
+    });
+    const wrongPhaseRetry = retryRoomItemGeneration(room, {
+      credential: present(hostToken),
+      verifyToken,
+      nowMs: NOW_MS + 5,
+    });
+
+    expect(guestRetry).toEqual({
+      ok: false,
+      room: failed,
+      error: {
+        code: "host_control_denied",
+        message: "Only the host can perform this room command.",
+      },
+    });
+    expect(wrongPhaseRetry).toEqual({
+      ok: false,
+      room,
+      error: {
+        code: "invalid_game_phase",
+        message: "Item generation can only be retried after an item generation failure.",
+      },
+    });
   });
 
   it("rejects a full guest slot until the host kicks the guest", () => {

@@ -23,6 +23,18 @@ The Worker exposes room routes before delegating unmatched requests to OpenNext:
 
 Room ids are validated with the room-domain parser before `idFromName` is called. Non-room routes continue to delegate to OpenNext unchanged.
 
+Public room POST routes and public WebSocket upgrades reject browser requests whose `Origin` does not match the request URL origin before forwarding to the Durable Object. Requests without an `Origin` header remain allowed for non-browser clients and server-to-server calls. Rejections use Worker-style JSON with `403`:
+
+```json
+{ "ok": false, "error": { "code": "origin_not_allowed", "message": "Request origin is not allowed." } }
+```
+
+`POST /api/rooms` and `POST /api/rooms/:roomId/custom-amazon-item` also apply bounded in-memory per-Cloudflare-client-IP rate limiting before forwarding. Normal room joins, access, command gameplay, and socket messages are not broadly rate-limited by this guard. Limit rejections use Worker-style JSON with `429`:
+
+```json
+{ "ok": false, "error": { "code": "rate_limited", "message": "Room request rate limit exceeded." } }
+```
+
 ## Durable Object Room Lifecycle
 
 - Binding name: `GAME_ROOM`
@@ -33,7 +45,7 @@ The Durable Object owns one room per object id. Named ids must also be valid roo
 
 Implemented HTTP endpoints on the Durable Object stub:
 
-- `POST /room`: creates a lobby if no non-corrupt private room envelope exists, or loads the existing room. The host capability token and full public snapshot are returned only for a newly created room; existing rooms return only an invite preview.
+- `POST /room`: creates a lobby if no loadable, non-expired private room envelope exists, or loads the existing room. Missing, expired, or corrupt envelopes are replaced by a new lobby and any stored private generated item keys for the object are deleted. The host capability token and full public snapshot are returned only for a newly created room; existing rooms return only an invite preview.
 - `GET /room`: returns only the invite preview.
 - `POST /room/access`: accepts `{ credential }`, authorizes access for the host or current guest, and returns the full public room snapshot.
 - `POST /room/join`: joins one guest through the room command layer and returns the guest capability token only for the successful join.
@@ -62,10 +74,12 @@ The Durable Object is the gameplay authority for generated item values and settl
 
 - Private generated items are stored separately from the room envelope under keys derived from `round_id`.
 - The stored private item includes `true_value` plus optional Amazon scrape metadata. The public room state receives only `round_id`, `item_title`, `category`, and `context_clue` until settlement.
-- After a successful `START_ROOM` or `ADVANCE_ROUND` command leaves the room in `active/generatingItem`, the Durable Object automatically invokes the Worker item provider, stores the private item, dispatches `ITEM_RECEIVED`, persists the updated room envelope, and broadcasts only the final public snapshot.
-- Automatic generation is skipped for `Amazon` rooms with `customAmazonQuery: true`; those rooms wait for `POST /room/custom-amazon-item` or the equivalent public route.
-- After a successful `EXECUTE_TRADE` command leaves the room in `settling`, the Durable Object loads the private item by the active `round_id`, dispatches `SETTLEMENT_RECEIVED`, persists the room envelope, and broadcasts the final settlement snapshot. Settlement is computed by the room command layer from the stored private item and active quote; clients never supply settlement fields.
-- If provider generation fails, the Durable Object dispatches `ITEM_FAILED` and persists the room error snapshot. If the private settlement item is missing, it dispatches `SETTLEMENT_FAILED` rather than accepting client-provided values.
+- After a successful `START_ROOM`, `ADVANCE_ROUND`, or `RETRY_ITEM_GENERATION` command leaves the room in `active/generatingItem`, the Durable Object automatically invokes the Worker item provider, stores the private item, dispatches `ITEM_RECEIVED`, persists the updated room envelope, and broadcasts only the final public snapshot.
+- Automatic generation is skipped for `Amazon` rooms with `customAmazonQuery: true`; those rooms wait for `POST /room/custom-amazon-item` or the equivalent public route, including after `RETRY_ITEM_GENERATION` returns a failed custom-query room to `generatingItem`.
+- After a successful `EXECUTE_TRADE` command leaves the room in `settling`, the Durable Object loads the private item by the active `round_id`, dispatches `SETTLEMENT_RECEIVED`, persists the room envelope, deletes that round's private item key in the same storage transaction after the room envelope write, and broadcasts the final settlement snapshot. Settlement is computed by the room command layer from the stored private item and active quote; clients never supply settlement fields.
+- If provider generation fails, including after a retry command, the Durable Object dispatches `ITEM_FAILED` and persists the room error snapshot without resetting scores, roles, lifecycle, or prior log entries. If the private settlement item is missing, it dispatches `SETTLEMENT_FAILED` rather than accepting client-provided values.
+- Successful `RESET_TO_LOBBY` and `KICK_GUEST` commands persist the lobby replacement and delete all `room:private-generated-item:v1:*` keys for the room object in the same storage transaction.
+- Room envelope writes schedule a Durable Object alarm for the room persistence expiration. When the alarm runs and the room envelope is missing, expired, or invalid, the Durable Object deletes all `room:private-generated-item:v1:*` keys and clears the alarm; if the room is still loadable, the alarm is rescheduled to the current room expiration.
 
 ## Room WebSocket Contract
 

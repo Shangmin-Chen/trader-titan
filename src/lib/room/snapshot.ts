@@ -61,7 +61,11 @@ export type PublicChoosingSideGameState = Omit<ChoosingSideGameState, "item"> &
 export type PublicSettlingGameState = Omit<SettlingGameState, "item"> &
   Readonly<{ item: PublicGeneratedItem }>;
 export type PublicSettledGeneratedItem = PublicGeneratedItem &
-  Readonly<{ true_value: number }>;
+  Readonly<{
+    true_value: number;
+    scraped_items?: SettledGeneratedItem["scraped_items"];
+    amazon_url?: string;
+  }>;
 export type PublicSettlementGameState = Omit<SettlementGameState, "item"> &
   Readonly<{ item: PublicSettledGeneratedItem }>;
 export type PublicGameOverState = GameOverState;
@@ -324,6 +328,15 @@ function toPublicSettledItem(
   return {
     ...toPublicItem(item),
     true_value: item.true_value,
+    ...(item.scraped_items === undefined
+      ? {}
+      : {
+          scraped_items: item.scraped_items.map((scraped) => ({
+            title: scraped.title,
+            price: scraped.price,
+          })),
+        }),
+    ...(item.amazon_url === undefined ? {} : { amazon_url: item.amazon_url }),
   };
 }
 

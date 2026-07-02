@@ -142,6 +142,38 @@ describe("room client", () => {
     });
   });
 
+  it("serializes retry item generation commands through the room command route", async () => {
+    const requests: Array<Readonly<{ input: string; body: unknown }>> = [];
+    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      requests.push({
+        input: String(input),
+        body: JSON.parse(String(init?.body)) as unknown,
+      });
+
+      return Response.json({
+        ok: true,
+        room: SNAPSHOT,
+      });
+    });
+
+    await sendRoomCommand(
+      ROOM_ID,
+      { type: "RETRY_ITEM_GENERATION", credential: HOST_TOKEN, nowMs: 2 },
+      { baseUrl: "https://example.test", fetchImpl },
+    );
+
+    expect(requests).toEqual([
+      {
+        input: `https://example.test/api/rooms/${ROOM_ID}/command`,
+        body: {
+          type: "RETRY_ITEM_GENERATION",
+          credential: HOST_TOKEN,
+          nowMs: 2,
+        },
+      },
+    ]);
+  });
+
   it("builds websocket URLs from explicit base URLs or browser location", () => {
     expect(roomSocketUrl(ROOM_ID, { baseUrl: "https://example.test", token: HOST_TOKEN })).toBe(
       `wss://example.test/api/rooms/${ROOM_ID}/socket`,

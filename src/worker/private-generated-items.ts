@@ -44,6 +44,10 @@ export function privateGeneratedItemStorageKey(roundId: string): string {
   return `${PRIVATE_GENERATED_ITEM_STORAGE_PREFIX}${roundId}`;
 }
 
+export function privateGeneratedItemStoragePrefix(): string {
+  return PRIVATE_GENERATED_ITEM_STORAGE_PREFIX;
+}
+
 export function createSettledGeneratedItem(
   roundId: string,
   item: Omit<SettledGeneratedItem, "round_id">,

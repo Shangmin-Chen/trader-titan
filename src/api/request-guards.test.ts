@@ -1,5 +1,7 @@
 import {
   createBoundedRateLimiter,
+  createRoomCreationRateLimiter,
+  createRoomCustomAmazonRateLimiter,
   isAllowedOrigin,
 } from "./request-guards";
 
@@ -14,7 +16,9 @@ describe("request guards", () => {
   it("allows missing or same-origin requests and rejects cross-origin requests", () => {
     expect(isAllowedOrigin(request())).toBe(true);
     expect(isAllowedOrigin(request({ origin: "https://trader-titan.test" }))).toBe(true);
+    expect(isAllowedOrigin(request({ origin: "https://trader-titan.test/ignored" }))).toBe(true);
     expect(isAllowedOrigin(request({ origin: "https://evil.test" }))).toBe(false);
+    expect(isAllowedOrigin(request({ origin: "null" }))).toBe(false);
   });
 
   it("enforces per-key rate limits and resets after the window", () => {
@@ -62,5 +66,25 @@ describe("request guards", () => {
     expect(limiter(request({ "x-forwarded-for": "203.0.113.1" }))).toBe(true);
     expect(limiter(request({ "x-forwarded-for": "203.0.113.2" }))).toBe(false);
     expect(limiter.bucketCount()).toBe(1);
+  });
+
+  it("creates bounded room route limiters from shared primitives", () => {
+    const creationLimiter = createRoomCreationRateLimiter({
+      windowMs: 60_000,
+      maxRequests: 1,
+      maxBuckets: 2,
+      now: () => 1_000,
+    });
+    const customAmazonLimiter = createRoomCustomAmazonRateLimiter({
+      windowMs: 60_000,
+      maxRequests: 1,
+      maxBuckets: 2,
+      now: () => 1_000,
+    });
+
+    expect(creationLimiter(request({ "cf-connecting-ip": "203.0.113.1" }))).toBe(true);
+    expect(creationLimiter(request({ "cf-connecting-ip": "203.0.113.1" }))).toBe(false);
+    expect(customAmazonLimiter(request({ "cf-connecting-ip": "203.0.113.1" }))).toBe(true);
+    expect(customAmazonLimiter(request({ "cf-connecting-ip": "203.0.113.1" }))).toBe(false);
   });
 });

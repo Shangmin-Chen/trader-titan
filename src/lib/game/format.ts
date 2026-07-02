@@ -17,11 +17,13 @@ export function formatPreciseNumber(value: number): string {
 }
 
 export function formatSignedNumber(value: number): string {
-  if (Object.is(value, -0) || value === 0) {
+  const formattedMagnitude = formatNumber(Math.abs(value));
+
+  if (formattedMagnitude === "0") {
     return "0";
   }
 
-  return `${value > 0 ? "+" : "-"}${formatNumber(Math.abs(value))}`;
+  return `${value > 0 ? "+" : "-"}${formattedMagnitude}`;
 }
 
 export function formatQuote(quote: Quote): string {

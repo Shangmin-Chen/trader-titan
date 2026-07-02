@@ -1,5 +1,10 @@
 import { DurableObject } from "cloudflare:workers";
 import openNextWorker from "../../.open-next/worker.js";
+import {
+  createRoomCreationRateLimiter,
+  createRoomCustomAmazonRateLimiter,
+  isAllowedOrigin
+} from "../api/request-guards";
 import type { GameMode, ProviderGeneratedItem, SettledGeneratedItem } from "../lib/game";
 import {
   authorizeRoomAction,
@@ -12,6 +17,7 @@ import {
   parseRoomId,
   parseRoomGameConfigPatch,
   parseTokenHash,
+  roomExpiresAtMs,
   roomDomainError,
   toPersistenceEnvelope,
   toPublicRoomInvitePreview,
@@ -39,6 +45,7 @@ import {
 import {
   createSettledGeneratedItem,
   loadPrivateGeneratedItemEnvelope,
+  privateGeneratedItemStoragePrefix,
   privateGeneratedItemStorageKey,
   toGeneratedItem,
   toPrivateGeneratedItemEnvelope
@@ -75,6 +82,8 @@ const TOKEN_HASH_PREFIX = "sha256";
 const TOKEN_HASH_INPUT_PREFIX = "trader-titan.room-token.v1";
 const PRIVATE_ITEM_UNAVAILABLE_MESSAGE = "Private generated item is unavailable for settlement.";
 const rejectTokenVerification: TokenVerifier = () => false;
+const publicRoomCreationRateLimiter = createRoomCreationRateLimiter();
+const publicRoomCustomAmazonRateLimiter = createRoomCustomAmazonRateLimiter();
 
 type OpenNextWorker = Required<Pick<ExportedHandler<Cloudflare.Env>, "fetch">>;
 type WorkerFetchContext = Parameters<OpenNextWorker["fetch"]>[2];
@@ -415,10 +424,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         } as const;
       }
 
-      await transaction.put(
-        ROOM_STORAGE_KEY,
-        persistenceEnvelopeForStorage(joined.room, nowMs)
-      );
+      await persistRoomEnvelope(transaction, joined.room, nowMs);
 
       return {
         ok: true,
@@ -642,6 +648,26 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
     await this.broadcastPresenceChangeForSocket(ws);
   }
 
+  async alarm(): Promise<void> {
+    const nowMs = currentUnixTimeMs();
+
+    await this.ctx.storage.transaction(async (transaction) => {
+      const loaded = loadStoredRoomEnvelope(
+        await transaction.get<unknown>(ROOM_STORAGE_KEY),
+        nowMs
+      );
+
+      if (loaded.ok) {
+        await transaction.setAlarm(roomExpiresAtMs(loaded.room));
+        return;
+      }
+
+      await deletePrivateGeneratedItems(transaction);
+      await transaction.delete(ROOM_STORAGE_KEY);
+      await transaction.deleteAlarm();
+    });
+  }
+
   private async applyDecodedRoomCommand(
     command: DecodedRoomCommand,
     verifyToken: TokenVerifier,
@@ -678,10 +704,11 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         } as const;
       }
 
-      await transaction.put(
-        ROOM_STORAGE_KEY,
-        persistenceEnvelopeForStorage(commandResult.room, nowMs)
-      );
+      await persistRoomEnvelope(transaction, commandResult.room, nowMs);
+
+      if (shouldDeletePrivateGeneratedItemsAfterCommand(command)) {
+        await deletePrivateGeneratedItems(transaction);
+      }
 
       return {
         ok: true,
@@ -795,6 +822,19 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       }
 
       if (!samePendingGeneration(loaded.room, target)) {
+        if (credential !== undefined && verifyToken !== undefined) {
+          const error = roomDomainError(
+            "invalid_game_phase",
+            "Custom Amazon generation is no longer pending."
+          );
+
+          return {
+            ok: false,
+            status: statusForDomainError(error),
+            error
+          } as const;
+        }
+
         return {
           ok: true,
           room: loaded.room
@@ -839,10 +879,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         } as const;
       }
 
-      await transaction.put(
-        ROOM_STORAGE_KEY,
-        persistenceEnvelopeForStorage(eventResult.room, nowMs)
-      );
+      await persistRoomEnvelope(transaction, eventResult.room, nowMs);
 
       return {
         ok: true,
@@ -894,10 +931,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         } as const;
       }
 
-      await transaction.put(
-        ROOM_STORAGE_KEY,
-        persistenceEnvelopeForStorage(eventResult.room, nowMs)
-      );
+      await persistRoomEnvelope(transaction, eventResult.room, nowMs);
 
       return {
         ok: true,
@@ -975,10 +1009,15 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         } as const;
       }
 
-      await transaction.put(
-        ROOM_STORAGE_KEY,
-        persistenceEnvelopeForStorage(eventResult.room, nowMs)
-      );
+      await persistRoomEnvelope(transaction, eventResult.room, nowMs);
+
+      if (
+        stored.ok &&
+        eventResult.room.lifecycle === "active" &&
+        eventResult.room.game.phase === "settlement"
+      ) {
+        await transaction.delete(privateGeneratedItemStorageKey(roundId));
+      }
 
       return {
         ok: true,
@@ -1088,14 +1127,6 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       };
     }
 
-    if (loaded.reason === "invalid") {
-      return {
-        ok: false,
-        status: statusForStoredRoomLoadFailure(loaded),
-        error: loaded.error
-      };
-    }
-
     const room = createLobbyRoom({
       id: roomId,
       hostName: body.hostName,
@@ -1104,7 +1135,8 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       nowMs
     });
 
-    await transaction.put(ROOM_STORAGE_KEY, persistenceEnvelopeForStorage(room, nowMs));
+    await persistRoomEnvelope(transaction, room, nowMs);
+    await deletePrivateGeneratedItems(transaction);
 
     return {
       ok: true,
@@ -1187,6 +1219,21 @@ function routePublicRoomRequest(
       );
     }
 
+    const originRejection = publicRoomOriginRejection(request);
+
+    if (originRejection !== null) {
+      return originRejection;
+    }
+
+    const rateLimitRejection = publicRoomRateLimitRejection(
+      request,
+      publicRoomCreationRateLimiter
+    );
+
+    if (rateLimitRejection !== null) {
+      return rateLimitRejection;
+    }
+
     return forwardRoomRequest(request, env, generateRoomId(), ROOM_ENDPOINT);
   }
 
@@ -1206,18 +1253,51 @@ function routePublicRoomRequest(
   }
 
   if (routeParts.length === 2 && routeParts[1] === "access" && request.method === "POST") {
+    const originRejection = publicRoomOriginRejection(request);
+
+    if (originRejection !== null) {
+      return originRejection;
+    }
+
     return forwardRoomRequest(request, env, parsedRoomId.roomId, ROOM_ACCESS_ENDPOINT);
   }
 
   if (routeParts.length === 2 && routeParts[1] === "join" && request.method === "POST") {
+    const originRejection = publicRoomOriginRejection(request);
+
+    if (originRejection !== null) {
+      return originRejection;
+    }
+
     return forwardRoomRequest(request, env, parsedRoomId.roomId, ROOM_JOIN_ENDPOINT);
   }
 
   if (routeParts.length === 2 && routeParts[1] === "command" && request.method === "POST") {
+    const originRejection = publicRoomOriginRejection(request);
+
+    if (originRejection !== null) {
+      return originRejection;
+    }
+
     return forwardRoomRequest(request, env, parsedRoomId.roomId, ROOM_COMMAND_ENDPOINT);
   }
 
   if (routeParts.length === 2 && routeParts[1] === PUBLIC_CUSTOM_AMAZON_ITEM_ROUTE && request.method === "POST") {
+    const originRejection = publicRoomOriginRejection(request);
+
+    if (originRejection !== null) {
+      return originRejection;
+    }
+
+    const rateLimitRejection = publicRoomRateLimitRejection(
+      request,
+      publicRoomCustomAmazonRateLimiter
+    );
+
+    if (rateLimitRejection !== null) {
+      return rateLimitRejection;
+    }
+
     return forwardRoomRequest(request, env, parsedRoomId.roomId, ROOM_CUSTOM_AMAZON_ITEM_ENDPOINT);
   }
 
@@ -1236,6 +1316,12 @@ function routePublicRoomRequest(
       );
     }
 
+    const originRejection = publicRoomOriginRejection(request);
+
+    if (originRejection !== null) {
+      return originRejection;
+    }
+
     return forwardRoomRequest(request, env, parsedRoomId.roomId, ROOM_SOCKET_ENDPOINT);
   }
 
@@ -1249,6 +1335,37 @@ function routePublicRoomRequest(
   return errorResponse(
     { code: "not_found", message: "Room endpoint was not found." },
     404
+  );
+}
+
+function publicRoomOriginRejection(request: Request): Response | null {
+  if (isAllowedOrigin(request)) {
+    return null;
+  }
+
+  return errorResponse(
+    {
+      code: "origin_not_allowed",
+      message: "Request origin is not allowed."
+    },
+    403
+  );
+}
+
+function publicRoomRateLimitRejection(
+  request: Request,
+  rateLimiter: (request: Request) => boolean
+): Response | null {
+  if (rateLimiter(request)) {
+    return null;
+  }
+
+  return errorResponse(
+    {
+      code: "rate_limited",
+      message: "Room request rate limit exceeded."
+    },
+    429
   );
 }
 
@@ -1285,7 +1402,11 @@ function shouldGenerateItemAfterCommand(
   command: DecodedRoomCommand,
   room: RoomState
 ): boolean {
-  return (command.type === "START_ROOM" || command.type === "ADVANCE_ROUND") &&
+  return (
+    command.type === "START_ROOM" ||
+    command.type === "ADVANCE_ROUND" ||
+    command.type === "RETRY_ITEM_GENERATION"
+  ) &&
     room.lifecycle === "active" &&
     room.game.phase === "generatingItem" &&
     !isCustomAmazonGenerationPending(room);
@@ -1755,6 +1876,34 @@ function loadStoredRoomEnvelope(
 
 function persistenceEnvelopeForStorage(room: RoomState, nowMs: UnixTimeMs): unknown {
   return JSON.parse(JSON.stringify(toPersistenceEnvelope(room, nowMs))) as unknown;
+}
+
+async function persistRoomEnvelope(
+  transaction: DurableObjectTransaction,
+  room: RoomState,
+  nowMs: UnixTimeMs
+): Promise<void> {
+  await transaction.put(ROOM_STORAGE_KEY, persistenceEnvelopeForStorage(room, nowMs));
+  await transaction.setAlarm(roomExpiresAtMs(room));
+}
+
+async function deletePrivateGeneratedItems(
+  transaction: DurableObjectTransaction
+): Promise<void> {
+  const items = await transaction.list<unknown>({
+    prefix: privateGeneratedItemStoragePrefix()
+  });
+  const keys = [...items.keys()];
+
+  if (keys.length > 0) {
+    await transaction.delete(keys);
+  }
+}
+
+function shouldDeletePrivateGeneratedItemsAfterCommand(
+  command: DecodedRoomCommand
+): boolean {
+  return command.type === "RESET_TO_LOBBY" || command.type === "KICK_GUEST";
 }
 
 function privateGeneratedItemEnvelopeForStorage(item: SettledGeneratedItem): unknown {

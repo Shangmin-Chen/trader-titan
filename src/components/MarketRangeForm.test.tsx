@@ -55,4 +55,21 @@ describe("MarketRangeForm", () => {
     expect(onSubmit).toHaveBeenCalledWith({ bid: 200, ask: 300 });
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
+
+  it("submits large fractional bid plus width quotes without a spread mismatch", () => {
+    const onSubmit = vi.fn();
+    render(<MarketRangeForm spreadWidth={0.1} onSubmit={onSubmit} />);
+
+    fireEvent.change(screen.getByLabelText("Bid"), {
+      target: { value: "100000000.5" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Commit market" }));
+
+    expect(onSubmit).toHaveBeenCalledOnce();
+    expect(onSubmit).toHaveBeenCalledWith({
+      bid: 100_000_000.5,
+      ask: 100_000_000.6,
+    });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
 });

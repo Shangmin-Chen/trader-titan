@@ -1,18 +1,38 @@
 /// <reference types="@cloudflare/vitest-pool-workers/types" />
 
 import { env } from "cloudflare:workers";
-import { createExecutionContext, waitOnExecutionContext } from "cloudflare:test";
+import {
+  createExecutionContext,
+  runInDurableObject,
+  waitOnExecutionContext
+} from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
 import worker from "./index";
 import {
+  privateGeneratedItemStorageKey,
+  privateGeneratedItemStoragePrefix
+} from "./private-generated-items";
+import {
   SMOKE_HEADER_NAME,
   SMOKE_HEADER_VALUE
 } from "./testing/open-next-worker";
+import type { GameMode, ProviderGeneratedItem } from "../lib/game";
+import {
+  ROOM_CREATION_RATE_LIMIT_MAX_REQUESTS,
+  ROOM_CUSTOM_AMAZON_RATE_LIMIT_MAX_REQUESTS
+} from "../api/request-guards";
+import {
+  dispatchSystemRoomEvent,
+  loadPersistenceEnvelope,
+  roomExpiresAtMs,
+  toPersistenceEnvelope
+} from "../lib/room";
 import type {
   PublicRoomInvitePreview,
   PublicRoomSnapshot,
-  RoomCapabilityToken
+  RoomCapabilityToken,
+  RoomState
 } from "../lib/room";
 
 const CREATE_ROOM_NAME = "worker-room-create-load";
@@ -20,7 +40,21 @@ const JOIN_ROOM_NAME = "worker-room-join-persist";
 const COMMAND_ROOM_NAME = "worker-room-command";
 const START_OFFLINE_ROOM_NAME = "worker-room-start-offline";
 const SETTLEMENT_ROOM_NAME = "worker-room-settlement";
+const MISSING_SETTLEMENT_ITEM_ROOM_NAME = "worker-room-missing-settlement-item";
+const CORRUPT_SETTLEMENT_ITEM_ROOM_NAME = "worker-room-corrupt-settlement-item";
+const RETRY_SUCCESS_ROOM_NAME = "worker-room-retry-success";
+const RETRY_FAILURE_ROOM_NAME = "worker-room-retry-failure";
+const RETRY_UNAUTHORIZED_ROOM_NAME = "worker-room-retry-unauthorized";
+const CUSTOM_AMAZON_RETRY_ROOM_NAME = "worker-room-custom-amazon-retry";
+const RESET_PRIVATE_ITEM_ROOM_NAME = "worker-room-reset-private-item";
+const KICK_PRIVATE_ITEM_ROOM_NAME = "worker-room-kick-private-item";
+const REPLACE_PRIVATE_ITEM_ROOM_NAME = "worker-room-replace-private-item";
+const ALARM_PRIVATE_ITEM_ROOM_NAME = "worker-room-alarm-private-item";
+const ALARM_MISSING_PRIVATE_ITEM_ROOM_NAME = "worker-room-alarm-missing-private-item";
+const ALARM_EXPIRED_PRIVATE_ITEM_ROOM_NAME = "worker-room-alarm-expired-private-item";
+const ALARM_VALID_PRIVATE_ITEM_ROOM_NAME = "worker-room-alarm-valid-private-item";
 const CUSTOM_AMAZON_ROOM_NAME = "worker-room-custom-amazon";
+const STALE_CUSTOM_AMAZON_ROOM_NAME = "worker-room-stale-custom-amazon";
 const SOCKET_INITIAL_ROOM_NAME = "worker-room-socket-initial";
 const SOCKET_COMMAND_ROOM_NAME = "worker-room-socket-command";
 const SOCKET_ERROR_ROOM_NAME = "worker-room-socket-error";
@@ -32,8 +66,10 @@ const RESET_STALE_SOCKET_ROOM_NAME = "worker-room-reset-stale-socket";
 const GAME_ROOM_SMOKE_URL = "https://trader-titan.worker.test/room";
 const ROOM_COMMAND_URL = `${GAME_ROOM_SMOKE_URL}/command`;
 const ROOM_JOIN_URL = `${GAME_ROOM_SMOKE_URL}/join`;
+const ROOM_CUSTOM_AMAZON_ITEM_URL = `${GAME_ROOM_SMOKE_URL}/custom-amazon-item`;
 const ROOM_SOCKET_URL = `${GAME_ROOM_SMOKE_URL}/socket`;
 const PUBLIC_ROOMS_URL = "https://trader-titan.worker.test/api/rooms";
+const TEST_ROOM_STORAGE_KEY = "room:persistence:v1";
 const HTTP_BAD_REQUEST_STATUS = 400;
 const HTTP_FORBIDDEN_STATUS = 403;
 const HTTP_CREATED_STATUS = 201;
@@ -41,12 +77,30 @@ const HTTP_OK_STATUS = 200;
 const HTTP_SWITCHING_PROTOCOLS_STATUS = 101;
 const HTTP_CONFLICT_STATUS = 409;
 const HTTP_GONE_STATUS = 410;
+const HTTP_TOO_MANY_REQUESTS_STATUS = 429;
 const SOCKET_MESSAGE_TIMEOUT_MS = 1_000;
 const WORKER_SMOKE_PATH = "/worker-smoke";
 const WORKER_SMOKE_URL = `https://trader-titan.worker.test${WORKER_SMOKE_PATH}`;
 const LEGACY_GENERATE_ITEM_URL = "https://trader-titan.worker.test/api/generate-item";
 type WorkerFetchRequest = Parameters<typeof worker.fetch>[0];
 type GameRoomStub = ReturnType<typeof roomStub>;
+type TestPendingItemGeneration = Readonly<{
+  roomId: PublicRoomSnapshot["id"];
+  revision: number;
+  roundNumber: number;
+  mode: GameMode;
+  customAmazonQuery: boolean;
+}>;
+type TestStoredRoomCommandResult =
+  | Readonly<{ ok: true; room: RoomState }>
+  | Readonly<{
+      ok: false;
+      status: number;
+      error: Readonly<{
+        code: string;
+        message: string;
+      }>;
+    }>;
 type RoomSocketConnection = Readonly<{
   socket: WebSocket;
   initial: RoomSnapshotSocketMessage;
@@ -199,6 +253,132 @@ describe("Cloudflare worker scaffold", () => {
     expect(accessResponse.status).toBe(HTTP_OK_STATUS);
     expectRoomPresence(accessed.room, { A: false, B: false });
     expect(accessed.room).toEqual(created.room);
+  });
+
+  it("rejects cross-origin public room mutations and socket upgrades", async () => {
+    const headers = {
+      "content-type": "application/json",
+      origin: "https://evil.example"
+    };
+    const createResponse = await fetchPublicWorker(new Request(PUBLIC_ROOMS_URL, {
+      body: JSON.stringify({ hostName: "Mallory" }),
+      headers,
+      method: "POST"
+    }));
+    const createRejected = await expectPublicJson<RoomErrorResponse>(createResponse);
+
+    expect(createResponse.status).toBe(HTTP_FORBIDDEN_STATUS);
+    expect(createRejected.error.code).toBe("origin_not_allowed");
+
+    for (const request of [
+      new Request(`${PUBLIC_ROOMS_URL}/room-cross-origin/access`, {
+        body: JSON.stringify({ credential: "invalid" }),
+        headers,
+        method: "POST"
+      }),
+      new Request(`${PUBLIC_ROOMS_URL}/room-cross-origin/join`, {
+        body: JSON.stringify({ guestName: "Mallory" }),
+        headers,
+        method: "POST"
+      }),
+      new Request(`${PUBLIC_ROOMS_URL}/room-cross-origin/command`, {
+        body: JSON.stringify({ type: "START_ROOM", credential: "invalid" }),
+        headers,
+        method: "POST"
+      })
+    ]) {
+      const response = await fetchPublicWorker(request);
+      const rejected = await expectPublicJson<RoomErrorResponse>(response);
+
+      expect(response.status).toBe(HTTP_FORBIDDEN_STATUS);
+      expect(rejected.error.code).toBe("origin_not_allowed");
+    }
+
+    const customResponse = await fetchPublicWorker(new Request(
+      `${PUBLIC_ROOMS_URL}/room-cross-origin/custom-amazon-item`,
+      {
+        body: JSON.stringify({ query: "wireless mouse" }),
+        headers,
+        method: "POST"
+      }
+    ));
+    const customRejected = await expectPublicJson<RoomErrorResponse>(customResponse);
+
+    expect(customResponse.status).toBe(HTTP_FORBIDDEN_STATUS);
+    expect(customRejected.error.code).toBe("origin_not_allowed");
+
+    const socketResponse = await fetchPublicWorker(new Request(
+      `${PUBLIC_ROOMS_URL}/room-cross-origin/socket`,
+      {
+        headers: {
+          origin: "https://evil.example",
+          upgrade: "websocket"
+        }
+      }
+    ));
+    const socketRejected = await expectPublicJson<RoomErrorResponse>(socketResponse);
+
+    expect(socketResponse.status).toBe(HTTP_FORBIDDEN_STATUS);
+    expect(socketResponse.webSocket).toBeNull();
+    expect(socketRejected.error.code).toBe("origin_not_allowed");
+  });
+
+  it("rate limits public room creation per Cloudflare client IP", async () => {
+    const limitedIp = "198.51.100.10";
+
+    for (let requestIndex = 0; requestIndex < ROOM_CREATION_RATE_LIMIT_MAX_REQUESTS; requestIndex += 1) {
+      const response = await postPublicRoomCreate(
+        `Rate Limited Host ${requestIndex}`,
+        limitedIp
+      );
+
+      expect(response.status).toBe(HTTP_CREATED_STATUS);
+    }
+
+    const limitedResponse = await postPublicRoomCreate("Rate Limited Host", limitedIp);
+    const limited = await expectPublicJson<RoomErrorResponse>(limitedResponse);
+
+    expect(limitedResponse.status).toBe(HTTP_TOO_MANY_REQUESTS_STATUS);
+    expect(limited.error.code).toBe("rate_limited");
+
+    const otherIpResponse = await postPublicRoomCreate(
+      "Other IP Host",
+      "198.51.100.11"
+    );
+
+    expect(otherIpResponse.status).toBe(HTTP_CREATED_STATUS);
+  });
+
+  it("rate limits public custom Amazon item submissions per Cloudflare client IP", async () => {
+    const limitedIp = "198.51.100.20";
+
+    for (let requestIndex = 0; requestIndex < ROOM_CUSTOM_AMAZON_RATE_LIMIT_MAX_REQUESTS; requestIndex += 1) {
+      const response = await postPublicCustomAmazonItemBody(
+        "room-custom-rate-limit",
+        {},
+        limitedIp
+      );
+
+      expect(response.status).not.toBe(HTTP_TOO_MANY_REQUESTS_STATUS);
+    }
+
+    const limitedResponse = await postPublicCustomAmazonItemBody(
+      "room-custom-rate-limit",
+      {},
+      limitedIp
+    );
+    const limited = await expectPublicJson<RoomErrorResponse>(limitedResponse);
+
+    expect(limitedResponse.status).toBe(HTTP_TOO_MANY_REQUESTS_STATUS);
+    expect(limited.error.code).toBe("rate_limited");
+
+    const otherIpResponse = await postPublicCustomAmazonItemBody(
+      "room-custom-rate-limit",
+      {},
+      "198.51.100.21"
+    );
+
+    expect(otherIpResponse.status).not.toBe(HTTP_TOO_MANY_REQUESTS_STATUS);
   });
 
   it("creates and then loads a lobby for the Durable Object id", async () => {
@@ -400,6 +580,207 @@ describe("Cloudflare worker scaffold", () => {
     expectRoomPresence(persisted.room, { A: false, B: false });
   });
 
+  it("auto-generates an item when retrying a failed non-custom generation", async () => {
+    const stub = roomStub(RETRY_SUCCESS_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created retry success room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+
+    expectRoomPresence(guestConnection.initial.room, { A: false, B: true });
+
+    const failed = await withMissingGeminiItemProvider(stub, () =>
+      applyRoomCommandWithoutTrueValue(stub, {
+        type: "START_ROOM",
+        credential: created.hostToken
+      })
+    );
+
+    expect(failed.room.lifecycle).toBe("active");
+    expect(failed.room.game.phase).toBe("error");
+
+    if (failed.room.game.phase !== "error") {
+      throw new Error("Expected initial provider failure.");
+    }
+
+    expect(failed.room.game.previousPhase).toBe("generatingItem");
+    expect(failed.room.game.error).toBe("Item generation is not configured.");
+
+    const failedLog = failed.room.game.log;
+    const retried = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "RETRY_ITEM_GENERATION",
+      credential: created.hostToken
+    });
+
+    expect(retried.room.lifecycle).toBe("active");
+    expect(retried.room.game.phase).toBe("proposingWidth");
+    expect(retried.room.revision).toBe(failed.room.revision + 2);
+    expect(retried.room.game.scores).toEqual(failed.room.game.scores);
+    expect(retried.room.game.roles).toEqual(failed.room.game.roles);
+    expect(retried.room.game.log.slice(0, failedLog.length)).toEqual(failedLog);
+    expect(retried.room.game.log[failedLog.length]?.message).toBe(
+      "Retrying item generation for round 1."
+    );
+
+    if (retried.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected retried item to be ready.");
+    }
+
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
+      privateGeneratedItemStorageKey(retried.room.game.item.round_id)
+    ]);
+
+    const persisted = await accessRoom(stub, created.hostToken);
+
+    expect(persisted.room).toEqual(retried.room);
+
+    guestConnection.socket.close();
+  });
+
+  it("records an error when retry provider generation fails without resetting room context", async () => {
+    const stub = roomStub(RETRY_FAILURE_ROOM_NAME);
+    const created = await createRoom(stub, "Host", { totalRounds: 2 });
+
+    if (!created.created) {
+      throw new Error("Expected a newly created retry failure room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+    const firstSettlement = await settleCurrentRound(
+      stub,
+      started.room,
+      created.hostToken,
+      joined.guestToken
+    );
+
+    expect(firstSettlement.game.phase).toBe("settlement");
+
+    const failedAdvance = await withMissingGeminiItemProvider(stub, () =>
+      applyRoomCommandWithoutTrueValue(stub, {
+        type: "ADVANCE_ROUND",
+        credential: created.hostToken
+      })
+    );
+
+    expect(failedAdvance.room.lifecycle).toBe("active");
+    expect(failedAdvance.room.game.phase).toBe("error");
+
+    if (failedAdvance.room.game.phase !== "error") {
+      throw new Error("Expected advance provider failure.");
+    }
+
+    expect(failedAdvance.room.game.previousPhase).toBe("generatingItem");
+    expect(failedAdvance.room.game.roundNumber).toBe(2);
+
+    const failedScores = failedAdvance.room.game.scores;
+    const failedRoles = failedAdvance.room.game.roles;
+    const failedPlayers = failedAdvance.room.game.players;
+    const failedLog = failedAdvance.room.game.log;
+    const retryFailure = await withMissingGeminiItemProvider(stub, () =>
+      applyRoomCommandWithoutTrueValue(stub, {
+        type: "RETRY_ITEM_GENERATION",
+        credential: created.hostToken
+      })
+    );
+
+    expect(retryFailure.room.lifecycle).toBe("active");
+    expect(retryFailure.room.game.phase).toBe("error");
+    expect(retryFailure.room.revision).toBe(failedAdvance.room.revision + 2);
+
+    if (retryFailure.room.game.phase !== "error") {
+      throw new Error("Expected retry provider failure.");
+    }
+
+    expect(retryFailure.room.game.previousPhase).toBe("generatingItem");
+    expect(retryFailure.room.game.error).toBe("Item generation is not configured.");
+    expect(retryFailure.room.game.roundNumber).toBe(2);
+    expect(retryFailure.room.game.totalRounds).toBe(2);
+    expect(retryFailure.room.game.scores).toEqual(failedScores);
+    expect(retryFailure.room.game.roles).toEqual(failedRoles);
+    expect(retryFailure.room.game.players).toEqual(failedPlayers);
+    expect(retryFailure.room.game.log.slice(0, failedLog.length)).toEqual(failedLog);
+    expect(retryFailure.room.game.log[failedLog.length]?.message).toBe(
+      "Retrying item generation for round 2."
+    );
+    expect(retryFailure.room.game.log.at(-1)?.message).toBe(
+      "Item generation failed: Item generation is not configured."
+    );
+
+    const persisted = await accessRoom(stub, created.hostToken);
+
+    expect(persisted.room).toEqual(retryFailure.room);
+
+    guestConnection.socket.close();
+  });
+
+  it("rejects guest item-generation retries over HTTP and WebSocket without generating an item", async () => {
+    const stub = roomStub(RETRY_UNAUTHORIZED_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created unauthorized retry room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const failed = await withMissingGeminiItemProvider(stub, () =>
+      applyRoomCommandWithoutTrueValue(stub, {
+        type: "START_ROOM",
+        credential: created.hostToken
+      })
+    );
+
+    expect(failed.room.lifecycle).toBe("active");
+    expect(failed.room.game.phase).toBe("error");
+
+    if (failed.room.game.phase !== "error") {
+      throw new Error("Expected initial item generation failure.");
+    }
+
+    expect(failed.room.game.previousPhase).toBe("generatingItem");
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
+
+    const httpRetryResponse = await postRoomCommand(stub, {
+      type: "RETRY_ITEM_GENERATION",
+      credential: joined.guestToken
+    });
+    const httpRetry = await expectPublicJson<RoomErrorResponse>(httpRetryResponse);
+
+    expect(httpRetryResponse.status).toBe(HTTP_FORBIDDEN_STATUS);
+    expect(httpRetry.error.code).toBe("host_control_denied");
+
+    const socketRetryError = nextSocketMessage<RoomSocketMessage>(guestConnection.socket);
+
+    guestConnection.socket.send(JSON.stringify({
+      type: "RETRY_ITEM_GENERATION",
+      credential: joined.guestToken
+    }));
+
+    await expect(socketRetryError).resolves.toMatchObject({
+      type: "ROOM_ERROR",
+      error: {
+        code: "host_control_denied"
+      }
+    });
+
+    const persisted = await accessRoom(stub, created.hostToken);
+
+    expect(persisted.room.revision).toBe(failed.room.revision);
+    expect(persisted.room.game).toEqual(failed.room.game);
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
+
+    guestConnection.socket.close();
+  });
+
   it("settles from the private Durable Object item after a fresh stub", async () => {
     const stub = roomStub(SETTLEMENT_ROOM_NAME);
     const created = await createRoom(stub, "Host");
@@ -423,6 +804,18 @@ describe("Cloudflare worker scaffold", () => {
     const started = await expectPublicJsonWithoutTrueValue<CommandRoomResponse>(startResponse);
 
     expect(started.room.game.phase).toBe("proposingWidth");
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected generated item to be ready.");
+    }
+
+    const privateItemKey = privateGeneratedItemStorageKey(
+      started.room.game.item.round_id
+    );
+
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
+      privateItemKey
+    ]);
 
     const freshStub = roomStub(SETTLEMENT_ROOM_NAME);
     const widthResponse = await freshStub.fetch(ROOM_COMMAND_URL, {
@@ -490,6 +883,349 @@ describe("Cloudflare worker scaffold", () => {
     const persisted = await accessRoom(roomStub(SETTLEMENT_ROOM_NAME), created.hostToken);
 
     expect(persisted.room).toEqual(settled.room);
+    await expect(privateGeneratedItemKeys(freshStub)).resolves.toEqual([]);
+
+    guestConnection.socket.close();
+  });
+
+  it.each([
+    {
+      roomName: MISSING_SETTLEMENT_ITEM_ROOM_NAME,
+      storageState: "missing",
+      expectedPrivateKeys: noPrivateItemKeys,
+      prepareUnavailableItem: deleteStoredPrivateGeneratedItem
+    },
+    {
+      roomName: CORRUPT_SETTLEMENT_ITEM_ROOM_NAME,
+      storageState: "corrupt",
+      expectedPrivateKeys: (privateItemKey: string) => [privateItemKey],
+      prepareUnavailableItem: corruptStoredPrivateGeneratedItem
+    }
+  ] as const)(
+    "fails settlement without leaking private item data when the stored item is $storageState",
+    async ({ roomName, expectedPrivateKeys, prepareUnavailableItem }) => {
+      const stub = roomStub(roomName);
+      const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created unavailable-settlement-item room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected generated item to be ready.");
+    }
+
+    const privateItemKey = privateGeneratedItemStorageKey(
+      started.room.game.item.round_id
+    );
+
+    await prepareUnavailableItem(stub, privateItemKey);
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual(
+      expectedPrivateKeys(privateItemKey)
+    );
+
+    const marketMakerToken = tokenForPlayer(
+      started.room.game.roles.marketMaker,
+      created.hostToken,
+      joined.guestToken
+    );
+    const traderToken = tokenForPlayer(
+      started.room.game.roles.trader,
+      created.hostToken,
+      joined.guestToken
+    );
+    const width = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_INITIAL_WIDTH",
+      credential: marketMakerToken,
+      width: 100
+    });
+
+    expect(width.room.game.phase).toBe("negotiatingWidth");
+
+    const configuring = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "TRADE_ON_WIDTH",
+      credential: traderToken
+    });
+
+    expect(configuring.room.game.phase).toBe("configuringMarket");
+
+    const quoted = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_MARKET_QUOTE",
+      credential: marketMakerToken,
+      quote: {
+        bid: 3500,
+        ask: 3600
+      }
+    });
+
+    expect(quoted.room.game.phase).toBe("choosingSide");
+
+    const settlementResponse = await postRoomCommand(stub, {
+      type: "EXECUTE_TRADE",
+      credential: traderToken,
+      side: "BUY"
+    });
+    const failed = await expectPublicJsonWithoutPrivateItemMetadata<CommandRoomResponse>(
+      settlementResponse
+    );
+
+    expect(settlementResponse.status).toBe(HTTP_OK_STATUS);
+    expect(failed.room.game.phase).toBe("choosingSide");
+    expect(failed.room.revision).toBe(quoted.room.revision + 2);
+
+    if (failed.room.game.phase !== "choosingSide") {
+      throw new Error("Expected settlement failure to return to side choice.");
+    }
+
+    expect(failed.room.game.lastError).toBe(
+      "Private generated item is unavailable for settlement."
+    );
+    expect(failed.room.game.scores).toEqual(quoted.room.game.scores);
+    expect(failed.room.game.log.at(-1)?.message).toBe(
+      "Settlement failed: Private generated item is unavailable for settlement."
+    );
+
+    const persisted = await accessRoom(stub, created.hostToken);
+
+    expect(persisted.room).toEqual(failed.room);
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual(
+      expectedPrivateKeys(privateItemKey)
+    );
+
+    guestConnection.socket.close();
+  });
+
+  it("deletes private generated items when resetting to the lobby", async () => {
+    const stub = roomStub(RESET_PRIVATE_ITEM_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created reset cleanup room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected generated item to be ready.");
+    }
+
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
+      privateGeneratedItemStorageKey(started.room.game.item.round_id)
+    ]);
+
+    const reset = await applyRoomCommand(stub, {
+      type: "RESET_TO_LOBBY",
+      credential: created.hostToken
+    });
+
+    expect(reset.room.lifecycle).toBe("lobby");
+    expect(reset.room.game.phase).toBe("setup");
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
+
+    guestConnection.socket.close();
+  });
+
+  it("deletes private generated items when kicking a guest", async () => {
+    const stub = roomStub(KICK_PRIVATE_ITEM_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created kick cleanup room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected generated item to be ready.");
+    }
+
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
+      privateGeneratedItemStorageKey(started.room.game.item.round_id)
+    ]);
+
+    const guestClosed = nextSocketClose(guestConnection.socket);
+    const kicked = await applyRoomCommand(stub, {
+      type: "KICK_GUEST",
+      credential: created.hostToken
+    });
+
+    expect(kicked.room.lifecycle).toBe("lobby");
+    expect(kicked.room.seats.guest.occupied).toBe(false);
+    expect(kicked.room.game.phase).toBe("setup");
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
+    await expect(guestClosed).resolves.toBeUndefined();
+  });
+
+  it("deletes private generated items when replacing a corrupt room", async () => {
+    const stub = roomStub(REPLACE_PRIVATE_ITEM_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created replacement cleanup room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected generated item to be ready.");
+    }
+
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
+      privateGeneratedItemStorageKey(started.room.game.item.round_id)
+    ]);
+
+    await corruptRoomEnvelope(stub);
+
+    const replaceResponse = await stub.fetch(GAME_ROOM_SMOKE_URL, {
+      body: JSON.stringify({ hostName: "Replacement Host" }),
+      method: "POST"
+    });
+    const replaced = await expectPublicJson<CreateRoomResponse>(replaceResponse);
+
+    expect(replaceResponse.status).toBe(HTTP_CREATED_STATUS);
+    expect(replaced.created).toBe(true);
+
+    if (!replaced.created) {
+      throw new Error("Expected corrupt room replacement.");
+    }
+
+    expect(replaced.room.lifecycle).toBe("lobby");
+    expect(replaced.room.revision).toBe(0);
+    expect(replaced.room.seats.host.displayName).toBe("Replacement Host");
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
+
+    guestConnection.socket.close();
+  });
+
+  it("deletes private generated items when the cleanup alarm sees an invalid room envelope", async () => {
+    const stub = roomStub(ALARM_PRIVATE_ITEM_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created alarm cleanup room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected generated item to be ready.");
+    }
+
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
+      privateGeneratedItemStorageKey(started.room.game.item.round_id)
+    ]);
+
+    await corruptRoomEnvelope(stub);
+    await runRoomCleanupAlarm(stub);
+    await expect(storedRoomEnvelopeExists(stub)).resolves.toBe(false);
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
+
+    guestConnection.socket.close();
+  });
+
+  it("deletes stale private generated items when the cleanup alarm sees no room envelope", async () => {
+    const stub = roomStub(ALARM_MISSING_PRIVATE_ITEM_ROOM_NAME);
+    const staleKey = await putStalePrivateGeneratedItem(stub, "missing-room");
+
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([staleKey]);
+    await runRoomCleanupAlarm(stub);
+    await expect(storedRoomEnvelopeExists(stub)).resolves.toBe(false);
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
+    await expect(storedRoomAlarm(stub)).resolves.toBeNull();
+  });
+
+  it("deletes expired room envelopes and private generated items during cleanup alarms", async () => {
+    const stub = roomStub(ALARM_EXPIRED_PRIVATE_ITEM_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created expired alarm room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected generated item to be ready.");
+    }
+
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
+      privateGeneratedItemStorageKey(started.room.game.item.round_id)
+    ]);
+
+    await expireStoredRoomEnvelope(stub);
+    await runRoomCleanupAlarm(stub);
+    await expect(storedRoomEnvelopeExists(stub)).resolves.toBe(false);
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
+
+    guestConnection.socket.close();
+  });
+
+  it("reschedules valid room cleanup alarms without deleting private generated items", async () => {
+    const stub = roomStub(ALARM_VALID_PRIVATE_ITEM_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created valid alarm room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected generated item to be ready.");
+    }
+
+    const privateItemKey = privateGeneratedItemStorageKey(
+      started.room.game.item.round_id
+    );
+    const expectedAlarm = await storedRoomExpiresAt(stub);
+
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
+      privateItemKey
+    ]);
+    await setStoredRoomAlarm(stub, Date.now() - 1);
+    await runRoomCleanupAlarm(stub);
+    await expect(storedRoomEnvelopeExists(stub)).resolves.toBe(true);
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
+      privateItemKey
+    ]);
+    await expect(storedRoomAlarm(stub)).resolves.toBe(expectedAlarm);
 
     guestConnection.socket.close();
   });
@@ -555,6 +1291,205 @@ describe("Cloudflare worker scaffold", () => {
       item_title: "wireless mouse"
     });
     expect("true_value" in custom.room.game.item).toBe(false);
+    expect("scraped_items" in custom.room.game.item).toBe(false);
+    expect("amazon_url" in custom.room.game.item).toBe(false);
+
+    const settledRoom = await settleCurrentRound(
+      stub,
+      custom.room,
+      created.hostToken,
+      joined.guestToken
+    );
+
+    expect(settledRoom.game.phase).toBe("settlement");
+
+    if (settledRoom.game.phase !== "settlement") {
+      throw new Error("Expected custom Amazon item to settle.");
+    }
+
+    expect(settledRoom.game.item.true_value).toBe(99.99);
+    expect(settledRoom.game.item.scraped_items).toEqual([
+      { title: "wireless mouse", price: 99.99 }
+    ]);
+    expect(settledRoom.game.item.amazon_url).toBe(
+      "https://www.amazon.com/s?k=wireless%20mouse"
+    );
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
+
+    guestConnection.socket.close();
+  });
+
+  it("rejects stale in-flight custom Amazon completion after the guest loses access", async () => {
+    const stub = roomStub(STALE_CUSTOM_AMAZON_ROOM_NAME);
+    const created = await createRoom(stub, "Host", {
+      mode: "Amazon",
+      customAmazonQuery: true,
+      totalRounds: 2
+    });
+
+    if (!created.created) {
+      throw new Error("Expected a newly created stale custom Amazon room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    expect(started.room.game.phase).toBe("generatingItem");
+    expect(started.room.game.roles.trader).toBe("A");
+
+    const roundOneResponse = await postRoomCustomAmazonItem(
+      stub,
+      created.hostToken,
+      "round one mouse"
+    );
+    const roundOne = await expectPublicJsonWithoutTrueValue<CustomAmazonItemResponse>(
+      roundOneResponse
+    );
+
+    expect(roundOneResponse.status).toBe(HTTP_OK_STATUS);
+
+    if (roundOne.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected round one custom Amazon item.");
+    }
+
+    const settledRoundOne = await settleCurrentRound(
+      stub,
+      roundOne.room,
+      created.hostToken,
+      joined.guestToken
+    );
+
+    expect(settledRoundOne.game.phase).toBe("settlement");
+
+    const roundTwo = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "ADVANCE_ROUND",
+      credential: created.hostToken
+    });
+
+    expect(roundTwo.room.game.phase).toBe("generatingItem");
+    expect(roundTwo.room.game.roundNumber).toBe(2);
+    expect(roundTwo.room.game.roles.trader).toBe("B");
+
+    const staleTarget = customAmazonGenerationTargetFor(roundTwo.room);
+    const guestClosed = nextSocketClose(guestConnection.socket);
+    const kicked = await applyRoomCommand(stub, {
+      type: "KICK_GUEST",
+      credential: created.hostToken
+    });
+
+    expect(kicked.room.lifecycle).toBe("lobby");
+    expect(kicked.room.seats.guest.occupied).toBe(false);
+    await expect(guestClosed).resolves.toBeUndefined();
+
+    const staleCompletion = await receiveGeneratedProviderItemForTest(
+      stub,
+      staleTarget,
+      {
+        item_title: "round two mouse",
+        category: "Amazon",
+        context_clue: "Amazon price for \"round two mouse\"",
+        true_value: 88.88,
+        scraped_items: [{ title: "round two mouse", price: 88.88 }],
+        amazon_url: "https://www.amazon.com/s?k=round%20two%20mouse"
+      },
+      joined.guestToken
+    );
+
+    expect(staleCompletion.ok).toBe(false);
+
+    if (staleCompletion.ok) {
+      throw new Error("Expected stale custom Amazon completion to fail.");
+    }
+
+    expect(staleCompletion.status).toBe(HTTP_CONFLICT_STATUS);
+    expect(staleCompletion.error).toEqual({
+      code: "invalid_game_phase",
+      message: "Custom Amazon generation is no longer pending."
+    });
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
+
+    const persisted = await accessRoom(stub, created.hostToken);
+
+    expect(persisted.room).toEqual(kicked.room);
+  });
+
+  it("waits for custom Amazon item submission after retrying a custom-query generation error", async () => {
+    const stub = roomStub(CUSTOM_AMAZON_RETRY_ROOM_NAME);
+    const created = await createRoom(stub, "Host", {
+      mode: "Amazon",
+      customAmazonQuery: true,
+      totalRounds: 1
+    });
+
+    if (!created.created) {
+      throw new Error("Expected a newly created custom Amazon retry room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    expect(started.room.game.phase).toBe("generatingItem");
+    expect(started.room.game.mode).toBe("Amazon");
+    expect(started.room.game.customAmazonQuery).toBe(true);
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
+
+    await recordTestItemGenerationFailure(stub, "Custom lookup timed out.");
+
+    const failed = await accessRoom(stub, created.hostToken);
+
+    expect(failed.room.game.phase).toBe("error");
+
+    if (failed.room.game.phase !== "error") {
+      throw new Error("Expected custom Amazon item generation failure.");
+    }
+
+    expect(failed.room.game.previousPhase).toBe("generatingItem");
+    expect(failed.room.game.mode).toBe("Amazon");
+    expect(failed.room.game.customAmazonQuery).toBe(true);
+
+    const retried = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "RETRY_ITEM_GENERATION",
+      credential: created.hostToken
+    });
+
+    expect(retried.room.lifecycle).toBe("active");
+    expect(retried.room.game.phase).toBe("generatingItem");
+    expect(retried.room.game.mode).toBe("Amazon");
+    expect(retried.room.game.customAmazonQuery).toBe(true);
+    expect(retried.room.revision).toBe(failed.room.revision + 1);
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
+
+    const customResponse = await postRoomCustomAmazonItem(
+      stub,
+      created.hostToken,
+      "wireless mouse"
+    );
+    const custom = await expectPublicJsonWithoutTrueValue<CustomAmazonItemResponse>(customResponse);
+
+    expect(customResponse.status).toBe(HTTP_OK_STATUS);
+    expect(custom.room.game.phase).toBe("proposingWidth");
+
+    if (custom.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected custom Amazon retry item to be ready.");
+    }
+
+    expect(custom.room.game.item).toMatchObject({
+      category: "Amazon",
+      context_clue: "Amazon price for \"wireless mouse\"",
+      item_title: "wireless mouse"
+    });
+    expect("true_value" in custom.room.game.item).toBe(false);
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
+      privateGeneratedItemStorageKey(custom.room.game.item.round_id)
+    ]);
 
     guestConnection.socket.close();
   });
@@ -1116,6 +2051,268 @@ function roomStub(roomName: string) {
   return env.GAME_ROOM.get(env.GAME_ROOM.idFromName(roomName));
 }
 
+type MutableWorkerItemProviderEnv = {
+  GEMINI_API_KEY?: string;
+  WORKER_ITEM_PROVIDER?: "deterministic" | "gemini";
+};
+
+type WorkerItemProviderEnvSnapshot = Readonly<{
+  geminiApiKey: MutableWorkerItemProviderEnv["GEMINI_API_KEY"];
+  workerItemProvider: MutableWorkerItemProviderEnv["WORKER_ITEM_PROVIDER"];
+}>;
+
+async function withMissingGeminiItemProvider<T>(
+  stub: GameRoomStub,
+  run: () => Promise<T>
+): Promise<T> {
+  const previous = await setDurableObjectItemProviderEnv(stub, {
+    geminiApiKey: undefined,
+    workerItemProvider: "gemini"
+  });
+
+  try {
+    return await run();
+  } finally {
+    await setDurableObjectItemProviderEnv(stub, previous);
+  }
+}
+
+async function setDurableObjectItemProviderEnv(
+  stub: GameRoomStub,
+  next: WorkerItemProviderEnvSnapshot
+): Promise<WorkerItemProviderEnvSnapshot> {
+  return runInDurableObject(stub, (instance) => {
+    const mutableEnv = (instance as unknown as { env: MutableWorkerItemProviderEnv }).env;
+    const previous = {
+      geminiApiKey: mutableEnv.GEMINI_API_KEY,
+      workerItemProvider: mutableEnv.WORKER_ITEM_PROVIDER
+    };
+
+    mutableEnv.GEMINI_API_KEY = next.geminiApiKey;
+    mutableEnv.WORKER_ITEM_PROVIDER = next.workerItemProvider;
+
+    return previous;
+  });
+}
+
+function customAmazonGenerationTargetFor(
+  room: PublicRoomSnapshot
+): TestPendingItemGeneration {
+  if (room.lifecycle !== "active" || room.game.phase !== "generatingItem") {
+    throw new Error("Expected a pending custom Amazon generation room.");
+  }
+
+  return {
+    roomId: room.id,
+    revision: room.revision,
+    roundNumber: room.game.roundNumber,
+    mode: room.game.mode,
+    customAmazonQuery: room.game.customAmazonQuery === true
+  };
+}
+
+async function receiveGeneratedProviderItemForTest(
+  stub: GameRoomStub,
+  target: TestPendingItemGeneration,
+  providerItem: ProviderGeneratedItem,
+  credential: RoomCapabilityToken
+): Promise<TestStoredRoomCommandResult> {
+  return runInDurableObject(stub, async (instance) => {
+    return (instance as unknown as {
+      receiveGeneratedProviderItem(
+        target: TestPendingItemGeneration,
+        providerItem: ProviderGeneratedItem,
+        nowMs: number,
+        credential: RoomCapabilityToken,
+        verifyToken: () => boolean
+      ): Promise<TestStoredRoomCommandResult>;
+    }).receiveGeneratedProviderItem(
+      target,
+      providerItem,
+      Date.now(),
+      credential,
+      () => true
+    );
+  });
+}
+
+async function privateGeneratedItemKeys(stub: GameRoomStub): Promise<string[]> {
+  return runInDurableObject(stub, async (_instance, state) => {
+    const items = await state.storage.list<unknown>({
+      prefix: privateGeneratedItemStoragePrefix()
+    });
+
+    return [...items.keys()].sort();
+  });
+}
+
+function noPrivateItemKeys(): string[] {
+  return [];
+}
+
+async function deleteStoredPrivateGeneratedItem(
+  stub: GameRoomStub,
+  key: string
+): Promise<void> {
+  await runInDurableObject(stub, async (_instance, state) => {
+    await state.storage.delete(key);
+  });
+}
+
+async function corruptStoredPrivateGeneratedItem(
+  stub: GameRoomStub,
+  key: string
+): Promise<void> {
+  await runInDurableObject(stub, async (_instance, state) => {
+    await state.storage.put(key, {
+      kind: "trader-titan.test-corrupt-private-item"
+    });
+  });
+}
+
+async function recordTestItemGenerationFailure(
+  stub: GameRoomStub,
+  error: string
+): Promise<void> {
+  await runInDurableObject(stub, async (_instance, state) => {
+    const nowMs = Date.now();
+    const loaded = loadPersistenceEnvelope(
+      await state.storage.get<unknown>(TEST_ROOM_STORAGE_KEY),
+      nowMs
+    );
+
+    if (!loaded.ok) {
+      throw new Error(`Expected loadable room envelope: ${loaded.error.code}`);
+    }
+
+    const result = dispatchSystemRoomEvent(
+      loaded.room,
+      {
+        type: "ITEM_FAILED",
+        error,
+        nowMs
+      }
+    );
+
+    if (!result.ok) {
+      throw new Error(`Expected item generation failure to apply: ${result.error.code}`);
+    }
+
+    await state.storage.put(
+      TEST_ROOM_STORAGE_KEY,
+      JSON.parse(JSON.stringify(toPersistenceEnvelope(result.room, nowMs))) as unknown
+    );
+    await state.storage.setAlarm(roomExpiresAtMs(result.room));
+  });
+}
+
+async function corruptRoomEnvelope(stub: GameRoomStub): Promise<void> {
+  await runInDurableObject(stub, async (_instance, state) => {
+    await state.storage.put(TEST_ROOM_STORAGE_KEY, {
+      kind: "trader-titan.test-corrupt-room"
+    });
+  });
+}
+
+async function storedRoomEnvelopeExists(stub: GameRoomStub): Promise<boolean> {
+  return runInDurableObject(stub, async (_instance, state) => {
+    return (await state.storage.get(TEST_ROOM_STORAGE_KEY)) !== undefined;
+  });
+}
+
+async function runRoomCleanupAlarm(stub: GameRoomStub): Promise<void> {
+  await runInDurableObject(stub, async (instance) => {
+    await (instance as { alarm(): Promise<void> }).alarm();
+  });
+}
+
+async function putStalePrivateGeneratedItem(
+  stub: GameRoomStub,
+  suffix: string
+): Promise<string> {
+  const key = `${privateGeneratedItemStoragePrefix()}${suffix}`;
+
+  await runInDurableObject(stub, async (_instance, state) => {
+    await state.storage.put(key, { stale: true });
+    await state.storage.setAlarm(Date.now() - 1);
+  });
+
+  return key;
+}
+
+async function storedRoomAlarm(stub: GameRoomStub): Promise<number | null> {
+  return runInDurableObject(stub, async (_instance, state) => {
+    return (await state.storage.getAlarm()) ?? null;
+  });
+}
+
+async function setStoredRoomAlarm(
+  stub: GameRoomStub,
+  scheduledTimeMs: number
+): Promise<void> {
+  await runInDurableObject(stub, async (_instance, state) => {
+    await state.storage.setAlarm(scheduledTimeMs);
+  });
+}
+
+async function storedRoomExpiresAt(stub: GameRoomStub): Promise<number> {
+  return runInDurableObject(stub, async (_instance, state) => {
+    const loaded = loadPersistenceEnvelope(
+      await state.storage.get<unknown>(TEST_ROOM_STORAGE_KEY),
+      Date.now()
+    );
+
+    if (!loaded.ok) {
+      throw new Error(`Expected loadable room envelope: ${loaded.error.code}`);
+    }
+
+    return roomExpiresAtMs(loaded.room);
+  });
+}
+
+async function expireStoredRoomEnvelope(stub: GameRoomStub): Promise<void> {
+  await runInDurableObject(stub, async (_instance, state) => {
+    const loaded = loadPersistenceEnvelope(
+      await state.storage.get<unknown>(TEST_ROOM_STORAGE_KEY),
+      Date.now()
+    );
+
+    if (!loaded.ok) {
+      throw new Error(`Expected loadable room envelope: ${loaded.error.code}`);
+    }
+
+    const expiredAtMs = 1;
+    const expiredRoom = roomWithStorageTimestamps(loaded.room, expiredAtMs);
+
+    await state.storage.put(
+      TEST_ROOM_STORAGE_KEY,
+      JSON.parse(JSON.stringify(toPersistenceEnvelope(expiredRoom, expiredAtMs))) as unknown
+    );
+    await state.storage.setAlarm(Date.now() - 1);
+  });
+}
+
+function roomWithStorageTimestamps(
+  room: RoomState,
+  timestampMs: number
+): RoomState {
+  return {
+    ...room,
+    host: {
+      ...room.host,
+      joinedAtMs: timestampMs
+    },
+    guest: room.guest === null
+      ? null
+      : {
+        ...room.guest,
+        joinedAtMs: timestampMs
+      },
+    createdAtMs: timestampMs,
+    updatedAtMs: timestampMs
+  };
+}
+
 async function createRoom(
   stub: GameRoomStub,
   hostName: string,
@@ -1176,6 +2373,29 @@ async function accessPublicRoom(
   await waitOnExecutionContext(ctx);
 
   return response;
+}
+
+async function fetchPublicWorker(request: Request): Promise<Response> {
+  const ctx = createExecutionContext();
+  const response = await worker.fetch(request as WorkerFetchRequest, env, ctx);
+
+  await waitOnExecutionContext(ctx);
+
+  return response;
+}
+
+async function postPublicRoomCreate(
+  hostName: string,
+  cfConnectingIp: string
+): Promise<Response> {
+  return fetchPublicWorker(new Request(PUBLIC_ROOMS_URL, {
+    body: JSON.stringify({ hostName }),
+    headers: {
+      "cf-connecting-ip": cfConnectingIp,
+      "content-type": "application/json"
+    },
+    method: "POST"
+  }));
 }
 
 type PresencePlayers = Readonly<{
@@ -1338,21 +2558,38 @@ type CreateRoomConfig = Readonly<{
   customAmazonQuery?: boolean;
 }>;
 
+async function postRoomCustomAmazonItem(
+  stub: GameRoomStub,
+  credential: RoomCapabilityToken,
+  query: string
+): Promise<Response> {
+  return stub.fetch(ROOM_CUSTOM_AMAZON_ITEM_URL, {
+    body: JSON.stringify({ credential, query }),
+    method: "POST"
+  });
+}
+
 async function postPublicCustomAmazonItem(
   roomId: string,
   credential: RoomCapabilityToken,
   query: string
 ): Promise<Response> {
-  const request = new Request(`${PUBLIC_ROOMS_URL}/${roomId}/custom-amazon-item`, {
-    body: JSON.stringify({ credential, query }),
+  return postPublicCustomAmazonItemBody(roomId, { credential, query });
+}
+
+async function postPublicCustomAmazonItemBody(
+  roomId: string,
+  body: unknown,
+  cfConnectingIp?: string
+): Promise<Response> {
+  return fetchPublicWorker(new Request(`${PUBLIC_ROOMS_URL}/${roomId}/custom-amazon-item`, {
+    body: JSON.stringify(body),
+    headers: {
+      ...(cfConnectingIp === undefined ? {} : { "cf-connecting-ip": cfConnectingIp }),
+      "content-type": "application/json"
+    },
     method: "POST"
-  }) as WorkerFetchRequest;
-  const ctx = createExecutionContext();
-  const response = await worker.fetch(request, env, ctx);
-
-  await waitOnExecutionContext(ctx);
-
-  return response;
+  }));
 }
 
 async function fetchPublicRoomSocket(
@@ -1503,6 +2740,19 @@ async function expectPublicJsonWithoutTrueValue<T = unknown>(
 
   expectPublicPayload(text);
   expect(text).not.toContain("true_value");
+
+  return JSON.parse(text) as T;
+}
+
+async function expectPublicJsonWithoutPrivateItemMetadata<T = unknown>(
+  response: Response
+): Promise<T> {
+  const text = await response.text();
+
+  expectPublicPayload(text);
+  expect(text).not.toContain("true_value");
+  expect(text).not.toContain("scraped_items");
+  expect(text).not.toContain("amazon_url");
 
   return JSON.parse(text) as T;
 }

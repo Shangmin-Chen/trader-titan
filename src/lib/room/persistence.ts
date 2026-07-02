@@ -12,6 +12,7 @@ import {
   type Roles,
   type RoundLogEntry,
   type RoundSettlement,
+  type ScrapedAmazonItem,
   type Scores,
   type SettledGeneratedItem,
   type TradeSide,
@@ -381,8 +382,9 @@ function isGeneratedItem(value: unknown): value is GeneratedItem {
 }
 
 function isSettledGeneratedItem(value: unknown): value is SettledGeneratedItem {
-  return isRecord(value) &&
-    hasOnlyKeys(value, [
+  if (
+    !isRecord(value) ||
+    !hasOnlyKeys(value, [
       "round_id",
       "item_title",
       "category",
@@ -390,13 +392,38 @@ function isSettledGeneratedItem(value: unknown): value is SettledGeneratedItem {
       "true_value",
       ...(value.scraped_items === undefined ? [] : ["scraped_items"]),
       ...(value.amazon_url === undefined ? [] : ["amazon_url"]),
-    ]) &&
-    typeof value.round_id === "string" &&
-    typeof value.item_title === "string" &&
-    typeof value.category === "string" &&
-    typeof value.context_clue === "string" &&
-    isFiniteNumber(value.true_value) &&
-    validateProviderItem(value as ProviderGeneratedItem).ok;
+    ]) ||
+    typeof value.round_id !== "string" ||
+    typeof value.item_title !== "string" ||
+    typeof value.category !== "string" ||
+    typeof value.context_clue !== "string" ||
+    !isFiniteNumber(value.true_value)
+  ) {
+    return false;
+  }
+
+  if (
+    value.scraped_items !== undefined &&
+    !isScrapedAmazonItems(value.scraped_items)
+  ) {
+    return false;
+  }
+
+  if (value.amazon_url !== undefined && typeof value.amazon_url !== "string") {
+    return false;
+  }
+
+  return validateProviderItem(value as ProviderGeneratedItem).ok;
+}
+
+function isScrapedAmazonItems(value: unknown): value is ScrapedAmazonItem[] {
+  return Array.isArray(value) &&
+    value.every((item) =>
+      isRecord(item) &&
+      hasOnlyKeys(item, ["title", "price"]) &&
+      typeof item.title === "string" &&
+      isFiniteNumber(item.price),
+    );
 }
 
 function isQuote(value: unknown): value is Quote {

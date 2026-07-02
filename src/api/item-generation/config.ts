@@ -1,4 +1,3 @@
-import { Type } from "@google/genai";
 import { MAX_PLAYABLE_ABSOLUTE_VALUE, type GameMode } from "../../lib/game";
 
 export const GEMINI_MODEL = "gemini-2.5-flash";
@@ -30,30 +29,30 @@ export type GeminiPromptInput = {
 };
 
 export const GEMINI_RESPONSE_SCHEMA = {
-  type: Type.OBJECT,
+  type: "OBJECT",
   properties: {
     item_title: {
-      type: Type.STRING,
+      type: "STRING",
       description: "Short display title for the generated numeric item.",
     },
     category: {
-      type: Type.STRING,
+      type: "STRING",
       description: "The requested generation mode or a concise subcategory.",
     },
     context_clue: {
-      type: Type.STRING,
+      type: "STRING",
       description:
         "One compact clue that gives enough static context for a player to reason about the quantity.",
     },
     true_value: {
-      type: Type.NUMBER,
+      type: "NUMBER",
       description:
         "The exact numeric answer as a JSON number only, with no commas, units, symbols, or formatting.",
     },
   },
   required: ["item_title", "category", "context_clue", "true_value"],
   propertyOrdering: ["item_title", "category", "context_clue", "true_value"],
-};
+} as const;
 
 export function buildGeminiPrompt({
   marketConfig,
@@ -81,4 +80,3 @@ Hard requirements:
 - If a fact could plausibly have changed after publication, choose a different static item.
 - Make the clue self-contained, concise, and playable without revealing the numeric answer.`;
 }
-

@@ -12,6 +12,8 @@ The room protocol is the boundary between client transports and the pure room do
 - Presence-only broadcasts are not room state mutations, so they can carry the same room revision as the previous public room snapshot.
 - Every rejected command returns a typed room-domain error and preserves the previous room state.
 - Public room snapshots include live presence booleans and never include capability secrets, token hashes, persistence envelopes, or pre-settlement private values.
+- Pre-settlement public item snapshots expose only `round_id`, `item_title`, `category`, and `context_clue`; they must redact `true_value`, `scraped_items`, and `amazon_url` even if those fields are present on an internal object.
+- Post-settlement public item snapshots expose `true_value` and may expose Amazon `scraped_items` and `amazon_url` when those fields are present on the settled generated item.
 
 ## Presence
 
@@ -31,6 +33,7 @@ The room protocol is the boundary between client transports and the pure room do
 - `RESET_TO_LOBBY`: host credential.
 - `KICK_GUEST`: host credential.
 - `ADVANCE_ROUND`: host credential.
+- `RETRY_ITEM_GENERATION`: host credential. Accepted only for active rooms whose game is `error` with `previousPhase === "generatingItem"`.
 - `SUBMIT_INITIAL_WIDTH`: active player credential and width.
 - `TIGHTEN_WIDTH`: active player credential and width.
 - `TRADE_ON_WIDTH`: active player credential.
@@ -49,3 +52,12 @@ The room protocol is the boundary between client transports and the pure room do
 The Durable Object slice should implement one runtime decoder for these messages and one dispatcher that calls the pure room command functions. WebSocket broadcasts should contain public room snapshots, never persistence envelopes.
 
 WebSocket connect, close, and error presence changes rebroadcast updated public snapshots to remaining authorized sockets. These snapshots may reuse the current room revision when only presence changed, and they must not expose secrets, token hashes, persistence metadata, or private generated values.
+
+## Client Snapshot Application
+
+- Clients apply public room snapshots monotonically by room id and revision.
+- A lower-revision snapshot for the current room is stale and must be ignored.
+- A same-revision snapshot may be accepted only when the public room state excluding `presence` is unchanged. This permits presence-only WebSocket broadcasts without allowing stale command responses to overwrite game, seat, config, timestamp, or settlement state.
+- A cross-room snapshot must be ignored unless the caller is intentionally switching rooms, such as after joining or creating a different room.
+- A create-room response with `created: false` is an invite preview only. A client with a stored host or guest session for that room must call the access route to hydrate the full public room snapshot before opening the room socket or rendering game state.
+- If that access call fails because the stored session is stale, invalid, or for the wrong room, the client clears the stored session and keeps only the invite preview state.

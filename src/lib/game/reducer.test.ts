@@ -7,6 +7,7 @@ import {
   receiveItem,
   receiveSettlement,
   resetGame,
+  retryItemGeneration,
   startGame,
   submitInitialWidth,
   submitMarketQuote,
@@ -132,6 +133,7 @@ describe("game reducer", () => {
       { state: generating, action: { type: "START_GAME", payload: startPayload } },
       { state: setup, action: { type: "ITEM_RECEIVED", item } },
       { state: setup, action: { type: "ITEM_FAILED", error: "no item" } },
+      { state: setup, action: { type: "RETRY_ITEM_GENERATION" } },
       { state: setup, action: { type: "SUBMIT_INITIAL_WIDTH", width: 500 } },
       { state: setup, action: { type: "TIGHTEN_WIDTH", width: 200 } },
       { state: setup, action: { type: "TRADE_ON_WIDTH" } },
@@ -267,7 +269,69 @@ describe("game reducer", () => {
     expect(failed.quote).toEqual({ bid: 200, ask: 400 });
     expect(failed.roles).toEqual({ marketMaker: "B", trader: "A" });
     expect("true_value" in failed.item).toBe(false);
+    expect("pendingSide" in failed).toBe(false);
     expect(failed.lastError).toBe("Settlement failed.");
+  });
+
+  it("retries item generation errors without dropping round context or log history", () => {
+    const customPayload: StartGamePayload = {
+      playerAName: "Ada",
+      playerBName: "Grace",
+      mode: "Amazon",
+      customAmazonQuery: true,
+      totalRounds: 2,
+    };
+    const generating = {
+      ...startGame(createInitialGameState(), customPayload),
+      scores: { A: 125, B: -125 },
+    };
+    const failed = gameReducer(generating, {
+      type: "ITEM_FAILED",
+      error: "Provider timed out.",
+    });
+
+    expect(failed.phase).toBe("error");
+
+    if (failed.phase !== "error") {
+      throw new Error("Expected item generation error state.");
+    }
+
+    const retried = retryItemGeneration(failed);
+
+    expect(retried.phase).toBe("generatingItem");
+    expect(retried.mode).toBe("Amazon");
+    expect(retried.customAmazonQuery).toBe(true);
+    expect(retried.players).toEqual(generating.players);
+    expect(retried.scores).toEqual({ A: 125, B: -125 });
+    expect(retried.roles).toEqual(generating.roles);
+    expect(retried.roundNumber).toBe(generating.roundNumber);
+    expect(retried.totalRounds).toBe(generating.totalRounds);
+    expect(retried.lastError).toBeUndefined();
+    expect("error" in retried).toBe(false);
+    expect("previousPhase" in retried).toBe(false);
+    expect(retried.log.slice(0, -1)).toEqual(failed.log);
+    expect(retried.log[retried.log.length - 1]).toMatchObject({
+      phase: "generatingItem",
+      message: "Retrying item generation for round 1.",
+    });
+  });
+
+  it("does not retry non-item-generation error states", () => {
+    const choosing = readyForSideChoice({ bid: 200, ask: 400 });
+    const settling = executeTrade(choosing, "BUY");
+    const failed = gameReducer(settling, {
+      type: "SETTLEMENT_FAILED",
+      error: "Settlement failed.",
+    });
+    const nonItemError: GameState = {
+      ...failed,
+      phase: "error",
+      error: "Market commit failed.",
+      previousPhase: "configuringMarket",
+      lastError: "Market commit failed.",
+    };
+
+    expect(retryItemGeneration(nonItemError)).toBe(nonItemError);
   });
 
   it("settles the clarified A 500, B 200, A trades, B sets 200 / 400 flow", () => {

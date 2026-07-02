@@ -110,6 +110,25 @@ describe("room protocol", () => {
     expect(typeCheck).toBe(false);
   });
 
+  it("decodes retry item generation as a host room command", () => {
+    const result = parseClientRoomCommand(
+      {
+        type: "RETRY_ITEM_GENERATION",
+        credential,
+      },
+      NOW_MS,
+    );
+
+    expect(result).toEqual({
+      ok: true,
+      command: {
+        type: "RETRY_ITEM_GENERATION",
+        credential,
+        nowMs: NOW_MS,
+      },
+    });
+  });
+
   it("rejects caller-supplied settlement data at the runtime boundary", () => {
     const result = parseSystemRoomEvent(
       {

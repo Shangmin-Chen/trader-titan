@@ -254,6 +254,31 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
       };
     }
 
+    case "RETRY_ITEM_GENERATION": {
+      if (state.phase !== "error" || state.previousPhase !== "generatingItem") {
+        return state;
+      }
+
+      const nextState: GameState = {
+        phase: "generatingItem",
+        mode: state.mode,
+        customAmazonQuery: state.customAmazonQuery,
+        players: state.players,
+        scores: state.scores,
+        roles: state.roles,
+        roundNumber: state.roundNumber,
+        totalRounds: state.totalRounds,
+        log: state.log,
+        lastError: undefined,
+      };
+
+      return withLog(
+        nextState,
+        "generatingItem",
+        `Retrying item generation for round ${state.roundNumber}.`,
+      );
+    }
+
     case "SUBMIT_INITIAL_WIDTH": {
       if (state.phase !== "proposingWidth") {
         return state;
@@ -413,8 +438,20 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
       }
 
       const nextState: GameState = {
-        ...state,
         phase: "choosingSide",
+        mode: state.mode,
+        ...(state.customAmazonQuery === undefined
+          ? {}
+          : { customAmazonQuery: state.customAmazonQuery }),
+        players: state.players,
+        scores: state.scores,
+        roles: state.roles,
+        roundNumber: state.roundNumber,
+        totalRounds: state.totalRounds,
+        log: state.log,
+        item: state.item,
+        spreadWidth: state.spreadWidth,
+        quote: state.quote,
         lastError: action.error,
       };
 
@@ -493,6 +530,10 @@ export function startGame(
 
 export function receiveItem(state: GameState, item: GeneratedItem): GameState {
   return gameReducer(state, { type: "ITEM_RECEIVED", item });
+}
+
+export function retryItemGeneration(state: GameState): GameState {
+  return gameReducer(state, { type: "RETRY_ITEM_GENERATION" });
 }
 
 export function submitInitialWidth(state: GameState, width: number): GameState {

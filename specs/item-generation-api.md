@@ -12,6 +12,8 @@ Both `/api/generate-item` and `/api/generate-custom-amazon-item` apply:
 
 The in-memory limiter is a temporary route-boundary guard. Durable Object room commands will become the authoritative multiplayer path.
 
+The same shared guard module also provides Worker-side public room limiters for `POST /api/rooms` and `POST /api/rooms/:roomId/custom-amazon-item`. Those room limiters use Cloudflare client IP keys, remain bounded in memory, and return Worker-style `{ "ok": false, "error": ... }` responses from the Worker boundary rather than the legacy Next route error shape.
+
 ## Responses
 
 Successful responses contain only public item fields:

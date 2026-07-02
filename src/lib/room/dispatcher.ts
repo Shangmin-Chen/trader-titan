@@ -9,6 +9,7 @@ import {
   receiveRoomItem,
   receiveRoomSettlement,
   resetRoomToLobby,
+  retryRoomItemGeneration,
   startRoom,
   submitInitialWidth,
   submitMarketQuote,
@@ -70,6 +71,12 @@ export function dispatchRoomCommand(
       return advanceRoomRound(room, {
         credential: command.credential,
         presence: context.presence,
+        verifyToken: context.verifyToken,
+        nowMs: command.nowMs,
+      });
+    case "RETRY_ITEM_GENERATION":
+      return retryRoomItemGeneration(room, {
+        credential: command.credential,
         verifyToken: context.verifyToken,
         nowMs: command.nowMs,
       });

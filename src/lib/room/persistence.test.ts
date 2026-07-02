@@ -2,15 +2,21 @@ import {
   ABANDONED_ROOM_TTL_MS,
   FINISHED_ROOM_TTL_MS,
   createLobbyRoom,
+  executeTrade,
   isRoomExpired,
   joinRoom,
   loadPersistenceEnvelope,
   parseCapabilityToken,
   parseRoomId,
   parseTokenHash,
+  receiveRoomItem,
+  receiveRoomSettlement,
   roomExpiresAtMs,
   startRoom,
+  submitInitialWidth,
+  submitMarketQuote,
   toPersistenceEnvelope,
+  tradeOnWidth,
   type PresentedCapabilityToken,
   type RoomCapabilityToken,
   type RoomCommandResult,
@@ -190,6 +196,47 @@ describe("room persistence", () => {
       },
     });
   });
+
+  it("rejects malformed settled Amazon metadata in persistence envelopes", () => {
+    const settled = settledRoomWithAmazonMetadata();
+    const envelope = toPersistenceEnvelope(settled, NOW_MS + 12);
+
+    expect(settled.game.phase).toBe("settlement");
+
+    if (settled.game.phase !== "settlement") {
+      throw new Error("Expected settled room fixture.");
+    }
+
+    for (const itemPatch of [
+      { scraped_items: "not an array" },
+      { scraped_items: [{ title: "Bad Listing", price: "12.34" }] },
+      { scraped_items: [{ title: "Bad Listing", price: 12.34, extra: true }] },
+      { amazon_url: 42 },
+    ]) {
+      expect(loadPersistenceEnvelope(
+        {
+          ...envelope,
+          room: {
+            ...settled,
+            game: {
+              ...settled.game,
+              item: {
+                ...settled.game.item,
+                ...itemPatch,
+              },
+            },
+          },
+        },
+        envelope.expiresAtMs - 1,
+      )).toEqual({
+        ok: false,
+        error: {
+          code: "persistence_invalid",
+          message: "Room persistence envelope is invalid.",
+        },
+      });
+    }
+  });
 });
 
 function joinedRoom(): {
@@ -215,6 +262,66 @@ function joinedRoom(): {
   );
 
   return { room: joined, hostToken, guestToken };
+}
+
+function settledRoomWithAmazonMetadata(): RoomState {
+  const { room, hostToken, guestToken } = joinedRoom();
+  const started = expectOk(
+    startRoom(room, {
+      credential: present(hostToken),
+      presence: LIVE_PRESENCE,
+      verifyToken,
+      nowMs: NOW_MS + 2,
+    }),
+  );
+  const item = {
+    round_id: "round-amazon-metadata",
+    item_title: "Vintage Calculator",
+    category: "Amazon",
+    context_clue: "Amazon price for \"Vintage Calculator\"",
+  };
+  const withItem = expectOk(receiveRoomItem(started, item, NOW_MS + 3));
+  const width = expectOk(
+    submitInitialWidth(withItem, 100, {
+      credential: present(hostToken),
+      verifyToken,
+      nowMs: NOW_MS + 4,
+    }),
+  );
+  const configuring = expectOk(
+    tradeOnWidth(width, {
+      credential: present(guestToken),
+      verifyToken,
+      nowMs: NOW_MS + 5,
+    }),
+  );
+  const choosing = expectOk(
+    submitMarketQuote(configuring, { bid: 300, ask: 400 }, {
+      credential: present(hostToken),
+      verifyToken,
+      nowMs: NOW_MS + 6,
+    }),
+  );
+  const settling = expectOk(
+    executeTrade(choosing, "BUY", {
+      credential: present(guestToken),
+      verifyToken,
+      nowMs: NOW_MS + 7,
+    }),
+  );
+
+  return expectOk(
+    receiveRoomSettlement(
+      settling,
+      {
+        ...item,
+        true_value: 349.99,
+        scraped_items: [{ title: "Vintage Calculator", price: 349.99 }],
+        amazon_url: "https://www.amazon.com/s?k=Vintage%20Calculator",
+      },
+      NOW_MS + 8,
+    ),
+  );
 }
 
 function mustRoomId(value: string): RoomId {

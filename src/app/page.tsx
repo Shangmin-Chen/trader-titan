@@ -115,6 +115,7 @@ type ClientCommandInput =
   | Readonly<{ type: "RESET_TO_LOBBY" }>
   | Readonly<{ type: "KICK_GUEST" }>
   | Readonly<{ type: "ADVANCE_ROUND" }>
+  | Readonly<{ type: "RETRY_ITEM_GENERATION" }>
   | Readonly<{ type: "SUBMIT_INITIAL_WIDTH"; width: number }>
   | Readonly<{ type: "TIGHTEN_WIDTH"; width: number }>
   | Readonly<{ type: "TRADE_ON_WIDTH" }>
@@ -142,7 +143,7 @@ export default function Home() {
 function HomeContent() {
   const { announce } = useAnnouncer();
 
-  const [room, setRoom] = useState<PublicRoomSnapshot | null>(null);
+  const [room, setRoomState] = useState<PublicRoomSnapshot | null>(null);
   const [preview, setPreview] = useState<PublicRoomInvitePreview | null>(null);
   const [session, setSession] = useState<RoomSession | null>(null);
   const [loadStatus, setLoadStatus] = useState<LoadStatus>("loading");
@@ -154,6 +155,33 @@ function HomeContent() {
   const [isCommanding, setIsCommanding] = useState(false);
   const [isGeneratingCustomItem, setIsGeneratingCustomItem] = useState(false);
   const socketRef = useRef<WebSocket | null>(null);
+  const roomRef = useRef<PublicRoomSnapshot | null>(null);
+  const setCurrentRoom = useCallback((nextRoom: PublicRoomSnapshot | null) => {
+    roomRef.current = nextRoom;
+    setRoomState(nextRoom);
+  }, []);
+  const applyCurrentRoomSnapshot = useCallback(
+    (
+      incoming: PublicRoomSnapshot,
+      options?: ApplyPublicRoomSnapshotOptions,
+    ): boolean => {
+      const result = applyPublicRoomSnapshotMonotonically(
+        roomRef.current,
+        incoming,
+        options,
+      );
+
+      if (!result.accepted) {
+        return false;
+      }
+
+      roomRef.current = result.room;
+      setRoomState(result.room);
+      setPreview(previewFromSnapshot(result.room));
+      return true;
+    },
+    [],
+  );
   const socketRoomId = room?.id ?? null;
   const socketToken = session?.token ?? null;
 
@@ -245,8 +273,7 @@ function HomeContent() {
               return;
             }
 
-            setRoom(accessed.room);
-            setPreview(previewFromSnapshot(accessed.room));
+            applyCurrentRoomSnapshot(accessed.room, { allowRoomSwitch: true });
             setSession(storedSession);
             setConnectionStatus("connecting");
             setError(null);
@@ -262,7 +289,7 @@ function HomeContent() {
           return;
         }
 
-        setRoom(null);
+        setCurrentRoom(null);
         setPreview(response.room);
         setSession(null);
         setConnectionStatus("idle");
@@ -283,7 +310,7 @@ function HomeContent() {
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [applyCurrentRoomSnapshot, setCurrentRoom]);
 
   useEffect(() => {
     socketRef.current?.close(1000, "room session changed");
@@ -310,21 +337,24 @@ function HomeContent() {
       }
 
       if (message.type === "ROOM_SNAPSHOT") {
+        const accepted = applyCurrentRoomSnapshot(message.room);
+
+        if (!accepted) {
+          return;
+        }
+
         if (
           socketToken.role === "guest" &&
           message.room.seats.guest.occupied === false
         ) {
           clearRoomSession(window.sessionStorage, message.room.id);
-          setRoom(null);
-          setPreview(previewFromSnapshot(message.room));
+          setCurrentRoom(null);
           setSession(null);
           setConnectionStatus("idle");
           socket.close(1008, "guest seat changed");
           return;
         }
 
-        setRoom(message.room);
-        setPreview(previewFromSnapshot(message.room));
         setError(null);
       } else {
         setError(message.error.message);
@@ -367,7 +397,7 @@ function HomeContent() {
           setPreview(null);
         }
 
-        setRoom(null);
+        setCurrentRoom(null);
         setSession(null);
         setConnectionStatus("idle");
       }
@@ -380,6 +410,8 @@ function HomeContent() {
   }, [
     socketRoomId,
     socketToken,
+    applyCurrentRoomSnapshot,
+    setCurrentRoom,
   ]);
 
   const inviteLink = useMemo(() => {
@@ -415,14 +447,14 @@ function HomeContent() {
           nowMs: Date.now(),
         } as RoomClientCommand);
 
-        setRoom(response.room);
+        applyCurrentRoomSnapshot(response.room);
       } catch (caughtError) {
         setError(errorMessage(caughtError, "Room command failed."));
       } finally {
         setIsCommanding(false);
       }
     },
-    [isCommanding, room, session],
+    [applyCurrentRoomSnapshot, isCommanding, room, session],
   );
 
   async function handleCreateRoom(config: CreateRoomConfig) {
@@ -436,20 +468,47 @@ function HomeContent() {
       });
 
       if (response.created) {
-        setRoom(response.room);
-        setPreview(previewFromSnapshot(response.room));
+        applyCurrentRoomSnapshot(response.room, { allowRoomSwitch: true });
         const nextSession = roomSessionFromToken(response.hostToken);
         saveRoomSession(window.sessionStorage, nextSession);
         setSession(nextSession);
         setConnectionStatus("connecting");
         announce("Room created. Share the invite link with player B.");
       } else {
-        setRoom(null);
-        setPreview(response.room);
-        const storedSession = loadRoomSession(window.sessionStorage, response.room.id);
-        setSession(storedSession);
-        setConnectionStatus(storedSession === null ? "idle" : "connecting");
-        announce("Rejoined your existing room.");
+        const storedSession = loadRoomSession(
+          window.sessionStorage,
+          response.room.id,
+        );
+        const existingRoomState = await resolveExistingRoomCreateState(
+          response.room,
+          storedSession,
+          async (roomId, session) => {
+            const accessed = await accessRoom(roomId, {
+              credential: session.token,
+            });
+
+            return accessed.room;
+          },
+        );
+
+        if (existingRoomState.clearStoredSession) {
+          clearRoomSession(window.sessionStorage, response.room.id);
+        }
+
+        if (existingRoomState.kind === "hydrated") {
+          applyCurrentRoomSnapshot(existingRoomState.room, {
+            allowRoomSwitch: true,
+          });
+          setSession(existingRoomState.session);
+          setConnectionStatus(existingRoomState.connectionStatus);
+          announce("Rejoined your existing room.");
+        } else {
+          setSession(null);
+          setCurrentRoom(null);
+          setPreview(existingRoomState.preview);
+          setConnectionStatus(existingRoomState.connectionStatus);
+          announce("Opened existing room preview.");
+        }
       }
 
       window.history.replaceState(
@@ -480,8 +539,7 @@ function HomeContent() {
       saveRoomSession(window.sessionStorage, nextSession);
       setSession(nextSession);
       setConnectionStatus("connecting");
-      setRoom(response.room);
-      setPreview(previewFromSnapshot(response.room));
+      applyCurrentRoomSnapshot(response.room, { allowRoomSwitch: true });
       announce(`Joined room as ${guestName}. Waiting for the host to start the game.`);
     } catch (caughtError) {
       setError(errorMessage(caughtError, "Room could not be joined."));
@@ -504,8 +562,7 @@ function HomeContent() {
         query,
       });
 
-      setRoom(response.room);
-      setPreview(previewFromSnapshot(response.room));
+      applyCurrentRoomSnapshot(response.room);
     } catch (caughtError) {
       setError(errorMessage(caughtError, "Failed to submit Amazon query."));
     } finally {
@@ -519,7 +576,7 @@ function HomeContent() {
     }
 
     setSession(null);
-    setRoom(null);
+    setCurrentRoom(null);
     setConnectionStatus("idle");
   }
 
@@ -628,6 +685,9 @@ function HomeContent() {
             }}
             onReset={() => {
               void runCommand({ type: "RESET_TO_LOBBY" });
+            }}
+            onRetryItemGeneration={() => {
+              void runCommand({ type: "RETRY_ITEM_GENERATION" });
             }}
             onSubmitInitialWidth={(width) => {
               void runCommand({ type: "SUBMIT_INITIAL_WIDTH", width });
@@ -1178,6 +1238,7 @@ type RoomGameViewProps = Readonly<{
   onCustomAmazonQuerySubmit: (query: string) => void;
   onExecuteTrade: (side: TradeSide) => void;
   onReset: () => void;
+  onRetryItemGeneration: () => void;
   onSubmitInitialWidth: (width: number) => void;
   onSubmitMarketQuote: (quote: Quote) => void;
   onTightenWidth: (width: number) => void;
@@ -1195,6 +1256,7 @@ function RoomGameView({
   onCustomAmazonQuerySubmit,
   onExecuteTrade,
   onReset,
+  onRetryItemGeneration,
   onSubmitInitialWidth,
   onSubmitMarketQuote,
   onTightenWidth,
@@ -1437,20 +1499,34 @@ function RoomGameView({
     );
   }
 
+  const canRetry = canRetryItemGeneration(game, isHost);
+
   return (
     <section className="phase-panel" data-testid="error-panel">
       <p className="eyebrow">Game error</p>
       <h2>Round stopped</h2>
       <p>{game.error}</p>
       {isHost ? (
-        <button
-          className="primary-button"
-          disabled={isCommanding}
-          onClick={onReset}
-          type="button"
-        >
-          Reset lobby
-        </button>
+        <div className="room-actions">
+          {canRetry ? (
+            <button
+              className="primary-button"
+              disabled={isCommanding}
+              onClick={onRetryItemGeneration}
+              type="button"
+            >
+              Retry generation
+            </button>
+          ) : null}
+          <button
+            className={canRetry ? "secondary-button" : "primary-button"}
+            disabled={isCommanding}
+            onClick={onReset}
+            type="button"
+          >
+            Reset lobby
+          </button>
+        </div>
       ) : null}
     </section>
   );
@@ -1475,6 +1551,142 @@ function LastError({ game }: LastErrorProps) {
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
+
+type ApplyPublicRoomSnapshotOptions = Readonly<{
+  allowRoomSwitch?: boolean;
+}>;
+
+type ApplyPublicRoomSnapshotResult = Readonly<{
+  accepted: boolean;
+  room: PublicRoomSnapshot;
+}>;
+
+export function applyPublicRoomSnapshotMonotonically(
+  current: PublicRoomSnapshot | null,
+  incoming: PublicRoomSnapshot,
+  options: ApplyPublicRoomSnapshotOptions = {},
+): ApplyPublicRoomSnapshotResult {
+  if (current === null) {
+    return { accepted: true, room: incoming };
+  }
+
+  if (current.id !== incoming.id) {
+    return options.allowRoomSwitch === true
+      ? { accepted: true, room: incoming }
+      : { accepted: false, room: current };
+  }
+
+  if (incoming.revision > current.revision) {
+    return { accepted: true, room: incoming };
+  }
+
+  if (
+    incoming.revision === current.revision &&
+    hasSamePublicRoomStateExceptPresence(current, incoming)
+  ) {
+    return { accepted: true, room: incoming };
+  }
+
+  return { accepted: false, room: current };
+}
+
+function hasSamePublicRoomStateExceptPresence(
+  current: PublicRoomSnapshot,
+  incoming: PublicRoomSnapshot,
+): boolean {
+  return publicRoomStateWithoutPresenceJson(current) ===
+    publicRoomStateWithoutPresenceJson(incoming);
+}
+
+function publicRoomStateWithoutPresenceJson(room: PublicRoomSnapshot): string {
+  return JSON.stringify({
+    id: room.id,
+    lifecycle: room.lifecycle,
+    config: room.config,
+    seats: room.seats,
+    game: room.game,
+    createdAtMs: room.createdAtMs,
+    updatedAtMs: room.updatedAtMs,
+    revision: room.revision,
+  });
+}
+
+export function canRetryItemGeneration(
+  game: PublicRoomGameState,
+  isHost: boolean,
+): boolean {
+  return (
+    isHost &&
+    game.phase === "error" &&
+    game.previousPhase === "generatingItem"
+  );
+}
+
+type ExistingRoomCreateStateAccess = (
+  roomId: PublicRoomInvitePreview["id"],
+  session: RoomSession,
+) => Promise<PublicRoomSnapshot>;
+
+type ExistingRoomCreateStateResolution =
+  | Readonly<{
+      kind: "hydrated";
+      room: PublicRoomSnapshot;
+      preview: PublicRoomInvitePreview;
+      session: RoomSession;
+      connectionStatus: "connecting";
+      clearStoredSession: false;
+    }>
+  | Readonly<{
+      kind: "preview";
+      room: null;
+      preview: PublicRoomInvitePreview;
+      session: null;
+      connectionStatus: "idle";
+      clearStoredSession: boolean;
+    }>;
+
+export async function resolveExistingRoomCreateState(
+  preview: PublicRoomInvitePreview,
+  storedSession: RoomSession | null,
+  accessStoredSession: ExistingRoomCreateStateAccess,
+): Promise<ExistingRoomCreateStateResolution> {
+  if (storedSession === null) {
+    return previewOnlyExistingRoomState(preview, false);
+  }
+
+  try {
+    const room = await accessStoredSession(preview.id, storedSession);
+
+    return {
+      kind: "hydrated",
+      room,
+      preview: previewFromSnapshot(room),
+      session: storedSession,
+      connectionStatus: "connecting",
+      clearStoredSession: false,
+    };
+  } catch (caughtError) {
+    if (isStaleOrInvalidRoomAccessError(caughtError)) {
+      return previewOnlyExistingRoomState(preview, true);
+    }
+
+    throw caughtError;
+  }
+}
+
+function previewOnlyExistingRoomState(
+  preview: PublicRoomInvitePreview,
+  clearStoredSession: boolean,
+): ExistingRoomCreateStateResolution {
+  return {
+    kind: "preview",
+    room: null,
+    preview,
+    session: null,
+    connectionStatus: "idle",
+    clearStoredSession,
+  };
+}
 
 /**
  * Strips everything except ASCII digits. Used on numeric-only text fields
@@ -1644,6 +1856,25 @@ function errorMessage(error: unknown, fallback: string): string {
 
 function isStaleGuestError(error: unknown): boolean {
   return error instanceof RoomClientRequestError && error.error.code === "stale_guest";
+}
+
+function isStaleOrInvalidRoomAccessError(error: unknown): boolean {
+  if (!(error instanceof RoomClientRequestError)) {
+    return false;
+  }
+
+  switch (error.error.code) {
+    case "invalid_request":
+    case "invalid_token":
+    case "missing_token":
+    case "spectator_access_denied":
+    case "stale_guest":
+    case "token_mismatch":
+    case "wrong_room":
+      return true;
+    default:
+      return false;
+  }
 }
 
 function hasRequiredRoomPresence(room: Record<string, unknown>): boolean {

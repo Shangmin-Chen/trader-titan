@@ -7,6 +7,7 @@ import {
   validateSpreadWidth,
   validateTightenedWidth,
 } from "./validation";
+import { MAX_PLAYABLE_ABSOLUTE_VALUE } from "./types";
 
 describe("quote validation", () => {
   it("rejects equality and inversion", () => {
@@ -46,6 +47,42 @@ describe("quote validation", () => {
     expect(validateQuoteForWidth({ bid: 200, ask: 401 }, 200)).toEqual({
       ok: false,
       error: "Bid and ask must match the accepted spread width.",
+    });
+  });
+
+  it("accepts fractional widths on large quotes produced from bid plus width", () => {
+    const quote = quoteFromBid(100_000_000.5, 0.1);
+
+    expect(validateQuoteForWidth(quote, 0.1)).toEqual({ ok: true });
+  });
+
+  it("scales spread tolerance for Cosmic Scale magnitudes", () => {
+    const quote = quoteFromBid(MAX_PLAYABLE_ABSOLUTE_VALUE - 1, 0.1);
+
+    expect(validateQuoteForWidth(quote, 0.1)).toEqual({ ok: true });
+  });
+
+  it("rejects meaningful spread mismatches at large magnitudes", () => {
+    const bid = MAX_PLAYABLE_ABSOLUTE_VALUE - 1;
+
+    expect(validateQuoteForWidth({ bid, ask: bid + 0.2 }, 0.1)).toEqual({
+      ok: false,
+      error: "Bid and ask must match the accepted spread width.",
+    });
+  });
+
+  it("keeps quote value maximum checks before spread width tolerance", () => {
+    expect(
+      validateQuoteForWidth(
+        {
+          bid: MAX_PLAYABLE_ABSOLUTE_VALUE - 0.5,
+          ask: MAX_PLAYABLE_ABSOLUTE_VALUE + 0.5,
+        },
+        1,
+      ),
+    ).toEqual({
+      ok: false,
+      error: `Quote values must be within +/-${MAX_PLAYABLE_ABSOLUTE_VALUE}.`,
     });
   });
 
