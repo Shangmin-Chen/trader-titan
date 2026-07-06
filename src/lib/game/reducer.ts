@@ -200,6 +200,7 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         phase: "generatingItem",
         mode: action.payload.mode,
         customAmazonQuery: action.payload.mode === "Amazon" && action.payload.customAmazonQuery,
+        aiGenerated: action.payload.aiGenerated,
         players: makePlayersFromStart(action.payload),
         scores: { ...DEFAULT_SCORES },
         roles: (action.payload.mode === "Amazon" && action.payload.customAmazonQuery) ? swapRoles(DEFAULT_ROLES) : DEFAULT_ROLES,
@@ -443,6 +444,9 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         ...(state.customAmazonQuery === undefined
           ? {}
           : { customAmazonQuery: state.customAmazonQuery }),
+        ...(state.aiGenerated === undefined
+          ? {}
+          : { aiGenerated: state.aiGenerated }),
         players: state.players,
         scores: state.scores,
         roles: state.roles,
@@ -489,6 +493,7 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         phase: "generatingItem",
         mode: state.mode,
         customAmazonQuery: state.customAmazonQuery,
+        aiGenerated: state.aiGenerated,
         players: state.players,
         scores: state.scores,
         roles: (state.mode === "Amazon" && state.customAmazonQuery) ? swapRoles(baseRoles) : baseRoles,

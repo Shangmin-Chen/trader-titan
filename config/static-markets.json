@@ -1,0 +1,332 @@
+{
+  "Fermi Math & Geometry": [
+    {
+      "item_title": "Seconds in a day",
+      "category": "Fermi Math & Geometry",
+      "context_clue": "A day has 24 hours, each hour has 60 minutes, each minute has 60 seconds.",
+      "true_value": 86400
+    },
+    {
+      "item_title": "Minutes in a standard year",
+      "category": "Fermi Math & Geometry",
+      "context_clue": "A standard year has 365 days, each day has 24 hours, each hour has 60 minutes.",
+      "true_value": 525600
+    },
+    {
+      "item_title": "Slices in 20 standard large pizzas",
+      "category": "Fermi Math & Geometry",
+      "context_clue": "A standard large pizza is cut into exactly 8 equal slices.",
+      "true_value": 160
+    },
+    {
+      "item_title": "Total dots on 10 standard six-sided dice",
+      "category": "Fermi Math & Geometry",
+      "context_clue": "A single standard die has faces numbered 1 through 6.",
+      "true_value": 210
+    },
+    {
+      "item_title": "Internal angles sum of a decagon",
+      "category": "Fermi Math & Geometry",
+      "context_clue": "A decagon has 10 sides. The sum of interior angles is (n-2)*180 degrees.",
+      "true_value": 1440
+    },
+    {
+      "item_title": "Ounces in 5 gallons of liquid",
+      "category": "Fermi Math & Geometry",
+      "context_clue": "One gallon has 4 quarts, one quart has 2 pints, one pint has 2 cups, one cup has 8 fluid ounces.",
+      "true_value": 640
+    },
+    {
+      "item_title": "Centimeters in a mile",
+      "category": "Fermi Math & Geometry",
+      "context_clue": "A mile is 1609.34 meters, and one meter contains exactly 100 centimeters. Round to nearest thousand.",
+      "true_value": 1609000
+    },
+    {
+      "item_title": "Keys on 3 standard grand pianos",
+      "category": "Fermi Math & Geometry",
+      "context_clue": "A standard grand piano has exactly 88 keys (52 white and 36 black).",
+      "true_value": 264
+    },
+    {
+      "item_title": "Pages in 5 copies of a 300-page book",
+      "category": "Fermi Math & Geometry",
+      "context_clue": "Each copy has exactly 300 pages.",
+      "true_value": 1500
+    },
+    {
+      "item_title": "Steps to climb the Empire State Building to 86th floor",
+      "category": "Fermi Math & Geometry",
+      "context_clue": "There are exactly 1,576 steps to climb to the 86th floor observatory.",
+      "true_value": 1576
+    }
+  ],
+  "Static Landmarks & History": [
+    {
+      "item_title": "Height of the Eiffel Tower in meters",
+      "category": "Static Landmarks & History",
+      "context_clue": "The height of the tower including its tip (excluding temporary antennas).",
+      "true_value": 300
+    },
+    {
+      "item_title": "Height of Mount Everest in meters",
+      "category": "Static Landmarks & History",
+      "context_clue": "The official elevation above sea level established by China and Nepal in 2020.",
+      "true_value": 8848
+    },
+    {
+      "item_title": "Year the US Declaration of Independence was signed",
+      "category": "Static Landmarks & History",
+      "context_clue": "Signed by the Second Continental Congress in Philadelphia.",
+      "true_value": 1776
+    },
+    {
+      "item_title": "Year the Titanic sank",
+      "category": "Static Landmarks & History",
+      "context_clue": "The ship struck an iceberg in the North Atlantic on its maiden voyage.",
+      "true_value": 1912
+    },
+    {
+      "item_title": "Year of the first Moon landing",
+      "category": "Static Landmarks & History",
+      "context_clue": "Neil Armstrong and Buzz Aldrin walked on the Lunar surface as part of Apollo 11.",
+      "true_value": 1969
+    },
+    {
+      "item_title": "Number of rooms in the Palace of Versailles",
+      "category": "Static Landmarks & History",
+      "context_clue": "The massive royal chateau built by Louis XIV outside Paris.",
+      "true_value": 2300
+    },
+    {
+      "item_title": "Length of the Great Wall of China in kilometers",
+      "category": "Static Landmarks & History",
+      "context_clue": "The main official wall built during the Ming dynasty. Round to nearest thousand.",
+      "true_value": 8850
+    },
+    {
+      "item_title": "Number of steps in the Eiffel Tower to the top",
+      "category": "Static Landmarks & History",
+      "context_clue": "Total steps from the ground to the third platform.",
+      "true_value": 1665
+    },
+    {
+      "item_title": "Year of the fall of the Western Roman Empire",
+      "category": "Static Landmarks & History",
+      "context_clue": "Odoacer deposed the last Western Roman Emperor, Romulus Augustulus.",
+      "true_value": 476
+    },
+    {
+      "item_title": "Year the Magna Carta was sealed",
+      "category": "Static Landmarks & History",
+      "context_clue": "Agreed to by King John of England at Runnymede.",
+      "true_value": 1215
+    }
+  ],
+  "Cosmic Scale": [
+    {
+      "item_title": "Diameter of the Earth in kilometers",
+      "category": "Cosmic Scale",
+      "context_clue": "Mean equatorial diameter. Round to the nearest ten.",
+      "true_value": 12756
+    },
+    {
+      "item_title": "Distance to the Moon in kilometers",
+      "category": "Cosmic Scale",
+      "context_clue": "Average center-to-center distance from Earth to Moon.",
+      "true_value": 384400
+    },
+    {
+      "item_title": "Average distance from Earth to the Sun in million km",
+      "category": "Cosmic Scale",
+      "context_clue": "One Astronomical Unit (AU) in millions of kilometers.",
+      "true_value": 150
+    },
+    {
+      "item_title": "Speed of light in vacuum in km per second",
+      "category": "Cosmic Scale",
+      "context_clue": "The universal physical constant. Round to nearest hundred thousand.",
+      "true_value": 300000
+    },
+    {
+      "item_title": "Mass of Jupiter compared to Earth",
+      "category": "Cosmic Scale",
+      "context_clue": "Jupiter is the largest planet in our Solar System. Round to nearest whole number.",
+      "true_value": 318
+    },
+    {
+      "item_title": "Number of moons of Saturn",
+      "category": "Cosmic Scale",
+      "context_clue": "The planet with the most recognized moons in our Solar System. Round to nearest five.",
+      "true_value": 146
+    },
+    {
+      "item_title": "Diameter of the Sun in kilometers",
+      "category": "Cosmic Scale",
+      "context_clue": "Approximately 109 times the diameter of Earth. Round to nearest ten thousand.",
+      "true_value": 1392700
+    },
+    {
+      "item_title": "Orbital period of Mars in Earth days",
+      "category": "Cosmic Scale",
+      "context_clue": "The time Mars takes to complete one orbit around the Sun.",
+      "true_value": 687
+    },
+    {
+      "item_title": "Escape velocity of Earth in meters per second",
+      "category": "Cosmic Scale",
+      "context_clue": "The minimum speed needed for a non-propelled object to escape Earth's gravity.",
+      "true_value": 11200
+    },
+    {
+      "item_title": "Age of the universe in billions of years",
+      "category": "Cosmic Scale",
+      "context_clue": "Estimated time since the Big Bang. Round to one decimal place.",
+      "true_value": 13.8
+    }
+  ],
+  "Chaos Quant": [
+    {
+      "item_title": "Base 10 representation of binary 101010",
+      "category": "Chaos Quant",
+      "context_clue": "Convert the binary string to a decimal integer.",
+      "true_value": 42
+    },
+    {
+      "item_title": "The 10th Fibonacci number",
+      "category": "Chaos Quant",
+      "context_clue": "F(1) = 1, F(2) = 1, F(3) = 2, ..., find F(10).",
+      "true_value": 55
+    },
+    {
+      "item_title": "Atomic number of Gold",
+      "category": "Chaos Quant",
+      "context_clue": "The chemical element Au in the periodic table.",
+      "true_value": 79
+    },
+    {
+      "item_title": "Sum of integers from 1 to 100",
+      "category": "Chaos Quant",
+      "context_clue": "The classic arithmetic series sum (n * (n + 1)) / 2.",
+      "true_value": 5050
+    },
+    {
+      "item_title": "Number of cards in a standard deck",
+      "category": "Chaos Quant",
+      "context_clue": "A standard French-suited deck with two extra jokers.",
+      "true_value": 54
+    },
+    {
+      "item_title": "Number of elements in the Periodic Table",
+      "category": "Chaos Quant",
+      "context_clue": "Fully completed up to row 7.",
+      "true_value": 118
+    },
+    {
+      "item_title": "Maximum score in a single game of Bowling",
+      "category": "Chaos Quant",
+      "context_clue": "Achieved by rolling 12 consecutive strikes.",
+      "true_value": 300
+    },
+    {
+      "item_title": "Value of pi to 4 decimal places",
+      "category": "Chaos Quant",
+      "context_clue": "Represented as 31415 (omitting the decimal point).",
+      "true_value": 31415
+    },
+    {
+      "item_title": "Number of standard time zones in the world",
+      "category": "Chaos Quant",
+      "context_clue": "Standard offsets from UTC.",
+      "true_value": 24
+    },
+    {
+      "item_title": "Sum of prime numbers less than 20",
+      "category": "Chaos Quant",
+      "context_clue": "Primes: 2, 3, 5, 7, 11, 13, 17, 19.",
+      "true_value": 77
+    }
+  ],
+  "Amazon": [
+    {
+      "item_title": "Liquid Ass Spray",
+      "category": "Amazon",
+      "context_clue": "Amazon price for a standard bottle of highly concentrated, terrible-smelling fart spray.",
+      "true_value": 12.99,
+      "scraped_items": [{ "title": "Liquid Ass Spray", "price": 12.99 }],
+      "amazon_url": "https://www.amazon.com/s?k=Liquid+Ass+Spray"
+    },
+    {
+      "item_title": "Nicolas Cage Mermaid Pillow",
+      "category": "Amazon",
+      "context_clue": "Amazon price for a reversible sequin throw pillow case featuring Nicolas Cage's face.",
+      "true_value": 9.99,
+      "scraped_items": [{ "title": "Nicolas Cage Mermaid Pillow", "price": 9.99 }],
+      "amazon_url": "https://www.amazon.com/s?k=Nicolas+Cage+Mermaid+Pillow"
+    },
+    {
+      "item_title": "Giant Inflatable T-Rex Costume",
+      "category": "Amazon",
+      "context_clue": "Amazon price for the official Rubie's inflatable adult dinosaur suit.",
+      "true_value": 59.99,
+      "scraped_items": [{ "title": "Giant Inflatable T-Rex Costume", "price": 59.99 }],
+      "amazon_url": "https://www.amazon.com/s?k=Giant+Inflatable+T-Rex+Costume"
+    },
+    {
+      "item_title": "Herman Miller Aeron Chair",
+      "category": "Amazon",
+      "context_clue": "Amazon price for a fully loaded, renewed Herman Miller ergonomic office chair.",
+      "true_value": 699.99,
+      "scraped_items": [{ "title": "Herman Miller Aeron Chair", "price": 699.99 }],
+      "amazon_url": "https://www.amazon.com/s?k=Herman+Miller+Aeron+Chair"
+    },
+    {
+      "item_title": "Apple iPad Air 11-inch M2",
+      "category": "Amazon",
+      "context_clue": "Amazon price for the latest 128GB Wi-Fi model of Apple's mid-tier tablet.",
+      "true_value": 599.00,
+      "scraped_items": [{ "title": "Apple iPad Air (11-inch, M2)", "price": 599.00 }],
+      "amazon_url": "https://www.amazon.com/s?k=Apple+iPad+Air+11-inch+M2"
+    },
+    {
+      "item_title": "Sony PlayStation 5 Slim Console",
+      "category": "Amazon",
+      "context_clue": "Amazon price for the digital edition of the slimmed-down PS5 console.",
+      "true_value": 449.99,
+      "scraped_items": [{ "title": "Sony PlayStation 5 Slim Console", "price": 449.99 }],
+      "amazon_url": "https://www.amazon.com/s?k=Sony+PlayStation+5+Slim+Console"
+    },
+    {
+      "item_title": "Yodelling Pickled Cucumber",
+      "category": "Amazon",
+      "context_clue": "Amazon price for the electronic yodeling pickle toy.",
+      "true_value": 14.95,
+      "scraped_items": [{ "title": "Yodelling Pickled Cucumber", "price": 14.95 }],
+      "amazon_url": "https://www.amazon.com/s?k=Yodelling+Pickled+Cucumber"
+    },
+    {
+      "item_title": "55 Gallon Drum of Lube",
+      "category": "Amazon",
+      "context_clue": "Amazon price for a massive bulk container of personal water-based lubricant.",
+      "true_value": 149.99,
+      "scraped_items": [{ "title": "55 Gallon Drum of Lube", "price": 149.99 }],
+      "amazon_url": "https://www.amazon.com/s?k=55+Gallon+Drum+of+Lube"
+    },
+    {
+      "item_title": "Bose QuietComfort Wireless Headphones",
+      "category": "Amazon",
+      "context_clue": "Amazon price for Bose's flagship noise-cancelling over-ear headphones.",
+      "true_value": 349.00,
+      "scraped_items": [{ "title": "Bose QuietComfort Wireless Headphones", "price": 349.00 }],
+      "amazon_url": "https://www.amazon.com/s?k=Bose+QuietComfort+Wireless+Headphones"
+    },
+    {
+      "item_title": "Tumi 19 Degree International Carry-On",
+      "category": "Amazon",
+      "context_clue": "Amazon price for Tumi's luxury hardside luggage suitcase.",
+      "true_value": 750.00,
+      "scraped_items": [{ "title": "Tumi 19 Degree International Carry-On", "price": 750.00 }],
+      "amazon_url": "https://www.amazon.com/s?k=Tumi+19+Degree+International+Carry-On"
+    }
+  ]
+}

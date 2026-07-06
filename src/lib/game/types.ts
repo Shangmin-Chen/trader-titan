@@ -95,6 +95,7 @@ export type RoundLogEntry = {
 type GameStateBase = {
   mode: GameMode;
   customAmazonQuery?: boolean;
+  aiGenerated?: boolean;
   players: Record<PlayerId, Player>;
   scores: Scores;
   roles: Roles;
@@ -181,6 +182,7 @@ export type StartGamePayload = {
   mode: GameMode;
   totalRounds: number;
   customAmazonQuery?: boolean;
+  aiGenerated?: boolean;
 };
 
 export type GameAction =

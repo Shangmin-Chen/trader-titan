@@ -271,6 +271,9 @@ function publicGameBase(game: GameState): Omit<SetupGameState, "phase"> {
     ...(game.customAmazonQuery === undefined
       ? {}
       : { customAmazonQuery: game.customAmazonQuery }),
+    ...(game.aiGenerated === undefined
+      ? {}
+      : { aiGenerated: game.aiGenerated }),
     players: {
       A: publicPlayer(game.players.A),
       B: publicPlayer(game.players.B),

@@ -733,6 +733,7 @@ function CreateRoomPanel({ disabled, error, onCreate }: CreateRoomPanelProps) {
   const [mode, setMode] = useState<GameMode>(GAME_MODES[0]);
   const [totalRoundsInput, setTotalRoundsInput] = useState("3");
   const [customAmazonQuery, setCustomAmazonQuery] = useState(false);
+  const [aiGenerated, setAiGenerated] = useState(false);
   const [fieldErrors, setFieldErrors] = useState<CreateRoomFieldErrors>({});
   const [formError, setFormError] = useState<string | null>(null);
   const totalRounds = useMemo(
@@ -748,6 +749,7 @@ function CreateRoomPanel({ disabled, error, onCreate }: CreateRoomPanelProps) {
       mode,
       totalRounds,
       customAmazonQuery,
+      aiGenerated,
     });
     const nextErrors = validateCreateRoomFields(hostName, mode, totalRounds);
     setFieldErrors(nextErrors);
@@ -771,6 +773,7 @@ function CreateRoomPanel({ disabled, error, onCreate }: CreateRoomPanelProps) {
         mode: payload.mode,
         totalRounds: payload.totalRounds,
         customAmazonQuery: payload.customAmazonQuery,
+        aiGenerated: payload.aiGenerated,
       },
     });
   }
@@ -859,7 +862,23 @@ function CreateRoomPanel({ disabled, error, onCreate }: CreateRoomPanelProps) {
             ) : null}
           </div>
 
-          {mode === "Amazon" ? (
+          <div className="form-field room-checkbox-field">
+            <input
+              checked={aiGenerated}
+              className="form-field__checkbox"
+              id={`${formId}-ai-generated`}
+              onChange={(event) => setAiGenerated(event.target.checked)}
+              type="checkbox"
+            />
+            <label
+              className="form-field__label"
+              htmlFor={`${formId}-ai-generated`}
+            >
+              AI automated generated markets
+            </label>
+          </div>
+
+          {mode === "Amazon" && !aiGenerated ? (
             <div className="form-field room-checkbox-field">
               <input
                 checked={customAmazonQuery}
@@ -1704,6 +1723,7 @@ function buildStartPayload(input: {
   mode: GameMode;
   totalRounds: number | null;
   customAmazonQuery: boolean;
+  aiGenerated: boolean;
 }): StartGamePayload | null {
   if (input.totalRounds === null) {
     return null;
@@ -1715,6 +1735,7 @@ function buildStartPayload(input: {
     mode: input.mode,
     totalRounds: input.totalRounds,
     customAmazonQuery: input.mode === "Amazon" && input.customAmazonQuery,
+    aiGenerated: input.aiGenerated,
   };
 }
 

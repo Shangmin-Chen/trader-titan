@@ -41,6 +41,7 @@ export function SetupForm({
     String(defaultValues?.totalRounds ?? 3),
   );
   const [customAmazonQuery, setCustomAmazonQuery] = useState(defaultValues?.customAmazonQuery ?? false);
+  const [aiGenerated, setAiGenerated] = useState(defaultValues?.aiGenerated ?? false);
   const [fieldErrors, setFieldErrors] = useState<SetupFieldErrors>({});
   const [formError, setFormError] = useState<string | null>(null);
 
@@ -60,6 +61,7 @@ export function SetupForm({
       mode,
       totalRounds,
       customAmazonQuery: mode === "Amazon" && customAmazonQuery,
+      aiGenerated,
     };
   }
 
@@ -189,7 +191,20 @@ export function SetupForm({
             </p>
           ) : null}
 
-          {mode === "Amazon" ? (
+          <div className="form-field room-checkbox-field">
+            <input
+              id={`${formId}-ai-generated`}
+              type="checkbox"
+              checked={aiGenerated}
+              onChange={(e) => setAiGenerated(e.target.checked)}
+              className="form-field__checkbox"
+            />
+            <label className={`form-field__label ${styles.checkboxLabel}`} htmlFor={`${formId}-ai-generated`}>
+              AI automated generated markets
+            </label>
+          </div>
+
+          {mode === "Amazon" && !aiGenerated ? (
             <div className="form-field room-checkbox-field">
               <input
                 id={`${formId}-custom-amazon`}
@@ -199,7 +214,7 @@ export function SetupForm({
                 className="form-field__checkbox"
               />
               <label className={`form-field__label ${styles.checkboxLabel}`} htmlFor={`${formId}-custom-amazon`}>
-                Player-entered Amazon product query (instead of Gemini)
+                Player-entered Amazon product query (instead of static predefined ones)
               </label>
             </div>
           ) : null}

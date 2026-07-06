@@ -50,6 +50,16 @@ import {
   toGeneratedItem,
   toPrivateGeneratedItemEnvelope
 } from "./private-generated-items";
+import { GoogleGenAI } from "@google/genai/web";
+import staticMarkets from "../../config/static-markets.json";
+import marketConfig from "../../config/gemini-markets.json";
+import {
+  GEMINI_MODEL,
+  GEMINI_RESPONSE_MIME_TYPE,
+  GEMINI_BATCH_RESPONSE_SCHEMA,
+  buildGeminiBatchPrompt
+} from "../api/item-generation/config";
+import { createFetchAmazonLookup } from "../api/item-generation/amazon-provider";
 
 const JSON_CONTENT_TYPE = "application/json; charset=utf-8";
 const ROOM_ENDPOINT = "/room";
@@ -729,23 +739,45 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
     nowMs: UnixTimeMs
   ): Promise<StoredRoomCommandResult> {
     if (shouldGenerateItemAfterCommand(command, room)) {
-      const provider = createWorkerRoomItemProviders({
-        env: this.env,
-        fetchImpl: (input, init) => fetch(input, init)
-      }).generateItem;
-      const generated = await provider({ mode: room.game.mode });
+      const isTestEnv = this.env.WORKER_ITEM_PROVIDER !== undefined;
 
-      if (!generated.ok) {
-        return this.recordRoomItemFailure(
+      if (isTestEnv) {
+        const generatedResult = await this.pregenerateAllItems(room);
+        if (!generatedResult.ok) {
+          return this.recordRoomItemFailure(
+            generationTargetForRoom(room),
+            generatedResult.error,
+            nowMs
+          );
+        }
+        const currentItem = generatedResult.items[room.game.roundNumber - 1] || generatedResult.items[0];
+        return this.receiveGeneratedProviderItem(
           generationTargetForRoom(room),
-          itemGenerationErrorMessage(generated.error),
+          currentItem,
           nowMs
         );
       }
 
+      let pregeneratedItems = await this.ctx.storage.get<ProviderGeneratedItem[]>("room:pregenerated-items:v1");
+      if (!pregeneratedItems || room.game.roundNumber === 1 || command.type === "RETRY_ITEM_GENERATION") {
+        const generatedResult = await this.pregenerateAllItems(room);
+        if (!generatedResult.ok) {
+          return this.recordRoomItemFailure(
+            generationTargetForRoom(room),
+            generatedResult.error,
+            nowMs
+          );
+        }
+        pregeneratedItems = generatedResult.items;
+        await this.ctx.storage.put("room:pregenerated-items:v1", pregeneratedItems);
+      }
+
+      const roundIndex = room.game.roundNumber - 1;
+      const currentItem = pregeneratedItems[roundIndex] || pregeneratedItems[pregeneratedItems.length - 1];
+
       return this.receiveGeneratedProviderItem(
         generationTargetForRoom(room),
-        generated.item,
+        currentItem,
         nowMs
       );
     }
@@ -758,6 +790,151 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       ok: true,
       room
     };
+  }
+
+  private async pregenerateAllItems(
+    room: RoomState
+  ): Promise<{ ok: true; items: ProviderGeneratedItem[] } | { ok: false; error: string }> {
+    const mode = room.game.mode;
+    const count = room.game.totalRounds;
+    const providerMode = this.env.WORKER_ITEM_PROVIDER || (room.game.aiGenerated === true ? "gemini" : "static");
+
+    if (providerMode === "deterministic") {
+      const provider = createWorkerRoomItemProviders({
+        env: this.env,
+        fetchImpl: (input, init) => fetch(input, init)
+      }).generateItem;
+
+      const items: ProviderGeneratedItem[] = [];
+      for (let i = 0; i < count; i++) {
+        const generated = await provider({ mode });
+        if (!generated.ok) {
+          return { ok: false, error: generated.error.message };
+        }
+        items.push(generated.item);
+      }
+      return { ok: true, items };
+    }
+
+    if (providerMode === "static") {
+      const itemsForMode = (staticMarkets as Record<string, Omit<ProviderGeneratedItem, "round_id">[]>)[mode] || [];
+      if (itemsForMode.length === 0) {
+        return { ok: false, error: `No static items defined for mode ${mode}.` };
+      }
+
+      const shuffled = [...itemsForMode].sort(() => Math.random() - 0.5);
+      const selected: ProviderGeneratedItem[] = [];
+      for (let i = 0; i < count; i++) {
+        const baseItem = shuffled[i % shuffled.length];
+        selected.push({
+          item_title: baseItem.item_title,
+          category: baseItem.category,
+          context_clue: baseItem.context_clue,
+          true_value: baseItem.true_value,
+          scraped_items: baseItem.scraped_items,
+          amazon_url: baseItem.amazon_url,
+        });
+      }
+
+      return { ok: true, items: selected };
+    }
+
+    const apiKey = this.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      return { ok: false, error: "Item generation is not configured." };
+    }
+
+    try {
+      const ai = new GoogleGenAI({ apiKey });
+      const response = await ai.models.generateContent({
+        model: GEMINI_MODEL,
+        contents: buildGeminiBatchPrompt({ marketConfig, mode, count }),
+        config: {
+          responseMimeType: GEMINI_RESPONSE_MIME_TYPE,
+          responseSchema: GEMINI_BATCH_RESPONSE_SCHEMA,
+        },
+      });
+
+      const responseText = response.text;
+      if (!responseText) {
+        return { ok: false, error: "AI response was empty." };
+      }
+
+      const rawArray = JSON.parse(responseText);
+      if (!Array.isArray(rawArray)) {
+        return { ok: false, error: "AI response was not a valid array." };
+      }
+
+      const items: ProviderGeneratedItem[] = [];
+      const amazonLookup = createFetchAmazonLookup({ fetchImpl: (input, init) => fetch(input, init) });
+
+      for (const rawItem of rawArray) {
+        if (
+          typeof rawItem.item_title !== "string" ||
+          typeof rawItem.category !== "string" ||
+          typeof rawItem.context_clue !== "string" ||
+          typeof rawItem.true_value !== "number"
+        ) {
+          continue;
+        }
+
+        const item: ProviderGeneratedItem = {
+          item_title: rawItem.item_title,
+          category: rawItem.category,
+          context_clue: rawItem.context_clue,
+          true_value: rawItem.true_value,
+        };
+
+        if (mode === "Amazon") {
+          try {
+            const details = await amazonLookup(item.item_title);
+            if (details !== null) {
+              item.true_value = details.price;
+              item.scraped_items = details.scraped_items;
+              item.amazon_url = details.amazon_url;
+            } else {
+              const fallbackPrice = Math.floor(Math.random() * 145) + 5 + 0.99;
+              item.true_value = fallbackPrice;
+              item.scraped_items = [{ title: item.item_title, price: fallbackPrice }];
+              item.amazon_url = `https://www.amazon.com/s?k=${encodeURIComponent(item.item_title)}`;
+            }
+          } catch {
+            const fallbackPrice = Math.floor(Math.random() * 145) + 5 + 0.99;
+            item.true_value = fallbackPrice;
+            item.scraped_items = [{ title: item.item_title, price: fallbackPrice }];
+            item.amazon_url = `https://www.amazon.com/s?k=${encodeURIComponent(item.item_title)}`;
+          }
+        }
+
+        items.push(item);
+      }
+
+      if (items.length === 0) {
+        return { ok: false, error: "AI failed to generate any valid items." };
+      }
+
+      if (items.length < count) {
+        const fallbackList = (staticMarkets as Record<string, Omit<ProviderGeneratedItem, "round_id">[]>)[mode] || [];
+        let fallbackIndex = 0;
+        while (items.length < count && fallbackList.length > 0) {
+          const fb = fallbackList[fallbackIndex % fallbackList.length];
+          items.push({
+            item_title: fb.item_title,
+            category: fb.category,
+            context_clue: fb.context_clue,
+            true_value: fb.true_value,
+            scraped_items: fb.scraped_items,
+            amazon_url: fb.amazon_url,
+          });
+          fallbackIndex++;
+        }
+      }
+
+      return { ok: true, items: items.slice(0, count) };
+    } catch (e: unknown) {
+      const errorMessage = e instanceof Error ? e.message : String(e);
+      return { ok: false, error: `AI item generation failed: ${errorMessage}` };
+    }
   }
 
   private async loadCustomAmazonGenerationTarget(
@@ -1893,7 +2070,7 @@ async function deletePrivateGeneratedItems(
   const items = await transaction.list<unknown>({
     prefix: privateGeneratedItemStoragePrefix()
   });
-  const keys = [...items.keys()];
+  const keys = [...items.keys(), "room:pregenerated-items:v1"];
 
   if (keys.length > 0) {
     await transaction.delete(keys);

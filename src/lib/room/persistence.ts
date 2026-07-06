@@ -197,6 +197,13 @@ function decodeRoomGameConfig(value: unknown): RoomGameConfig | null {
     return null;
   }
 
+  if (
+    value.aiGenerated !== undefined &&
+    typeof value.aiGenerated !== "boolean"
+  ) {
+    return null;
+  }
+
   if (value.mode !== "Amazon" && value.customAmazonQuery === true) {
     return null;
   }
@@ -205,6 +212,7 @@ function decodeRoomGameConfig(value: unknown): RoomGameConfig | null {
     mode: value.mode,
     totalRounds: value.totalRounds,
     ...(value.customAmazonQuery === true ? { customAmazonQuery: true } : {}),
+    ...(value.aiGenerated === true ? { aiGenerated: true } : {}),
   };
 }
 
@@ -306,6 +314,8 @@ function isGameStateBase(value: Record<string, unknown>): boolean {
     isGameMode(value.mode) &&
     (value.customAmazonQuery === undefined ||
       typeof value.customAmazonQuery === "boolean") &&
+    (value.aiGenerated === undefined ||
+      typeof value.aiGenerated === "boolean") &&
     isPlayers(value.players) &&
     isScores(value.scores) &&
     isRoles(value.roles) &&
@@ -326,6 +336,7 @@ function baseGameKeysFor(value: Record<string, unknown>): string[] {
     "totalRounds",
     "log",
     ...(value.customAmazonQuery === undefined ? [] : ["customAmazonQuery"]),
+    ...(value.aiGenerated === undefined ? [] : ["aiGenerated"]),
     ...(value.lastError === undefined ? [] : ["lastError"]),
   ];
 }

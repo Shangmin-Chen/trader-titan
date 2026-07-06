@@ -22,7 +22,7 @@ import {
 } from "./tokens";
 import type { RoomGameConfig, UnixTimeMs } from "./types";
 
-const CONFIG_KEYS = ["mode", "totalRounds", "customAmazonQuery"] as const;
+const CONFIG_KEYS = ["mode", "totalRounds", "customAmazonQuery", "aiGenerated"] as const;
 const GENERATED_ITEM_KEYS = [
   "round_id",
   "item_title",
@@ -173,6 +173,7 @@ type MutableRoomGameConfigPatch = {
   mode?: RoomGameConfig["mode"];
   totalRounds?: RoomGameConfig["totalRounds"];
   customAmazonQuery?: NonNullable<RoomGameConfig["customAmazonQuery"]>;
+  aiGenerated?: NonNullable<RoomGameConfig["aiGenerated"]>;
 };
 type SystemEventType = SystemRoomEvent["type"];
 
@@ -571,6 +572,18 @@ function decodeRoomGameConfigPatch(value: unknown): DecodeResult<Partial<RoomGam
     }
 
     config.customAmazonQuery = value.customAmazonQuery;
+  }
+
+  if (hasField(value, "aiGenerated")) {
+    if (typeof value.aiGenerated !== "boolean") {
+      return decodeFailure(
+        "config_invalid",
+        "AI generated must be a boolean.",
+        "config.aiGenerated",
+      );
+    }
+
+    config.aiGenerated = value.aiGenerated;
   }
 
   return { ok: true, value: config };

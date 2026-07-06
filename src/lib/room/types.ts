@@ -20,6 +20,7 @@ export type RoomGameConfig = Readonly<{
   mode: GameMode;
   totalRounds: number;
   customAmazonQuery?: boolean;
+  aiGenerated?: boolean;
 }>;
 
 export type HostSeat = Readonly<{
