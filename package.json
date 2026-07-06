@@ -20,7 +20,6 @@
     "@google/genai": "^2.10.0",
     "next": "^16.2.9",
     "react": "^19.2.7",
-    "react-aria-components": "^1.19.0",
     "react-dom": "^19.2.7"
   },
   "devDependencies": {
@@ -37,7 +36,6 @@
     "eslint": "^9.39.4",
     "eslint-config-next": "^16.2.9",
     "jsdom": "^29.1.1",
-    "rclone.js": "^0.6.6",
     "typescript": "^6.0.3",
     "vitest": "^4.1.9",
     "wrangler": "^4.105.0"
