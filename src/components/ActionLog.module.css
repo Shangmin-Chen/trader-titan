@@ -17,7 +17,7 @@
 }
 
 .toggle[aria-expanded="true"] .chevron {
-  color: var(--accent-hover);
+  color: var(--accent);
 }
 
 .body {

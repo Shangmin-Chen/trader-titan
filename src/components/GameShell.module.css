@@ -6,11 +6,16 @@
   top: 0;
   /* Above scrolling panels, below modals (>= 900) */
   z-index: 800;
-  background: var(--bg-base);
-  -webkit-backdrop-filter: blur(12px) saturate(180%);
-  backdrop-filter: blur(12px) saturate(180%);
-  /* Subtle separation line when content scrolls under */
-  box-shadow: 0 1px 0 var(--border-subtle);
+  /* Slightly translucent so the ledger-grid body shows through the blur */
+  background: color-mix(in srgb, var(--bg-base) 88%, transparent);
+  -webkit-backdrop-filter: blur(10px);
+  backdrop-filter: blur(10px);
+}
+
+@supports not (background: color-mix(in srgb, red 50%, blue)) {
+  .stickyHeader {
+    background: var(--bg-base);
+  }
 }
 
 @media (prefers-reduced-motion: reduce) {
