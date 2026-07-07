@@ -17,7 +17,7 @@ test.describe("Cloudflare room invite flow", () => {
     await expect(guest.getByTestId("room-controls")).toBeVisible();
 
     await host.getByRole("button", { name: "Start game" }).click();
-    await playHostMarketMakerRoundToSettlement(host, guest);
+    await playDefaultQueryRoundToSettlement(host, guest);
 
     await host.getByRole("button", { name: "End game" }).click();
     await expect(host.getByTestId("game-over-panel")).toBeVisible({
@@ -68,7 +68,7 @@ test.describe("Cloudflare room invite flow", () => {
 
     await expect(host.getByRole("button", { name: "Start game" })).toBeEnabled();
     await host.getByRole("button", { name: "Start game" }).click();
-    await playHostMarketMakerRoundToSettlement(host, guest);
+    await playDefaultQueryRoundToSettlement(host, guest);
 
     await guest.goto("about:blank");
 
@@ -100,10 +100,18 @@ test.describe("Cloudflare room invite flow", () => {
     await expect(host.getByRole("button", { name: "Next round" })).toBeEnabled();
     await host.getByRole("button", { name: "Next round" }).click();
 
-    await expect(guest.getByRole("button", { name: "Propose width" })).toBeEnabled({
+    // Round 2 alternates roles: the guest is now the trader who enters the
+    // query, after which the host makes the market.
+    await expect(guest.getByTestId("custom-amazon-query-form")).toBeVisible({
       timeout: ROOM_PHASE_TIMEOUT_MS,
     });
-    await expect(host.getByRole("button", { name: "Propose width" })).toBeDisabled();
+    await guest.getByLabel("Search Term / Product Name").fill("standing desk");
+    await guest.getByRole("button", { name: "Submit & Scrape Price" }).click();
+
+    await expect(host.getByRole("button", { name: "Propose width" })).toBeEnabled({
+      timeout: ROOM_PHASE_TIMEOUT_MS,
+    });
+    await expect(guest.getByRole("button", { name: "Propose width" })).toBeDisabled();
   });
 
   test("keeps lobby start blocked while player B is disconnected and enables it on reconnect", async ({
@@ -214,36 +222,49 @@ async function createAndJoinRoom(
   return { host, guest, inviteUrl };
 }
 
-async function playHostMarketMakerRoundToSettlement(host: Page, guest: Page) {
+/**
+ * Plays round 1 to settlement under the default player-entered-query flow:
+ * roles are swapped, so the host (Ada) is the trader who enters the query
+ * and the guest (Grace) makes the market.
+ */
+async function playDefaultQueryRoundToSettlement(host: Page, guest: Page) {
+  await expect(host.getByTestId("custom-amazon-query-form")).toBeVisible({
+    timeout: ROOM_PHASE_TIMEOUT_MS,
+  });
+  await host
+    .getByLabel("Search Term / Product Name")
+    .fill("mechanical keyboard");
+  await host.getByRole("button", { name: "Submit & Scrape Price" }).click();
+
   await expect(host.getByTestId("item-panel")).toBeVisible({
     timeout: ROOM_PHASE_TIMEOUT_MS,
   });
   await expect(host.getByTestId("item-panel")).not.toContainText("True value");
 
-  await host.getByRole("spinbutton", { name: "Spread width" }).fill("100");
-  await host.getByRole("button", { name: "Propose width" }).click();
+  await guest.getByRole("spinbutton", { name: "Spread width" }).fill("100");
+  await guest.getByRole("button", { name: "Propose width" }).click();
 
-  await expect(guest.getByTestId("width-negotiation-panel")).toContainText(
+  await expect(host.getByTestId("width-negotiation-panel")).toContainText(
     /Current width:?\s*100/,
     { timeout: ROOM_PHASE_TIMEOUT_MS },
   );
-  await guest.getByRole("button", { name: "Trade on width" }).click();
+  await host.getByRole("button", { name: "Trade on width" }).click();
 
-  await host.getByRole("spinbutton", { name: "Ask" }).fill("3700");
-  await expect(host.getByRole("spinbutton", { name: "Bid" })).toHaveValue("3600");
-  await host.getByRole("button", { name: "Commit market" }).click();
+  await guest.getByRole("spinbutton", { name: "Ask" }).fill("3700");
+  await expect(guest.getByRole("spinbutton", { name: "Bid" })).toHaveValue("3600");
+  await guest.getByRole("button", { name: "Commit market" }).click();
 
-  await expect(guest.getByTestId("trade-action-panel")).toContainText(
+  await expect(host.getByTestId("trade-action-panel")).toContainText(
     "Quote: 3,600 / 3,700",
     { timeout: ROOM_PHASE_TIMEOUT_MS },
   );
-  await guest.getByRole("button", { name: "Buy" }).click();
+  await host.getByRole("button", { name: "Buy" }).click();
 
   await expect(host.getByTestId("settlement-panel")).toBeVisible({
     timeout: ROOM_PHASE_TIMEOUT_MS,
   });
   await expect(host.getByTestId("item-panel")).toContainText("True value");
   await expect(host.getByTestId("settlement-panel")).toContainText(
-    "Grace trader PnL",
+    "Ada trader PnL",
   );
 }

@@ -1592,7 +1592,6 @@ function shouldGenerateItemAfterCommand(
 function isCustomAmazonGenerationPending(room: RoomState): boolean {
   return room.lifecycle === "active" &&
     room.game.phase === "generatingItem" &&
-    room.game.mode === "Amazon" &&
     room.game.customAmazonQuery === true;
 }
 

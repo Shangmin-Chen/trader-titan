@@ -199,11 +199,11 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         ...state,
         phase: "generatingItem",
         mode: action.payload.mode,
-        customAmazonQuery: action.payload.mode === "Amazon" && action.payload.customAmazonQuery,
+        customAmazonQuery: action.payload.customAmazonQuery === true,
         aiGenerated: action.payload.aiGenerated,
         players: makePlayersFromStart(action.payload),
         scores: { ...DEFAULT_SCORES },
-        roles: (action.payload.mode === "Amazon" && action.payload.customAmazonQuery) ? swapRoles(DEFAULT_ROLES) : DEFAULT_ROLES,
+        roles: action.payload.customAmazonQuery === true ? swapRoles(DEFAULT_ROLES) : DEFAULT_ROLES,
         roundNumber: 1,
         totalRounds: action.payload.totalRounds,
         log: [],
@@ -264,6 +264,9 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         phase: "generatingItem",
         mode: state.mode,
         customAmazonQuery: state.customAmazonQuery,
+        ...(state.aiGenerated === undefined
+          ? {}
+          : { aiGenerated: state.aiGenerated }),
         players: state.players,
         scores: state.scores,
         roles: state.roles,
@@ -413,6 +416,9 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         phase: "settlement",
         mode: state.mode,
         customAmazonQuery: state.customAmazonQuery,
+        ...(state.aiGenerated === undefined
+          ? {}
+          : { aiGenerated: state.aiGenerated }),
         players: state.players,
         scores: applySettlementToScores(state.scores, action.settlement),
         roles: state.roles,
@@ -496,7 +502,7 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         aiGenerated: state.aiGenerated,
         players: state.players,
         scores: state.scores,
-        roles: (state.mode === "Amazon" && state.customAmazonQuery) ? swapRoles(baseRoles) : baseRoles,
+        roles: state.customAmazonQuery === true ? swapRoles(baseRoles) : baseRoles,
         roundNumber: nextRoundNumber,
         totalRounds: state.totalRounds,
         log: state.log,

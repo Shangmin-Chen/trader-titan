@@ -24,7 +24,7 @@ export function CustomAmazonQueryForm({
 
     const trimmed = query.trim();
     if (trimmed.length === 0) {
-      setError("Amazon search query is required.");
+      setError("A search query is required.");
       return;
     }
 
@@ -41,7 +41,7 @@ export function CustomAmazonQueryForm({
     >
       <fieldset className="setup-form__fieldset" disabled={disabled}>
         <legend className="setup-form__legend">
-          {generatorName}, enter Amazon product query
+          {generatorName}, enter an item to trade
         </legend>
         <p className={`eyebrow ${styles.notice}`} role="note">
           ⚠️ Other player should look away!

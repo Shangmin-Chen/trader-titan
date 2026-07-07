@@ -26,10 +26,9 @@ test.describe("Visual Audit Multi-Player Flows", () => {
     await host.getByTestId("create-room-form").getByLabel("Your name").fill("Ada");
     await host.getByLabel("Total rounds").fill("1");
     
-    // Select Amazon mode and enable custom Amazon query
+    // Select Amazon mode; player-entered queries are the default flow.
     await host.getByRole("combobox", { name: "Game mode" }).click();
     await host.locator("li.custom-select__item").filter({ hasText: "Amazon" }).click();
-    await host.getByLabel("Player-entered Amazon query").check();
     
     // Create the room
     await host.getByRole("button", { name: "Create invite room" }).click();
@@ -160,7 +159,6 @@ test.describe("Visual Audit Multi-Player Flows", () => {
     
     await host.getByRole("combobox", { name: "Game mode" }).click();
     await host.locator("li.custom-select__item").filter({ hasText: "Amazon" }).click();
-    await host.getByLabel("Player-entered Amazon query").check();
     
     await host.getByRole("button", { name: "Create invite room" }).click();
     await expect(host.getByTestId("room-controls")).toBeVisible({ timeout: 15000 });

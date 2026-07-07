@@ -306,6 +306,9 @@ function lobbyRoom(): {
     id: roomId,
     hostName: "Ada",
     hostTokenHash: hashFor(hostToken),
+    // Server-generated items (no player-entered query), so round-1 roles
+    // stay marketMaker=A / trader=B as these command flows assume.
+    config: { aiGenerated: true },
     nowMs: NOW_MS,
   });
 

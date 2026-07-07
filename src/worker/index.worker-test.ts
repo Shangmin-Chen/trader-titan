@@ -2318,10 +2318,17 @@ async function createRoom(
   hostName: string,
   config?: CreateRoomConfig
 ): Promise<CreateRoomResponse> {
+  // Player-entered queries are the product default, but most worker flows
+  // here assume server-generated items (no query wait, unswapped roles), so
+  // default test rooms to aiGenerated unless a test opts into custom queries.
+  const effectiveConfig: CreateRoomConfig = {
+    ...(config?.customAmazonQuery === true ? {} : { aiGenerated: true }),
+    ...config
+  };
   const response = await stub.fetch(GAME_ROOM_SMOKE_URL, {
     body: JSON.stringify({
       hostName,
-      ...(config === undefined ? {} : { config })
+      config: effectiveConfig
     }),
     method: "POST"
   });
@@ -2556,6 +2563,7 @@ type CreateRoomConfig = Readonly<{
   mode?: string;
   totalRounds?: number;
   customAmazonQuery?: boolean;
+  aiGenerated?: boolean;
 }>;
 
 async function postRoomCustomAmazonItem(

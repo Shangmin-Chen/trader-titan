@@ -4,7 +4,6 @@ export * from "./ItemPanel";
 export * from "./MarketRangeForm";
 export * from "./Scoreboard";
 export * from "./SettlementPanel";
-export * from "./SetupForm";
 export * from "./SpreadWidthForm";
 export * from "./TradeActionPanel";
 export * from "./WidthNegotiationPanel";

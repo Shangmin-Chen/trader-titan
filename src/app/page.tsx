@@ -732,7 +732,6 @@ function CreateRoomPanel({ disabled, error, onCreate }: CreateRoomPanelProps) {
   const [hostName, setHostName] = useState("");
   const [mode, setMode] = useState<GameMode>(GAME_MODES[0]);
   const [totalRoundsInput, setTotalRoundsInput] = useState("3");
-  const [customAmazonQuery, setCustomAmazonQuery] = useState(false);
   const [aiGenerated, setAiGenerated] = useState(false);
   const [fieldErrors, setFieldErrors] = useState<CreateRoomFieldErrors>({});
   const [formError, setFormError] = useState<string | null>(null);
@@ -748,7 +747,6 @@ function CreateRoomPanel({ disabled, error, onCreate }: CreateRoomPanelProps) {
       hostName,
       mode,
       totalRounds,
-      customAmazonQuery,
       aiGenerated,
     });
     const nextErrors = validateCreateRoomFields(hostName, mode, totalRounds);
@@ -878,23 +876,6 @@ function CreateRoomPanel({ disabled, error, onCreate }: CreateRoomPanelProps) {
             </label>
           </div>
 
-          {mode === "Amazon" && !aiGenerated ? (
-            <div className="form-field room-checkbox-field">
-              <input
-                checked={customAmazonQuery}
-                className="form-field__checkbox"
-                id={`${formId}-custom-amazon`}
-                onChange={(event) => setCustomAmazonQuery(event.target.checked)}
-                type="checkbox"
-              />
-              <label
-                className="form-field__label"
-                htmlFor={`${formId}-custom-amazon`}
-              >
-                Player-entered Amazon query
-              </label>
-            </div>
-          ) : null}
         </div>
 
         {formError || error ? (
@@ -1299,7 +1280,7 @@ function RoomGameView({
   }
 
   if (game.phase === "generatingItem") {
-    if (game.mode === "Amazon" && game.customAmazonQuery === true) {
+    if (game.customAmazonQuery === true) {
       return (
         <>
           {stepper}
@@ -1722,19 +1703,20 @@ function buildStartPayload(input: {
   hostName: string;
   mode: GameMode;
   totalRounds: number | null;
-  customAmazonQuery: boolean;
   aiGenerated: boolean;
 }): StartGamePayload | null {
   if (input.totalRounds === null) {
     return null;
   }
 
+  // Player-entered queries are the default for every mode; AI pre-generated
+  // markets are the explicit opt-out.
   return {
     playerAName: input.hostName,
     playerBName: "Player B",
     mode: input.mode,
     totalRounds: input.totalRounds,
-    customAmazonQuery: input.mode === "Amazon" && input.customAmazonQuery,
+    customAmazonQuery: !input.aiGenerated,
     aiGenerated: input.aiGenerated,
   };
 }

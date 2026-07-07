@@ -204,10 +204,6 @@ function decodeRoomGameConfig(value: unknown): RoomGameConfig | null {
     return null;
   }
 
-  if (value.mode !== "Amazon" && value.customAmazonQuery === true) {
-    return null;
-  }
-
   return {
     mode: value.mode,
     totalRounds: value.totalRounds,
