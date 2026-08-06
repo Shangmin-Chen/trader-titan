@@ -33,7 +33,7 @@ The room protocol is the boundary between client transports and the pure room do
 - `RESET_TO_LOBBY`: host credential.
 - `KICK_GUEST`: host credential.
 - `ADVANCE_ROUND`: host credential.
-- `RETRY_ITEM_GENERATION`: host credential. Accepted only for active rooms whose game is `error` with `previousPhase === "generatingItem"`.
+- `RETRY_ITEM_GENERATION`: host credential. Accepted for active rooms whose game is `error` with `previousPhase === "generatingItem"`, retrying generation, **or** whose game is `settling` (the room can become durably stuck here if the settlement effect never ran after `EXECUTE_TRADE` committed the transition), retrying settlement for the current round from the already-committed item, quote, and side without regenerating the item or restarting the round. Rejected with `invalid_game_phase` in every other phase.
 - `SUBMIT_INITIAL_WIDTH`: active player credential and width.
 - `TIGHTEN_WIDTH`: active player credential and width.
 - `TRADE_ON_WIDTH`: active player credential.

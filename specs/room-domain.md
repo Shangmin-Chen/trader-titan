@@ -34,6 +34,8 @@ Round advancement after settlement is host-controlled. Non-final `ADVANCE_ROUND`
 
 Room settlement is server-authoritative. The room layer computes settlement from the active settling state and the private settled item value; callers cannot provide score-affecting settlement data.
 
+If the settlement effect that normally follows an `EXECUTE_TRADE` transition never runs, the room can remain durably in `settling`. The host can recover it with `RETRY_ITEM_GENERATION`, which re-runs settlement for the current round from the already-committed item, quote, and side. Settlement is a pure function of those three values, so retrying cannot change the outcome or restart the round.
+
 ## Persistence And Privacy
 
 Persistence envelopes are private and may contain token hashes. Clients must receive only public room snapshots. Public snapshots redact token hashes, persistence metadata, and pre-settlement item values.

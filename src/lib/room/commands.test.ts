@@ -344,7 +344,41 @@ describe("room commands", () => {
       room,
       error: {
         code: "invalid_game_phase",
-        message: "Item generation can only be retried after an item generation failure.",
+        message: "Item generation or settlement can only be retried after a failure.",
+      },
+    });
+  });
+
+  it("lets the host retry a stuck settlement without mutating the room or the private item", () => {
+    // The room command layer does not resolve the settlement itself; it
+    // leaves the room exactly as EXECUTE_TRADE committed it (same item,
+    // quote, pendingSide) and reports success so the Worker layer can
+    // re-run the settlement effect for the current round. See the
+    // worker-level F-02 recovery test for the full end-to-end path.
+    const { room, hostToken } = settlingRoom();
+    const retried = retryRoomItemGeneration(room, {
+      credential: present(hostToken),
+      verifyToken,
+      nowMs: NOW_MS + 9,
+    });
+
+    expect(retried).toEqual({ ok: true, room });
+  });
+
+  it("rejects guest recovery of a stuck settlement without mutating the room", () => {
+    const { room, guestToken } = settlingRoom();
+    const guestRetry = retryRoomItemGeneration(room, {
+      credential: present(guestToken),
+      verifyToken,
+      nowMs: NOW_MS + 9,
+    });
+
+    expect(guestRetry).toEqual({
+      ok: false,
+      room,
+      error: {
+        code: "host_control_denied",
+        message: "Only the host can perform this room command.",
       },
     });
   });

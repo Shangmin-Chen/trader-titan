@@ -316,6 +316,24 @@ export function failRoomItem(
   return applySystemGameAction(room, { type: "ITEM_FAILED", error }, nowMs);
 }
 
+/**
+ * F-02 mitigation: this command originally retried only a failed item
+ * generation. It now also recovers a room durably stuck in `settling` -
+ * the trapdoor phase EXECUTE_TRADE commits to storage before the automatic
+ * settlement effect runs. If that effect never runs (isolate evicted,
+ * request abandoned), no client command could previously move the room out
+ * of `settling`, and the only escape was RESET_TO_LOBBY, discarding the
+ * whole match. Widening this command in place (rather than introducing a
+ * new wire command) keeps the client, dispatcher, and protocol decoding
+ * unchanged; see specs/room-protocol.md.
+ *
+ * The settling branch intentionally does not touch the reducer: the room
+ * is left exactly as EXECUTE_TRADE committed it (same item, quote, and
+ * pendingSide), and the caller re-runs the settlement effect
+ * (Worker `applyAutomaticRoomEffects` -> `receiveStoredSettlement`) against
+ * that unchanged state. Settlement is a pure function of
+ * (item, quote, side), so retrying cannot change or re-roll the outcome.
+ */
 export function retryRoomItemGeneration(
   room: RoomState,
   input: AuthorizedCommandInput,
@@ -332,14 +350,25 @@ export function retryRoomItemGeneration(
   }
 
   if (room.lifecycle !== "active") {
-    return commandFailure(room, "room_not_active", "Only active rooms can retry item generation.");
+    return commandFailure(room, "room_not_active", "Only active rooms can retry a pending effect.");
   }
 
-  if (room.game.phase !== "error" || room.game.previousPhase !== "generatingItem") {
-    return commandFailure(room, "invalid_game_phase", "Item generation can only be retried after an item generation failure.");
+  if (room.game.phase === "error" && room.game.previousPhase === "generatingItem") {
+    return applySystemGameAction(room, { type: "RETRY_ITEM_GENERATION" }, input.nowMs);
   }
 
-  return applySystemGameAction(room, { type: "RETRY_ITEM_GENERATION" }, input.nowMs);
+  if (room.game.phase === "settling") {
+    // No reducer transition: the room stays in settling exactly as
+    // EXECUTE_TRADE committed it. The Worker layer treats this as a signal
+    // to re-run the settlement effect for the current round.
+    return { ok: true, room };
+  }
+
+  return commandFailure(
+    room,
+    "invalid_game_phase",
+    "Item generation or settlement can only be retried after a failure.",
+  );
 }
 
 export function submitInitialWidth(
