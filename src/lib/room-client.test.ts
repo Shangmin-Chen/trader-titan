@@ -6,6 +6,7 @@ import {
   joinRoom,
   loadRoomSession,
   openRoomSocket,
+  RoomClientTimeoutError,
   roomSessionFromToken,
   roomSocketProtocols,
   roomSocketUrl,
@@ -97,6 +98,7 @@ describe("room client", () => {
     expect(fetchImpl).toHaveBeenNthCalledWith(
       1,
       `https://example.test/api/rooms/${ROOM_ID}`,
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
     );
     expect(fetchImpl).toHaveBeenNthCalledWith(
       2,
@@ -140,6 +142,86 @@ describe("room client", () => {
       },
       status: 409,
     });
+  });
+
+  it("converts an aborted request into a typed RoomClientTimeoutError", async () => {
+    // Simulates what a real fetch does when its signal fires: it never
+    // resolves the outer promise and instead rejects with the signal's
+    // abort reason. `AbortSignal.timeout(...)` reasons are a DOMException
+    // named "TimeoutError" (verified against Node's real fetch/undici).
+    // A real 30s default would make this test slow, so a short
+    // caller-supplied `AbortSignal.timeout` stands in for it here — the
+    // code path that turns the abort into a typed error is identical
+    // regardless of which signal fired it.
+    const fetchImpl = vi.fn(
+      async (_input: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener("abort", () => {
+            reject(new DOMException("The operation was aborted due to timeout", "TimeoutError"));
+          });
+        }),
+    );
+
+    await expect(
+      getRoomPreview(ROOM_ID, { fetchImpl, signal: AbortSignal.timeout(5) }),
+    ).rejects.toBeInstanceOf(RoomClientTimeoutError);
+  });
+
+  it("passes a not-yet-aborted signal to fetchImpl by default", async () => {
+    let capturedSignal: AbortSignal | undefined;
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      capturedSignal = init?.signal ?? undefined;
+      return Response.json({ ok: true, room: SNAPSHOT });
+    });
+
+    await getRoomPreview(ROOM_ID, { fetchImpl });
+
+    expect(capturedSignal).toBeInstanceOf(AbortSignal);
+    expect(capturedSignal?.aborted).toBe(false);
+  });
+
+  it("honours a caller-supplied signal instead of the default timeout", async () => {
+    const controller = new AbortController();
+    let capturedSignal: AbortSignal | undefined;
+    const fetchImpl = vi.fn(
+      (_input: RequestInfo | URL, init?: RequestInit) =>
+        new Promise<Response>((_resolve, reject) => {
+          capturedSignal = init?.signal ?? undefined;
+          init?.signal?.addEventListener("abort", () => {
+            reject(init.signal!.reason);
+          });
+        }),
+    );
+
+    const pending = getRoomPreview(ROOM_ID, {
+      fetchImpl,
+      signal: controller.signal,
+    });
+
+    // The caller's signal, not an internally-created one, must be what
+    // was handed to fetchImpl.
+    expect(capturedSignal).toBe(controller.signal);
+
+    controller.abort();
+
+    await expect(pending).rejects.toBeInstanceOf(RoomClientTimeoutError);
+  });
+
+  it("leaves normal responses unaffected by the timeout plumbing", async () => {
+    const fetchImpl = vi.fn(async () =>
+      Response.json({
+        ok: true,
+        room: SNAPSHOT,
+      }),
+    );
+
+    await expect(
+      sendRoomCommand(
+        ROOM_ID,
+        { type: "START_ROOM", credential: HOST_TOKEN, nowMs: 1 },
+        { fetchImpl },
+      ),
+    ).resolves.toEqual({ ok: true, room: SNAPSHOT });
   });
 
   it("serializes retry item generation commands through the room command route", async () => {

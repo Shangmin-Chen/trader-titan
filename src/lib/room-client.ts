@@ -12,6 +12,23 @@ import {
 const PUBLIC_ROOMS_PATH = "/api/rooms";
 const ROOM_SESSION_STORAGE_PREFIX = "trader-titan.room-session.v1";
 
+/**
+ * Default abort timeout for every room HTTP call (both reads and command
+ * POSTs), used whenever a caller does not supply its own `signal`.
+ *
+ * Room commands are not uniformly cheap: `START_ROOM` (round 1) and
+ * `RETRY_ITEM_GENERATION` synchronously pregenerate every round's item
+ * before the worker responds (see `applyAutomaticRoomEffects` /
+ * `pregenerateAllItems` in `src/worker/index.ts`). When AI generation is
+ * enabled that path makes a single batched Gemini call and then, in Amazon
+ * mode, an additional sequential price-lookup fetch per round — real
+ * network latency stacked on top of an LLM call, not a fixed-cost request.
+ * 30s comfortably covers that common case while still turning a truly
+ * hung connection (which would otherwise hang forever, see F-06) into a
+ * bounded, recoverable failure.
+ */
+const DEFAULT_ROOM_REQUEST_TIMEOUT_MS = 30_000;
+
 type JsonObject = Record<string, unknown>;
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 type WebSocketConstructor = new (
@@ -102,6 +119,13 @@ export type RoomSession = Readonly<{
 export type RoomClientOptions = Readonly<{
   baseUrl?: string | URL;
   fetchImpl?: FetchLike;
+  /**
+   * Overrides the default request timeout signal. When omitted, every room
+   * HTTP call aborts on its own after `DEFAULT_ROOM_REQUEST_TIMEOUT_MS`.
+   * Pass this to use a longer/shorter bound, or to wire up caller-driven
+   * cancellation (e.g. an in-flight request abandoned by the UI).
+   */
+  signal?: AbortSignal;
 }>;
 
 export type RoomSocketOptions = Readonly<{
@@ -120,6 +144,21 @@ export class RoomClientRequestError extends Error {
     this.name = "RoomClientRequestError";
     this.status = status;
     this.error = error;
+  }
+}
+
+/**
+ * Thrown when a room HTTP call never got a response — the request was
+ * aborted, either by the default `DEFAULT_ROOM_REQUEST_TIMEOUT_MS` bound or
+ * by a caller-supplied `signal`. Distinct from `RoomClientRequestError`
+ * (the server responded, and said no) so callers can word the two
+ * differently: this one means "we don't know what happened," not "that
+ * command was rejected."
+ */
+export class RoomClientTimeoutError extends Error {
+  constructor() {
+    super("The server didn't respond. Check your connection and try again.");
+    this.name = "RoomClientTimeoutError";
   }
 }
 
@@ -258,7 +297,11 @@ async function readRoomJson<T>(
   options: RoomClientOptions,
 ): Promise<T> {
   const fetchImpl = options.fetchImpl ?? globalThis.fetch;
-  const response = await fetchImpl(resolveRoomHttpUrl(path, options.baseUrl));
+  const response = await fetchRoomResponse(
+    fetchImpl,
+    resolveRoomHttpUrl(path, options.baseUrl),
+    { signal: requestTimeoutSignal(options) },
+  );
 
   return decodeRoomResponse<T>(response);
 }
@@ -269,15 +312,55 @@ async function postRoomJson<T>(
   options: RoomClientOptions,
 ): Promise<T> {
   const fetchImpl = options.fetchImpl ?? globalThis.fetch;
-  const response = await fetchImpl(resolveRoomHttpUrl(path, options.baseUrl), {
-    body: JSON.stringify(body),
-    headers: {
-      "content-type": "application/json",
+  const response = await fetchRoomResponse(
+    fetchImpl,
+    resolveRoomHttpUrl(path, options.baseUrl),
+    {
+      body: JSON.stringify(body),
+      headers: {
+        "content-type": "application/json",
+      },
+      method: "POST",
+      signal: requestTimeoutSignal(options),
     },
-    method: "POST",
-  });
+  );
 
   return decodeRoomResponse<T>(response);
+}
+
+function requestTimeoutSignal(options: RoomClientOptions): AbortSignal {
+  return options.signal ?? AbortSignal.timeout(DEFAULT_ROOM_REQUEST_TIMEOUT_MS);
+}
+
+/**
+ * Runs `fetchImpl` and converts an aborted request into a typed
+ * `RoomClientTimeoutError`. An abort rejects before a `Response` ever
+ * exists, so it has to be handled here — `decodeRoomResponse` below
+ * assumes it was handed a real `Response`.
+ */
+async function fetchRoomResponse(
+  fetchImpl: FetchLike,
+  url: string,
+  init: RequestInit,
+): Promise<Response> {
+  try {
+    return await fetchImpl(url, init);
+  } catch (caughtError) {
+    if (isAbortLikeError(caughtError)) {
+      throw new RoomClientTimeoutError();
+    }
+
+    throw caughtError;
+  }
+}
+
+function isAbortLikeError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "name" in error &&
+    (error.name === "AbortError" || error.name === "TimeoutError")
+  );
 }
 
 async function decodeRoomResponse<T>(response: Response): Promise<T> {
