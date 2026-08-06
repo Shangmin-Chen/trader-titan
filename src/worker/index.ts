@@ -82,6 +82,8 @@ const ROOM_SOCKET_MESSAGE_ROOM_ERROR = "ROOM_ERROR";
 const ROOM_SOCKET_PROTOCOL = "tt-room-v1";
 const ROOM_SOCKET_ROLE_PROTOCOL_PREFIX = "tt-role-";
 const ROOM_SOCKET_SECRET_PROTOCOL_PREFIX = "tt-secret-";
+const ROOM_SOCKET_PING_MESSAGE = "tt-ping";
+const ROOM_SOCKET_PONG_MESSAGE = "tt-pong";
 const HTTP_SWITCHING_PROTOCOLS_STATUS = 101;
 const ROOM_ID_GENERATION_ATTEMPTS = 3;
 const TOKEN_SECRET_BYTE_LENGTH = 32;
@@ -229,6 +231,19 @@ type RoomSocketBroadcastOptions = Readonly<{
  * public snapshots to clients so transport code cannot leak credential hashes.
  */
 export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
+  constructor(ctx: DurableObjectState, env: Cloudflare.Env) {
+    super(ctx, env);
+
+    // The DO uses the Hibernation API (acceptWebSocket below), so an
+    // application-level ping/pong would wake this object on every heartbeat
+    // and bill for it. The edge auto-responder replies to "tt-ping" with
+    // "tt-pong" without waking the DO, keeping idle sockets alive through
+    // intermediaries during long thinking turns.
+    this.ctx.setWebSocketAutoResponse(
+      new WebSocketRequestResponsePair(ROOM_SOCKET_PING_MESSAGE, ROOM_SOCKET_PONG_MESSAGE)
+    );
+  }
+
   async fetch(request: Request): Promise<Response> {
     const url = new URL(request.url);
     const pathname = normalizePathname(url.pathname);
@@ -594,6 +609,26 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       role: credentialToken.token.role,
       tokenHash
     } satisfies RoomSocketAttachment);
+
+    // One seat, one socket: evict any prior live socket for this exact
+    // (roomId, role, tokenHash) before accepting the new one, so a zombie
+    // socket the edge has not reaped yet cannot mask a genuine disconnect
+    // once client reconnect logic lands.
+    for (const existingSocket of this.ctx.getWebSockets()) {
+      const existingAttachment = parseRoomSocketAttachment(
+        existingSocket.deserializeAttachment()
+      );
+
+      if (
+        existingAttachment !== null &&
+        existingAttachment.roomId === roomId.roomId &&
+        existingAttachment.role === credentialToken.token.role &&
+        existingAttachment.tokenHash === tokenHash
+      ) {
+        closeSocketQuietly(existingSocket, "Room seat opened a new socket.");
+      }
+    }
+
     this.ctx.acceptWebSocket(server);
     const presence = this.currentRoomPresence(loaded.room);
 
