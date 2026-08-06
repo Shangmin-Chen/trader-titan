@@ -1,6 +1,19 @@
-import { expect, test, type Browser, type Page } from "@playwright/test";
+import {
+  expect,
+  test,
+  type Browser,
+  type BrowserContext,
+  type Page,
+} from "@playwright/test";
 
 const ROOM_PHASE_TIMEOUT_MS = 15_000;
+// The reconnect supervisor's heartbeat watchdog needs up to ~40s to notice a
+// socket that went silent without a clean close (20s ping interval, 10s pong
+// deadline, 2 missed pongs) before it force-closes the socket and the
+// backoff loop reopens it. Give assertions that depend on that full detour
+// through the watchdog (rather than an immediate transport-level close)
+// enough headroom.
+const HEARTBEAT_RECOVERY_TIMEOUT_MS = 75_000;
 
 test.describe("Cloudflare room invite flow", () => {
   test("creates an invite room, plays one round, and frees the guest slot", async ({
@@ -143,6 +156,79 @@ test.describe("Cloudflare room invite flow", () => {
     );
     await expect(host.getByRole("button", { name: "Start game" })).toBeEnabled();
   });
+
+  // T-4: unlike the reconnect tests above (which use guest.goto to simulate
+  // a drop, then guest.goto(inviteUrl) to "reconnect" — really a fresh page
+  // load and a brand-new socket), this exercises the actual client-side
+  // reconnect supervisor: the guest's page never navigates or reloads, so
+  // any recovery must come from src/lib/room-socket-supervisor.ts reopening
+  // the socket on its own after the drop.
+  test("guest socket reopens after a network drop without a page reload, and both clients converge on the same phase (T-4)", async ({
+    baseURL,
+    browser,
+  }) => {
+    // Covers: room setup, one full round to settlement, the offline window
+    // (including a possible full heartbeat-watchdog detection cycle), and
+    // round 2 setup after recovery.
+    test.setTimeout(180_000);
+
+    const { host, guest, guestContext } = await createAndJoinRoom(
+      browser,
+      baseURL,
+      { totalRounds: 2 },
+    );
+
+    await expect(host.getByRole("button", { name: "Start game" })).toBeEnabled();
+    await host.getByRole("button", { name: "Start game" }).click();
+    await playDefaultQueryRoundToSettlement(host, guest);
+
+    // Drop the guest's network at the transport level (CDP offline
+    // emulation), not by navigating away. The guest's page, its React
+    // state, and its WebSocket object are otherwise left completely alone.
+    await guestContext.setOffline(true);
+
+    await expect(host.getByTestId("room-controls")).toContainText(
+      "Player B: Disconnected",
+      { timeout: HEARTBEAT_RECOVERY_TIMEOUT_MS },
+    );
+    await expect(host.getByRole("button", { name: "Next round" })).toBeDisabled();
+    await expect(host.getByTestId("settlement-panel")).toContainText(
+      "Player B is disconnected",
+    );
+
+    await guestContext.setOffline(false);
+
+    // No guest.reload() / guest.goto() anywhere below: recovery must come
+    // from the reconnect supervisor's own backoff + (if the drop wasn't a
+    // clean close) heartbeat-triggered retry.
+    await expect(guest.getByTestId("room-controls")).toContainText(
+      "This browser: Live",
+      { timeout: HEARTBEAT_RECOVERY_TIMEOUT_MS },
+    );
+    await expect(host.getByTestId("room-controls")).toContainText(
+      "Player B: Connected",
+      { timeout: HEARTBEAT_RECOVERY_TIMEOUT_MS },
+    );
+
+    // Convergence, not just "a socket is open": the host can now advance
+    // the round, and round 2 (which requires the guest to submit the
+    // query, i.e. the guest's client has to be on the same phase the host
+    // just advanced it to) proceeds exactly as it would with an
+    // uninterrupted connection.
+    await expect(host.getByRole("button", { name: "Next round" })).toBeEnabled();
+    await host.getByRole("button", { name: "Next round" }).click();
+
+    await expect(guest.getByTestId("custom-amazon-query-form")).toBeVisible({
+      timeout: ROOM_PHASE_TIMEOUT_MS,
+    });
+    await guest.getByLabel("Search Term / Product Name").fill("standing desk");
+    await guest.getByRole("button", { name: "Submit & Scrape Price" }).click();
+
+    await expect(host.getByRole("button", { name: "Propose width" })).toBeEnabled({
+      timeout: ROOM_PHASE_TIMEOUT_MS,
+    });
+    await expect(guest.getByRole("button", { name: "Propose width" })).toBeDisabled();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -190,6 +276,8 @@ async function createAndJoinRoom(
 ): Promise<{
   host: Page;
   guest: Page;
+  hostContext: BrowserContext;
+  guestContext: BrowserContext;
   inviteUrl: string;
 }> {
   const hostContext = await browser.newContext({ baseURL });
@@ -219,7 +307,7 @@ async function createAndJoinRoom(
   });
   await expect(guest.locator("#room-invite-link")).toHaveCount(0);
 
-  return { host, guest, inviteUrl };
+  return { host, guest, hostContext, guestContext, inviteUrl };
 }
 
 /**
