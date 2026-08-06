@@ -77,6 +77,15 @@ const LEGACY_NEXT_GAME_API_PATHS = new Set([
   "/api/settle-round",
 ]);
 const ROOM_STORAGE_KEY = "room:persistence:v1";
+const ROOM_COMMAND_DEDUPE_STORAGE_KEY = "room:command-dedupe:v1";
+// A rolling record of the most recently applied (actor, commandId) pairs.
+// Bounded so storage never grows with a room's lifetime: since each
+// successful command increments revision by exactly one, capping the record
+// at this many entries is equivalent to only protecting replays of the last
+// COMMAND_DEDUPE_MAX_ENTRIES committed commands, which comfortably covers a
+// lost-ACK retry burst without needing per-room cleanup as rounds progress
+// (rooms can run up to MAX_ROUNDS rounds).
+const COMMAND_DEDUPE_MAX_ENTRIES = 64;
 const ROOM_SOCKET_MESSAGE_ROOM_SNAPSHOT = "ROOM_SNAPSHOT";
 const ROOM_SOCKET_MESSAGE_ROOM_ERROR = "ROOM_ERROR";
 const ROOM_SOCKET_PROTOCOL = "tt-room-v1";
@@ -101,6 +110,11 @@ type WorkerFetchEnv = Parameters<OpenNextWorker["fetch"]>[1];
 type WorkerFetchRequest = Parameters<OpenNextWorker["fetch"]>[0];
 type JsonRecord = Record<string, unknown>;
 type DecodedRoomCommand = Exclude<ClientRoomCommand, { type: "JOIN_ROOM" }>;
+type CommandDedupeEntry = Readonly<{
+  role: string;
+  commandId: string;
+  revision: number;
+}>;
 
 type RoomHttpError = Readonly<{
   code: string;
@@ -674,10 +688,22 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
 
       await deletePrivateGeneratedItems(transaction);
       await transaction.delete(ROOM_STORAGE_KEY);
+      await transaction.delete(ROOM_COMMAND_DEDUPE_STORAGE_KEY);
       await transaction.deleteAlarm();
     });
   }
 
+  /**
+   * A lost HTTP/WebSocket response after the Durable Object already committed
+   * is a normal mobile-network event, and the client's only recourse is to
+   * resend the identical command. The commandId dedupe check and its write
+   * both run inside this same storage transaction as the dispatch itself, so
+   * a replay can never race a fresh copy of the same command: a recognized
+   * replay short-circuits to the current room (a no-op the revision guard on
+   * the client makes safe to apply again) instead of re-running a command
+   * whose safety would otherwise depend on the reducer's phase guard
+   * happening to reject its own replay.
+   */
   private async applyDecodedRoomCommand(
     command: DecodedRoomCommand,
     verifyToken: TokenVerifier,
@@ -694,6 +720,18 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
           ok: false,
           status: statusForStoredRoomLoadFailure(loaded),
           error: loaded.error
+        } as const;
+      }
+
+      const dedupeEntries = loadCommandDedupeEntries(
+        await transaction.get<unknown>(ROOM_COMMAND_DEDUPE_STORAGE_KEY)
+      );
+
+      if (findCommandDedupeEntry(dedupeEntries, command) !== undefined) {
+        return {
+          ok: true,
+          room: loaded.room,
+          replay: true
         } as const;
       }
 
@@ -715,6 +753,10 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       }
 
       await persistRoomEnvelope(transaction, commandResult.room, nowMs);
+      await transaction.put(
+        ROOM_COMMAND_DEDUPE_STORAGE_KEY,
+        withCommandDedupeEntry(dedupeEntries, command, commandResult.room.revision)
+      );
 
       if (shouldDeletePrivateGeneratedItemsAfterCommand(command)) {
         await deletePrivateGeneratedItems(transaction);
@@ -722,12 +764,21 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
 
       return {
         ok: true,
-        room: commandResult.room
+        room: commandResult.room,
+        replay: false
       } as const;
     });
 
     if (!commandResult.ok) {
       return commandResult;
+    }
+
+    if (commandResult.replay) {
+      // The mutation already committed on a prior attempt. Automatic effects
+      // (item generation, settlement fetch, ...) already ran then too, so
+      // running them again here would duplicate side effects rather than
+      // just re-deliver the response the client lost.
+      return { ok: true, room: commandResult.room };
     }
 
     return this.applyAutomaticRoomEffects(command, commandResult.room, nowMs);
@@ -2080,6 +2131,64 @@ function shouldDeletePrivateGeneratedItemsAfterCommand(
   command: DecodedRoomCommand
 ): boolean {
   return command.type === "RESET_TO_LOBBY" || command.type === "KICK_GUEST";
+}
+
+/**
+ * Scoped by credential role (host/guest), not just commandId: a room only
+ * ever has one active actor per role, so this is equivalent to per-actor
+ * scoping without needing a verified identity before dispatch runs. It also
+ * means a guest cannot forge a commandId to collide with -- and block -- a
+ * future host command, or vice versa. Entries are only ever written after a
+ * command succeeds (see applyDecodedRoomCommand), so an unauthorized or
+ * otherwise-rejected attempt can never poison the dedupe record and block a
+ * legitimate later command with the same id.
+ */
+function findCommandDedupeEntry(
+  entries: readonly CommandDedupeEntry[],
+  command: DecodedRoomCommand
+): CommandDedupeEntry | undefined {
+  return entries.find(
+    (entry) => entry.role === command.credential.role && entry.commandId === command.commandId
+  );
+}
+
+function withCommandDedupeEntry(
+  entries: readonly CommandDedupeEntry[],
+  command: DecodedRoomCommand,
+  revision: number
+): CommandDedupeEntry[] {
+  const next = [
+    ...entries,
+    { role: command.credential.role, commandId: command.commandId, revision }
+  ];
+
+  return next.length > COMMAND_DEDUPE_MAX_ENTRIES
+    ? next.slice(next.length - COMMAND_DEDUPE_MAX_ENTRIES)
+    : next;
+}
+
+function loadCommandDedupeEntries(raw: unknown): CommandDedupeEntry[] {
+  if (!Array.isArray(raw)) {
+    return [];
+  }
+
+  const entries: CommandDedupeEntry[] = [];
+
+  for (const item of raw) {
+    if (
+      isRecord(item) &&
+      (item.role === "host" || item.role === "guest") &&
+      typeof item.commandId === "string" &&
+      typeof item.revision === "number" &&
+      Number.isInteger(item.revision)
+    ) {
+      entries.push({ role: item.role, commandId: item.commandId, revision: item.revision });
+    }
+  }
+
+  return entries.length > COMMAND_DEDUPE_MAX_ENTRIES
+    ? entries.slice(entries.length - COMMAND_DEDUPE_MAX_ENTRIES)
+    : entries;
 }
 
 function privateGeneratedItemEnvelopeForStorage(item: SettledGeneratedItem): unknown {

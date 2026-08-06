@@ -444,6 +444,7 @@ function HomeContent() {
         const response = await sendRoomCommand(room.id, {
           ...input,
           credential: session.token,
+          commandId: crypto.randomUUID(),
           nowMs: Date.now(),
         } as RoomClientCommand);
 

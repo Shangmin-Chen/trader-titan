@@ -90,7 +90,7 @@ describe("room client", () => {
     await joinRoom(ROOM_ID, { guestName: "Grace" }, { baseUrl: "https://example.test", fetchImpl });
     await sendRoomCommand(
       ROOM_ID,
-      { type: "START_ROOM", credential: HOST_TOKEN, nowMs: 1 },
+      { type: "START_ROOM", credential: HOST_TOKEN, commandId: "command-start-room-1", nowMs: 1 },
       { baseUrl: "https://example.test", fetchImpl },
     );
 
@@ -158,7 +158,12 @@ describe("room client", () => {
 
     await sendRoomCommand(
       ROOM_ID,
-      { type: "RETRY_ITEM_GENERATION", credential: HOST_TOKEN, nowMs: 2 },
+      {
+        type: "RETRY_ITEM_GENERATION",
+        credential: HOST_TOKEN,
+        commandId: "command-retry-item-generation-1",
+        nowMs: 2,
+      },
       { baseUrl: "https://example.test", fetchImpl },
     );
 
@@ -168,6 +173,7 @@ describe("room client", () => {
         body: {
           type: "RETRY_ITEM_GENERATION",
           credential: HOST_TOKEN,
+          commandId: "command-retry-item-generation-1",
           nowMs: 2,
         },
       },

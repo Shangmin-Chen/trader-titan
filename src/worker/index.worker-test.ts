@@ -63,6 +63,8 @@ const SOCKET_ADVANCE_OFFLINE_ROOM_NAME = "worker-room-socket-advance-offline";
 const SOCKET_PRESENCE_ROOM_NAME = "worker-room-socket-presence";
 const ADVANCE_PRESENCE_ROOM_NAME = "worker-room-advance-presence";
 const RESET_STALE_SOCKET_ROOM_NAME = "worker-room-reset-stale-socket";
+const TIGHTEN_REPLAY_SAME_ID_ROOM_NAME = "worker-room-tighten-replay-same-id";
+const TIGHTEN_REPLAY_DIFFERENT_ID_ROOM_NAME = "worker-room-tighten-replay-different-id";
 const GAME_ROOM_SMOKE_URL = "https://trader-titan.worker.test/room";
 const ROOM_COMMAND_URL = `${GAME_ROOM_SMOKE_URL}/command`;
 const ROOM_JOIN_URL = `${GAME_ROOM_SMOKE_URL}/join`;
@@ -509,12 +511,9 @@ describe("Cloudflare worker scaffold", () => {
 
     expectRoomPresence(guestConnection.initial.room, { A: false, B: true });
 
-    const startResponse = await stub.fetch(ROOM_COMMAND_URL, {
-      body: JSON.stringify({
-        type: "START_ROOM",
-        credential: created.hostToken
-      }),
-      method: "POST"
+    const startResponse = await postRoomCommand(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
     });
     const started = await expectPublicJsonWithoutTrueValue<CommandRoomResponse>(startResponse);
 
@@ -538,6 +537,170 @@ describe("Cloudflare worker scaffold", () => {
     const persisted = await accessRoom(roomStub(COMMAND_ROOM_NAME), created.hostToken);
 
     expect(persisted.room).toEqual(started.room);
+
+    guestConnection.socket.close();
+  });
+
+  it("applies a lost-ACK TIGHTEN_WIDTH replay exactly once instead of double-swapping roles", async () => {
+    // Simulates the client re-sending an identical command after losing the
+    // HTTP response for one that the Durable Object already committed --
+    // packet loss on a lost ACK, not a second click. TIGHTEN_WIDTH is a
+    // negotiatingWidth -> negotiatingWidth self-loop that swaps
+    // roles.marketMaker/roles.trader, so replaying it without dedupe would
+    // swap roles a second time; only validateTightenedWidth's "must be
+    // tighter than current" check would happen to catch it, and only
+    // because the width also happens to stay the same across the replay.
+    const stub = roomStub(TIGHTEN_REPLAY_SAME_ID_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created tighten-replay room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected a room ready for width proposal.");
+    }
+
+    // aiGenerated rooms keep round-1 roles unswapped: A is marketMaker, B is trader.
+    const proposed = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_INITIAL_WIDTH",
+      credential: created.hostToken,
+      width: 10
+    });
+
+    if (proposed.room.game.phase !== "negotiatingWidth") {
+      throw new Error("Expected negotiating width phase.");
+    }
+
+    expect(proposed.room.game.spreadWidth).toBe(10);
+    expect(proposed.room.game.roles).toEqual({ marketMaker: "A", trader: "B" });
+
+    const revisionBeforeTighten = proposed.room.revision;
+    const tightenCommand = {
+      type: "TIGHTEN_WIDTH",
+      credential: joined.guestToken,
+      commandId: "tighten-replay-same-id",
+      width: 6
+    };
+
+    const firstResponse = await postRoomCommand(stub, tightenCommand);
+    const first = await expectPublicJson<CommandRoomResponse>(firstResponse);
+
+    expect(firstResponse.status).toBe(HTTP_OK_STATUS);
+    expect(first.room.revision).toBe(revisionBeforeTighten + 1);
+
+    if (first.room.game.phase !== "negotiatingWidth") {
+      throw new Error("Expected negotiating width phase after tighten.");
+    }
+
+    expect(first.room.game.spreadWidth).toBe(6);
+    expect(first.room.game.roles).toEqual({ marketMaker: "B", trader: "A" });
+    expect(first.room.game.lastError).toBeUndefined();
+
+    // Resend the identical command body -- same commandId, same everything --
+    // exactly as a client would after losing the first response.
+    const secondResponse = await postRoomCommand(stub, tightenCommand);
+    const second = await expectPublicJson<CommandRoomResponse>(secondResponse);
+
+    expect(secondResponse.status).toBe(HTTP_OK_STATUS);
+    expect(second.room).toEqual(first.room);
+    expect(second.room.revision).toBe(first.room.revision);
+    expect(second.room.game.roles).toEqual({ marketMaker: "B", trader: "A" });
+
+    const persisted = await accessRoom(stub, created.hostToken);
+
+    expect(persisted.room).toEqual(first.room);
+    expect(persisted.room.revision).toBe(revisionBeforeTighten + 1);
+
+    guestConnection.socket.close();
+  });
+
+  it("treats a different commandId as a fresh command, preserving the existing validateTightenedWidth guard", async () => {
+    const stub = roomStub(TIGHTEN_REPLAY_DIFFERENT_ID_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created tighten-replay room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected a room ready for width proposal.");
+    }
+
+    const proposed = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_INITIAL_WIDTH",
+      credential: created.hostToken,
+      width: 10
+    });
+
+    if (proposed.room.game.phase !== "negotiatingWidth") {
+      throw new Error("Expected negotiating width phase.");
+    }
+
+    const revisionBeforeTighten = proposed.room.revision;
+
+    const firstResponse = await postRoomCommand(stub, {
+      type: "TIGHTEN_WIDTH",
+      credential: joined.guestToken,
+      commandId: "tighten-different-id-first",
+      width: 6
+    });
+    const first = await expectPublicJson<CommandRoomResponse>(firstResponse);
+
+    expect(firstResponse.status).toBe(HTTP_OK_STATUS);
+    expect(first.room.revision).toBe(revisionBeforeTighten + 1);
+
+    if (first.room.game.phase !== "negotiatingWidth") {
+      throw new Error("Expected negotiating width phase after tighten.");
+    }
+
+    expect(first.room.game.spreadWidth).toBe(6);
+    expect(first.room.game.roles).toEqual({ marketMaker: "B", trader: "A" });
+
+    // A genuinely new command (different commandId) attempting the same
+    // nominal width is not recognized as a replay, so it reaches the
+    // reducer. The active trader is now A (post-swap), and the reducer's
+    // own validateTightenedWidth guard -- unchanged by this fix -- declines
+    // it because 6 is not tighter than the current width of 6. The command
+    // still records as an applied room mutation (matching pre-existing
+    // reducer behavior for domain-rejected actions), but the roles and
+    // width are left exactly as the first tighten set them: no second swap.
+    const secondResponse = await postRoomCommand(stub, {
+      type: "TIGHTEN_WIDTH",
+      credential: created.hostToken,
+      commandId: "tighten-different-id-second",
+      width: 6
+    });
+    const second = await expectPublicJson<CommandRoomResponse>(secondResponse);
+
+    expect(secondResponse.status).toBe(HTTP_OK_STATUS);
+    expect(second.room.revision).toBe(first.room.revision + 1);
+
+    if (second.room.game.phase !== "negotiatingWidth") {
+      throw new Error("Expected negotiating width phase after the rejected tighten.");
+    }
+
+    expect(second.room.game.spreadWidth).toBe(6);
+    expect(second.room.game.roles).toEqual({ marketMaker: "B", trader: "A" });
+    expect(second.room.game.lastError).toBe(
+      "New spread width must be tighter than current width."
+    );
 
     guestConnection.socket.close();
   });
@@ -760,10 +923,10 @@ describe("Cloudflare worker scaffold", () => {
 
     const socketRetryError = nextSocketMessage<RoomSocketMessage>(guestConnection.socket);
 
-    guestConnection.socket.send(JSON.stringify({
+    guestConnection.socket.send(JSON.stringify(withTestCommandId({
       type: "RETRY_ITEM_GENERATION",
       credential: joined.guestToken
-    }));
+    })));
 
     await expect(socketRetryError).resolves.toMatchObject({
       type: "ROOM_ERROR",
@@ -794,12 +957,9 @@ describe("Cloudflare worker scaffold", () => {
 
     expectRoomPresence(guestConnection.initial.room, { A: false, B: true });
 
-    const startResponse = await stub.fetch(ROOM_COMMAND_URL, {
-      body: JSON.stringify({
-        type: "START_ROOM",
-        credential: created.hostToken
-      }),
-      method: "POST"
+    const startResponse = await postRoomCommand(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
     });
     const started = await expectPublicJsonWithoutTrueValue<CommandRoomResponse>(startResponse);
 
@@ -818,54 +978,42 @@ describe("Cloudflare worker scaffold", () => {
     ]);
 
     const freshStub = roomStub(SETTLEMENT_ROOM_NAME);
-    const widthResponse = await freshStub.fetch(ROOM_COMMAND_URL, {
-      body: JSON.stringify({
-        type: "SUBMIT_INITIAL_WIDTH",
-        credential: created.hostToken,
-        width: 100
-      }),
-      method: "POST"
+    const widthResponse = await postRoomCommand(freshStub, {
+      type: "SUBMIT_INITIAL_WIDTH",
+      credential: created.hostToken,
+      width: 100
     });
     const width = await expectPublicJsonWithoutTrueValue<CommandRoomResponse>(widthResponse);
 
     expect(widthResponse.status).toBe(HTTP_OK_STATUS);
     expect(width.room.game.phase).toBe("negotiatingWidth");
 
-    const tradeOnWidthResponse = await freshStub.fetch(ROOM_COMMAND_URL, {
-      body: JSON.stringify({
-        type: "TRADE_ON_WIDTH",
-        credential: joined.guestToken
-      }),
-      method: "POST"
+    const tradeOnWidthResponse = await postRoomCommand(freshStub, {
+      type: "TRADE_ON_WIDTH",
+      credential: joined.guestToken
     });
     const tradeOnWidth = await expectPublicJsonWithoutTrueValue<CommandRoomResponse>(tradeOnWidthResponse);
 
     expect(tradeOnWidthResponse.status).toBe(HTTP_OK_STATUS);
     expect(tradeOnWidth.room.game.phase).toBe("configuringMarket");
 
-    const quoteResponse = await freshStub.fetch(ROOM_COMMAND_URL, {
-      body: JSON.stringify({
-        type: "SUBMIT_MARKET_QUOTE",
-        credential: created.hostToken,
-        quote: {
-          bid: 3500,
-          ask: 3600
-        }
-      }),
-      method: "POST"
+    const quoteResponse = await postRoomCommand(freshStub, {
+      type: "SUBMIT_MARKET_QUOTE",
+      credential: created.hostToken,
+      quote: {
+        bid: 3500,
+        ask: 3600
+      }
     });
     const quoted = await expectPublicJsonWithoutTrueValue<CommandRoomResponse>(quoteResponse);
 
     expect(quoteResponse.status).toBe(HTTP_OK_STATUS);
     expect(quoted.room.game.phase).toBe("choosingSide");
 
-    const settlementResponse = await freshStub.fetch(ROOM_COMMAND_URL, {
-      body: JSON.stringify({
-        type: "EXECUTE_TRADE",
-        credential: joined.guestToken,
-        side: "BUY"
-      }),
-      method: "POST"
+    const settlementResponse = await postRoomCommand(freshStub, {
+      type: "EXECUTE_TRADE",
+      credential: joined.guestToken,
+      side: "BUY"
     });
     const settled = await expectPublicJson<CommandRoomResponse>(settlementResponse);
 
@@ -1247,12 +1395,9 @@ describe("Cloudflare worker scaffold", () => {
 
     expectRoomPresence(guestConnection.initial.room, { A: false, B: true });
 
-    const startResponse = await stub.fetch(ROOM_COMMAND_URL, {
-      body: JSON.stringify({
-        type: "START_ROOM",
-        credential: created.hostToken
-      }),
-      method: "POST"
+    const startResponse = await postRoomCommand(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
     });
     const started = await expectPublicJsonWithoutTrueValue<CommandRoomResponse>(startResponse);
 
@@ -1576,10 +1721,10 @@ describe("Cloudflare worker scaffold", () => {
     const secondStarted = nextSocketMessage<RoomSnapshotSocketMessage>(secondConnection.socket);
     const guestStarted = nextSocketMessage<RoomSnapshotSocketMessage>(guestConnection.socket);
 
-    firstConnection.socket.send(JSON.stringify({
+    firstConnection.socket.send(JSON.stringify(withTestCommandId({
       type: "START_ROOM",
       credential: created.hostToken
-    }));
+    })));
 
     const firstStartedMessage = await firstStarted;
     const secondStartedMessage = await secondStarted;
@@ -1650,10 +1795,10 @@ describe("Cloudflare worker scaffold", () => {
 
     const errorMessage = nextSocketMessage<RoomSocketMessage>(hostConnection.socket);
 
-    hostConnection.socket.send(JSON.stringify({
+    hostConnection.socket.send(JSON.stringify(withTestCommandId({
       type: "START_ROOM",
       credential: created.hostToken
-    }));
+    })));
 
     await expect(errorMessage).resolves.toMatchObject({
       type: "ROOM_ERROR",
@@ -1690,12 +1835,9 @@ describe("Cloudflare worker scaffold", () => {
     });
 
     const guestClosed = nextSocketClose(guestConnection.socket);
-    const kickResponse = await stub.fetch(ROOM_COMMAND_URL, {
-      body: JSON.stringify({
-        type: "KICK_GUEST",
-        credential: created.hostToken
-      }),
-      method: "POST"
+    const kickResponse = await postRoomCommand(stub, {
+      type: "KICK_GUEST",
+      credential: created.hostToken
     });
     const kicked = await expectPublicJson<CommandRoomResponse>(kickResponse);
 
@@ -1738,12 +1880,9 @@ describe("Cloudflare worker scaffold", () => {
     expectRoomPresence(afterReplacementStart.room, { A: false, B: false });
     await expect(guestClosed).resolves.toBeUndefined();
 
-    const resetResponse = await stub.fetch(ROOM_COMMAND_URL, {
-      body: JSON.stringify({
-        type: "RESET_TO_LOBBY",
-        credential: created.hostToken
-      }),
-      method: "POST"
+    const resetResponse = await postRoomCommand(stub, {
+      type: "RESET_TO_LOBBY",
+      credential: created.hostToken
     });
     const reset = await expectPublicJson<CommandRoomResponse>(resetResponse);
 
@@ -1775,12 +1914,9 @@ describe("Cloudflare worker scaffold", () => {
     expectRoomPresence(firstGuestConnection.initial.room, { A: false, B: true });
 
     const firstGuestClosed = nextSocketClose(firstGuestConnection.socket);
-    const resetResponse = await stub.fetch(ROOM_COMMAND_URL, {
-      body: JSON.stringify({
-        type: "RESET_TO_LOBBY",
-        credential: created.hostToken
-      }),
-      method: "POST"
+    const resetResponse = await postRoomCommand(stub, {
+      type: "RESET_TO_LOBBY",
+      credential: created.hostToken
     });
     const reset = await expectPublicJson<CommandRoomResponse>(resetResponse);
 
@@ -1990,10 +2126,10 @@ describe("Cloudflare worker scaffold", () => {
 
     const errorMessage = nextSocketMessage<RoomSocketMessage>(hostConnection.socket);
 
-    hostConnection.socket.send(JSON.stringify({
+    hostConnection.socket.send(JSON.stringify(withTestCommandId({
       type: "ADVANCE_ROUND",
       credential: created.hostToken
-    }));
+    })));
 
     await expect(errorMessage).resolves.toMatchObject({
       type: "ROOM_ERROR",
@@ -2461,12 +2597,35 @@ function delay(ms: number): Promise<void> {
   });
 }
 
+let testCommandIdSequence = 0;
+
+/**
+ * Most tests only care about the command's domain effect, not about
+ * commandId itself, so this fills one in when the caller didn't set one.
+ * Tests that exercise commandId directly (decode validation, replay
+ * dedupe) pass an explicit commandId, which this leaves untouched.
+ */
+function withTestCommandId(command: unknown): unknown {
+  if (
+    typeof command !== "object" ||
+    command === null ||
+    Array.isArray(command) ||
+    "commandId" in command
+  ) {
+    return command;
+  }
+
+  testCommandIdSequence += 1;
+
+  return { ...command, commandId: `test-command-${testCommandIdSequence}` };
+}
+
 async function postRoomCommand(
   stub: GameRoomStub,
   command: unknown
 ): Promise<Response> {
   return stub.fetch(ROOM_COMMAND_URL, {
-    body: JSON.stringify(command),
+    body: JSON.stringify(withTestCommandId(command)),
     method: "POST"
   });
 }

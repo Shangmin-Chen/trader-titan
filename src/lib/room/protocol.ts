@@ -22,6 +22,9 @@ import {
 } from "./tokens";
 import type { RoomGameConfig, UnixTimeMs } from "./types";
 
+const COMMAND_ID_MIN_LENGTH = 1;
+const COMMAND_ID_MAX_LENGTH = 128;
+const COMMAND_ID_ALLOWED_CHARACTERS = /^[A-Za-z0-9_-]+$/u;
 const CONFIG_KEYS = ["mode", "totalRounds", "customAmazonQuery", "aiGenerated"] as const;
 const GENERATED_ITEM_KEYS = [
   "round_id",
@@ -64,6 +67,7 @@ export type HostRoomCommand =
   | Readonly<{
       type: "CONFIGURE_ROOM";
       credential: PresentedCapabilityToken;
+      commandId: string;
       config: Partial<RoomGameConfig>;
       nowMs: UnixTimeMs;
     }>
@@ -75,6 +79,7 @@ export type HostRoomCommand =
         | "ADVANCE_ROUND"
         | "RETRY_ITEM_GENERATION";
       credential: PresentedCapabilityToken;
+      commandId: string;
       nowMs: UnixTimeMs;
     }>;
 
@@ -82,23 +87,27 @@ export type PlayerRoomCommand =
   | Readonly<{
       type: "SUBMIT_INITIAL_WIDTH" | "TIGHTEN_WIDTH";
       credential: PresentedCapabilityToken;
+      commandId: string;
       width: number;
       nowMs: UnixTimeMs;
     }>
   | Readonly<{
       type: "TRADE_ON_WIDTH";
       credential: PresentedCapabilityToken;
+      commandId: string;
       nowMs: UnixTimeMs;
     }>
   | Readonly<{
       type: "SUBMIT_MARKET_QUOTE";
       credential: PresentedCapabilityToken;
+      commandId: string;
       quote: Quote;
       nowMs: UnixTimeMs;
     }>
   | Readonly<{
       type: "EXECUTE_TRADE";
       credential: PresentedCapabilityToken;
+      commandId: string;
       side: TradeSide;
       nowMs: UnixTimeMs;
     }>;
@@ -136,6 +145,7 @@ export type RoomProtocolDecodeErrorCode =
   | "message_type_unknown"
   | "now_invalid"
   | "credential_invalid"
+  | "command_id_invalid"
   | "guest_name_invalid"
   | "guest_token_hash_invalid"
   | "config_invalid"
@@ -348,6 +358,12 @@ function decodeConfigureRoomCommand(
     return decodeCommandFailure(credential.error);
   }
 
+  const commandId = decodeCommandId(value.commandId);
+
+  if (!commandId.ok) {
+    return decodeCommandFailure(commandId.error);
+  }
+
   const config = decodeRoomGameConfigPatch(value.config);
 
   if (!config.ok) {
@@ -359,6 +375,7 @@ function decodeConfigureRoomCommand(
     command: {
       type: "CONFIGURE_ROOM",
       credential: credential.value,
+      commandId: commandId.value,
       config: config.value,
       nowMs,
     },
@@ -372,9 +389,18 @@ function decodeHostRoomCommand(
 ): ClientRoomCommandDecodeResult {
   const credential = decodePresentedCredential(value.credential);
 
-  return credential.ok
-    ? { ok: true, command: { type, credential: credential.value, nowMs } }
-    : decodeCommandFailure(credential.error);
+  if (!credential.ok) {
+    return decodeCommandFailure(credential.error);
+  }
+
+  const commandId = decodeCommandId(value.commandId);
+
+  return commandId.ok
+    ? {
+        ok: true,
+        command: { type, credential: credential.value, commandId: commandId.value, nowMs },
+      }
+    : decodeCommandFailure(commandId.error);
 }
 
 function decodeWidthRoomCommand(
@@ -388,6 +414,12 @@ function decodeWidthRoomCommand(
     return decodeCommandFailure(credential.error);
   }
 
+  const commandId = decodeCommandId(value.commandId);
+
+  if (!commandId.ok) {
+    return decodeCommandFailure(commandId.error);
+  }
+
   const width = decodeWidth(value.width);
 
   if (!width.ok) {
@@ -396,7 +428,13 @@ function decodeWidthRoomCommand(
 
   return {
     ok: true,
-    command: { type, credential: credential.value, width: width.value, nowMs },
+    command: {
+      type,
+      credential: credential.value,
+      commandId: commandId.value,
+      width: width.value,
+      nowMs,
+    },
   };
 }
 
@@ -406,12 +444,23 @@ function decodeTradeOnWidthCommand(
 ): ClientRoomCommandDecodeResult {
   const credential = decodePresentedCredential(value.credential);
 
-  return credential.ok
+  if (!credential.ok) {
+    return decodeCommandFailure(credential.error);
+  }
+
+  const commandId = decodeCommandId(value.commandId);
+
+  return commandId.ok
     ? {
         ok: true,
-        command: { type: "TRADE_ON_WIDTH", credential: credential.value, nowMs },
+        command: {
+          type: "TRADE_ON_WIDTH",
+          credential: credential.value,
+          commandId: commandId.value,
+          nowMs,
+        },
       }
-    : decodeCommandFailure(credential.error);
+    : decodeCommandFailure(commandId.error);
 }
 
 function decodeSubmitMarketQuoteCommand(
@@ -422,6 +471,12 @@ function decodeSubmitMarketQuoteCommand(
 
   if (!credential.ok) {
     return decodeCommandFailure(credential.error);
+  }
+
+  const commandId = decodeCommandId(value.commandId);
+
+  if (!commandId.ok) {
+    return decodeCommandFailure(commandId.error);
   }
 
   const quote = decodeQuote(value.quote);
@@ -435,6 +490,7 @@ function decodeSubmitMarketQuoteCommand(
     command: {
       type: "SUBMIT_MARKET_QUOTE",
       credential: credential.value,
+      commandId: commandId.value,
       quote: quote.value,
       nowMs,
     },
@@ -451,6 +507,12 @@ function decodeExecuteTradeCommand(
     return decodeCommandFailure(credential.error);
   }
 
+  const commandId = decodeCommandId(value.commandId);
+
+  if (!commandId.ok) {
+    return decodeCommandFailure(commandId.error);
+  }
+
   const side = decodeTradeSide(value.side);
 
   if (!side.ok) {
@@ -462,6 +524,7 @@ function decodeExecuteTradeCommand(
     command: {
       type: "EXECUTE_TRADE",
       credential: credential.value,
+      commandId: commandId.value,
       side: side.value,
       nowMs,
     },
@@ -593,6 +656,28 @@ function decodeGameMode(value: unknown): DecodeResult<GameMode> {
   return typeof value === "string" && GAME_MODES.includes(value as GameMode)
     ? { ok: true, value: value as GameMode }
     : decodeFailure("config_invalid", "Choose a valid game mode.", "config.mode");
+}
+
+/**
+ * The command id is an opaque client-generated idempotency key, not a secret,
+ * so it only needs a bounded shape check here. The Durable Object storage
+ * layer is what actually uses it to detect a lost-ACK replay.
+ */
+function decodeCommandId(value: unknown): DecodeResult<string> {
+  if (
+    typeof value !== "string" ||
+    value.length < COMMAND_ID_MIN_LENGTH ||
+    value.length > COMMAND_ID_MAX_LENGTH ||
+    !COMMAND_ID_ALLOWED_CHARACTERS.test(value)
+  ) {
+    return decodeFailure(
+      "command_id_invalid",
+      `Command id must be ${COMMAND_ID_MIN_LENGTH}-${COMMAND_ID_MAX_LENGTH} characters from [A-Za-z0-9_-].`,
+      "commandId",
+    );
+  }
+
+  return { ok: true, value };
 }
 
 function decodeWidth(value: unknown): DecodeResult<number> {
