@@ -1469,6 +1469,8 @@ function RoomGameView({
   }
 
   if (game.phase === "settling") {
+    const canRetry = canRetryItemGeneration(game, isHost);
+
     return (
       <>
         {stepper}
@@ -1482,6 +1484,23 @@ function RoomGameView({
             </h2>
             <p>The server is revealing the true value and computing PnL.</p>
             <div className="loading-line" aria-label="Loading" />
+            {canRetry ? (
+              <div className="room-actions">
+                <p>
+                  Taking a while? The round may be stuck. Retrying safely
+                  re-settles this round from the trade already made - it
+                  cannot change the outcome or the score.
+                </p>
+                <button
+                  className="secondary-button"
+                  disabled={isCommanding}
+                  onClick={onRetryItemGeneration}
+                  type="button"
+                >
+                  Retry settlement
+                </button>
+              </div>
+            ) : null}
           </section>
         </div>
       </>
@@ -1659,14 +1678,26 @@ function publicRoomStateWithoutPresenceJson(room: PublicRoomSnapshot): string {
   });
 }
 
+/**
+ * F-02 mitigation: also true while the room is durably stuck in `settling`
+ * (EXECUTE_TRADE committed the transition, but the settlement effect that
+ * should follow it never ran). The host's RETRY_ITEM_GENERATION command
+ * covers both cases server-side; this predicate must match that widened
+ * guard so the retry control actually appears for a settling failure, not
+ * just an item-generation failure. See retryRoomItemGeneration in
+ * src/lib/room/commands.ts.
+ */
 export function canRetryItemGeneration(
   game: PublicRoomGameState,
   isHost: boolean,
 ): boolean {
+  if (!isHost) {
+    return false;
+  }
+
   return (
-    isHost &&
-    game.phase === "error" &&
-    game.previousPhase === "generatingItem"
+    (game.phase === "error" && game.previousPhase === "generatingItem") ||
+    game.phase === "settling"
   );
 }
 

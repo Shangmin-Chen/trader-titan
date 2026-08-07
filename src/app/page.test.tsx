@@ -365,6 +365,20 @@ describe("item generation retry affordance", () => {
     expect(canRetryItemGeneration(otherError, true)).toBe(false);
     expect(canRetryItemGeneration(BASE_SNAPSHOT.game, true)).toBe(false);
   });
+
+  it("also allows the host to retry a room durably stuck in settling (F-02)", () => {
+    const settling = {
+      ...BASE_SNAPSHOT.game,
+      phase: "settling",
+      item: { round_id: "round-1", item_title: "Item", category: "Cat", context_clue: "Clue" },
+      spreadWidth: 100,
+      quote: { bid: 900, ask: 1000 },
+      pendingSide: "BUY",
+    } satisfies PublicRoomSnapshot["game"];
+
+    expect(canRetryItemGeneration(settling, true)).toBe(true);
+    expect(canRetryItemGeneration(settling, false)).toBe(false);
+  });
 });
 
 describe("room socket message parsing", () => {

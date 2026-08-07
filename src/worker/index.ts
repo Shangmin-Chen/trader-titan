@@ -821,6 +821,21 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       return this.receiveStoredSettlement(room, nowMs);
     }
 
+    // F-02 mitigation: a host retry of a room durably stuck in `settling`
+    // (the settling transition committed, but this same effect never ran -
+    // isolate evicted, request abandoned) re-runs settlement for the
+    // current round from the untouched persisted item, quote, and
+    // pendingSide. retryRoomItemGeneration left the room state unchanged
+    // for this case, so this reuses the exact same settlement path
+    // EXECUTE_TRADE uses, which is why the outcome cannot be re-rolled.
+    if (
+      command.type === "RETRY_ITEM_GENERATION" &&
+      room.lifecycle === "active" &&
+      room.game.phase === "settling"
+    ) {
+      return this.receiveStoredSettlement(room, nowMs);
+    }
+
     return {
       ok: true,
       room

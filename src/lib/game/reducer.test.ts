@@ -334,6 +334,21 @@ describe("game reducer", () => {
     expect(retryItemGeneration(nonItemError)).toBe(nonItemError);
   });
 
+  it("leaves a settling room untouched (F-02 recovery is a room/Worker-layer concern, not a reducer transition)", () => {
+    // Retrying a room stuck in `settling` re-runs the settlement effect
+    // against the unchanged item/quote/pendingSide; it does not go through
+    // RETRY_ITEM_GENERATION or any other reducer action. This pins that the
+    // reducer has no case for retrying out of `settling`, so a future
+    // reducer change can't accidentally let this action mutate settling
+    // state (e.g. resetting pendingSide) and undermine settlement
+    // determinism.
+    const choosing = readyForSideChoice({ bid: 200, ask: 400 });
+    const settling = executeTrade(choosing, "BUY");
+
+    expect(settling.phase).toBe("settling");
+    expect(gameReducer(settling, { type: "RETRY_ITEM_GENERATION" })).toBe(settling);
+  });
+
   it("settles the clarified A 500, B 200, A trades, B sets 200 / 400 flow", () => {
     const choosing = submitMarketQuote(readyForMarket(200), { bid: 200, ask: 400 });
     const settled = settleTrade(choosing, "BUY", 300);

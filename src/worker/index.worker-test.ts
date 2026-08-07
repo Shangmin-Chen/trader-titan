@@ -17,12 +17,14 @@ import {
   SMOKE_HEADER_NAME,
   SMOKE_HEADER_VALUE
 } from "./testing/open-next-worker";
-import type { GameMode, ProviderGeneratedItem } from "../lib/game";
+import { applySettlementToScores } from "../lib/game";
+import type { GameMode, ProviderGeneratedItem, TradeSide } from "../lib/game";
 import {
   ROOM_CREATION_RATE_LIMIT_MAX_REQUESTS,
   ROOM_CUSTOM_AMAZON_RATE_LIMIT_MAX_REQUESTS
 } from "../api/request-guards";
 import {
+  dispatchRoomCommand,
   dispatchSystemRoomEvent,
   loadPersistenceEnvelope,
   roomExpiresAtMs,
@@ -42,6 +44,8 @@ const START_OFFLINE_ROOM_NAME = "worker-room-start-offline";
 const SETTLEMENT_ROOM_NAME = "worker-room-settlement";
 const MISSING_SETTLEMENT_ITEM_ROOM_NAME = "worker-room-missing-settlement-item";
 const CORRUPT_SETTLEMENT_ITEM_ROOM_NAME = "worker-room-corrupt-settlement-item";
+const STUCK_SETTLING_ROOM_NAME = "worker-room-stuck-settling";
+const STUCK_SETTLING_UNAUTHORIZED_ROOM_NAME = "worker-room-stuck-settling-unauthorized";
 const RETRY_SUCCESS_ROOM_NAME = "worker-room-retry-success";
 const RETRY_FAILURE_ROOM_NAME = "worker-room-retry-failure";
 const RETRY_UNAUTHORIZED_ROOM_NAME = "worker-room-retry-unauthorized";
@@ -1001,6 +1005,271 @@ describe("Cloudflare worker scaffold", () => {
     await expect(privateGeneratedItemKeys(stub)).resolves.toEqual(
       expectedPrivateKeys(privateItemKey)
     );
+
+    guestConnection.socket.close();
+  });
+
+  it("recovers a room durably stuck in settling via host retry, preserving prior-round scores (F-02)", async () => {
+    const stub = roomStub(STUCK_SETTLING_ROOM_NAME);
+    const created = await createRoom(stub, "Host", { totalRounds: 2 });
+
+    if (!created.created) {
+      throw new Error("Expected a newly created stuck-settling room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    // Round 1 settles normally and contributes to the scoreboard. Recovering
+    // round 2 must not touch this. Quote away from the deterministic
+    // provider's fixed true_value (3600) so round 1's PnL is non-zero and
+    // score preservation is a meaningful assertion, not a 0 === 0 coincidence.
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected a room ready for round 1 width proposal.");
+    }
+
+    const round1MarketMakerToken = tokenForPlayer(
+      started.room.game.roles.marketMaker,
+      created.hostToken,
+      joined.guestToken
+    );
+    const round1TraderToken = tokenForPlayer(
+      started.room.game.roles.trader,
+      created.hostToken,
+      joined.guestToken
+    );
+
+    const round1Width = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_INITIAL_WIDTH",
+      credential: round1MarketMakerToken,
+      width: 100
+    });
+
+    expect(round1Width.room.game.phase).toBe("negotiatingWidth");
+
+    const round1Configuring = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "TRADE_ON_WIDTH",
+      credential: round1TraderToken
+    });
+
+    expect(round1Configuring.room.game.phase).toBe("configuringMarket");
+
+    const round1Quoted = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_MARKET_QUOTE",
+      credential: round1MarketMakerToken,
+      quote: {
+        bid: 3400,
+        ask: 3500
+      }
+    });
+
+    expect(round1Quoted.room.game.phase).toBe("choosingSide");
+
+    const firstSettlementResponse = await applyRoomCommand(stub, {
+      type: "EXECUTE_TRADE",
+      credential: round1TraderToken,
+      side: "BUY"
+    });
+
+    if (firstSettlementResponse.room.game.phase !== "settlement") {
+      throw new Error("Expected round 1 to settle.");
+    }
+
+    const firstSettlement = firstSettlementResponse.room;
+    const priorScores = firstSettlement.game.scores;
+
+    expect(priorScores.A !== 0 || priorScores.B !== 0).toBe(true);
+
+    const round2 = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "ADVANCE_ROUND",
+      credential: created.hostToken
+    });
+
+    if (round2.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected round 2 item to be ready.");
+    }
+
+    expect(round2.room.game.roundNumber).toBe(2);
+
+    const marketMakerToken = tokenForPlayer(
+      round2.room.game.roles.marketMaker,
+      created.hostToken,
+      joined.guestToken
+    );
+    const traderToken = tokenForPlayer(
+      round2.room.game.roles.trader,
+      created.hostToken,
+      joined.guestToken
+    );
+
+    const width = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_INITIAL_WIDTH",
+      credential: marketMakerToken,
+      width: 100
+    });
+
+    expect(width.room.game.phase).toBe("negotiatingWidth");
+
+    const configuring = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "TRADE_ON_WIDTH",
+      credential: traderToken
+    });
+
+    expect(configuring.room.game.phase).toBe("configuringMarket");
+
+    const quoted = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_MARKET_QUOTE",
+      credential: marketMakerToken,
+      quote: {
+        bid: 3500,
+        ask: 3600
+      }
+    });
+
+    expect(quoted.room.game.phase).toBe("choosingSide");
+
+    // Simulate the F-02 trapdoor: the settling transition is durably
+    // persisted, but the settlement effect that should follow it never runs
+    // (isolate evicted / request abandoned before applyAutomaticRoomEffects
+    // reached receiveStoredSettlement).
+    const stuck = await forceStuckSettling(stub, traderToken, "BUY");
+
+    expect(stuck.game.phase).toBe("settling");
+
+    // Confirm the room is durably stuck: a fresh load still shows settling,
+    // and no client command targets that phase today.
+    const reloadedWhileStuck = await accessRoom(stub, created.hostToken);
+
+    expect(reloadedWhileStuck.room.game.phase).toBe("settling");
+    expect(reloadedWhileStuck.room.game.roundNumber).toBe(2);
+
+    const blockedTrade = await postRoomCommand(stub, {
+      type: "EXECUTE_TRADE",
+      credential: traderToken,
+      side: "SELL"
+    });
+    const blockedTradeResult = await expectPublicJson<RoomErrorResponse>(blockedTrade);
+
+    expect(blockedTrade.status).toBe(HTTP_CONFLICT_STATUS);
+    expect(blockedTradeResult.error.code).toBe("invalid_game_phase");
+
+    // Host recovery: retrying re-runs settlement for THIS round from the
+    // already-committed item, quote, and side. It must not regenerate the
+    // item, restart the round, or touch round 1's scores.
+    const recovered = await applyRoomCommand(stub, {
+      type: "RETRY_ITEM_GENERATION",
+      credential: created.hostToken
+    });
+
+    expect(recovered.room.game.phase).toBe("settlement");
+
+    if (recovered.room.game.phase !== "settlement") {
+      throw new Error("Expected host retry to complete round 2 settlement.");
+    }
+
+    expect(recovered.room.game.roundNumber).toBe(2);
+    expect(recovered.room.game.settlement.side).toBe("BUY");
+    expect(recovered.room.game.settlement.transactionPrice).toBe(3600);
+    expect(recovered.room.game.scores).toEqual(
+      applySettlementToScores(priorScores, recovered.room.game.settlement)
+    );
+
+    // The round can now complete without ever resetting to the lobby.
+    const finished = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "ADVANCE_ROUND",
+      credential: created.hostToken
+    });
+
+    expect(finished.room.lifecycle).toBe("finished");
+    expect(finished.room.game.phase).toBe("gameOver");
+
+    if (finished.room.game.phase !== "gameOver") {
+      throw new Error("Expected the game to finish.");
+    }
+
+    expect(finished.room.game.scores).toEqual(recovered.room.game.scores);
+
+    guestConnection.socket.close();
+  });
+
+  it("rejects guest recovery of a room stuck in settling without mutating it", async () => {
+    const stub = roomStub(STUCK_SETTLING_UNAUTHORIZED_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created unauthorized stuck-settling room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected generated item to be ready.");
+    }
+
+    const marketMakerToken = tokenForPlayer(
+      started.room.game.roles.marketMaker,
+      created.hostToken,
+      joined.guestToken
+    );
+    const traderToken = tokenForPlayer(
+      started.room.game.roles.trader,
+      created.hostToken,
+      joined.guestToken
+    );
+
+    const width = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_INITIAL_WIDTH",
+      credential: marketMakerToken,
+      width: 100
+    });
+
+    expect(width.room.game.phase).toBe("negotiatingWidth");
+
+    const configuring = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "TRADE_ON_WIDTH",
+      credential: traderToken
+    });
+
+    expect(configuring.room.game.phase).toBe("configuringMarket");
+
+    const quoted = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_MARKET_QUOTE",
+      credential: marketMakerToken,
+      quote: {
+        bid: 3500,
+        ask: 3600
+      }
+    });
+
+    expect(quoted.room.game.phase).toBe("choosingSide");
+
+    const stuck = await forceStuckSettling(stub, traderToken, "BUY");
+
+    expect(stuck.game.phase).toBe("settling");
+
+    const guestCredential = tokenForPlayer("B", created.hostToken, joined.guestToken);
+    const httpRetryResponse = await postRoomCommand(stub, {
+      type: "RETRY_ITEM_GENERATION",
+      credential: guestCredential
+    });
+    const httpRetry = await expectPublicJson<RoomErrorResponse>(httpRetryResponse);
+
+    expect(httpRetryResponse.status).toBe(HTTP_FORBIDDEN_STATUS);
+    expect(httpRetry.error.code).toBe("host_control_denied");
+
+    const persisted = await accessRoom(stub, created.hostToken);
+
+    expect(persisted.room.game.phase).toBe("settling");
+    expect(persisted.room.revision).toBe(stuck.revision);
 
     guestConnection.socket.close();
   });
@@ -2322,6 +2591,63 @@ async function recordTestItemGenerationFailure(
       JSON.parse(JSON.stringify(toPersistenceEnvelope(result.room, nowMs))) as unknown
     );
     await state.storage.setAlarm(roomExpiresAtMs(result.room));
+  });
+}
+
+/**
+ * Reproduces the F-02 trapdoor directly: EXECUTE_TRADE's choosingSide -> settling
+ * transition is committed to storage, but the automatic settlement effect that
+ * normally follows it (applyAutomaticRoomEffects -> receiveStoredSettlement) never
+ * runs, exactly as if the isolate had been evicted or the request abandoned
+ * between the two storage transactions in applyDecodedRoomCommand. The stored
+ * private item is left untouched, matching a real abandonment (settlement was
+ * never attempted, not that it failed).
+ */
+async function forceStuckSettling(
+  stub: GameRoomStub,
+  traderCredential: RoomCapabilityToken,
+  side: TradeSide
+): Promise<RoomState> {
+  return runInDurableObject(stub, async (_instance, state) => {
+    const nowMs = Date.now();
+    const loaded = loadPersistenceEnvelope(
+      await state.storage.get<unknown>(TEST_ROOM_STORAGE_KEY),
+      nowMs
+    );
+
+    if (!loaded.ok) {
+      throw new Error(`Expected loadable room envelope: ${loaded.error.code}`);
+    }
+
+    const result = dispatchRoomCommand(
+      loaded.room,
+      {
+        type: "EXECUTE_TRADE",
+        credential: traderCredential,
+        side,
+        nowMs
+      },
+      {
+        presence: { players: { A: true, B: true } },
+        verifyToken: () => true
+      }
+    );
+
+    if (!result.ok) {
+      throw new Error(`Expected EXECUTE_TRADE to transition to settling: ${result.error.code}`);
+    }
+
+    if (result.room.game.phase !== "settling") {
+      throw new Error("Expected settling phase after forced EXECUTE_TRADE.");
+    }
+
+    await state.storage.put(
+      TEST_ROOM_STORAGE_KEY,
+      JSON.parse(JSON.stringify(toPersistenceEnvelope(result.room, nowMs))) as unknown
+    );
+    await state.storage.setAlarm(roomExpiresAtMs(result.room));
+
+    return result.room;
   });
 }
 
