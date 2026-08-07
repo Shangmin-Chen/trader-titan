@@ -79,6 +79,9 @@ const PING_PONG_ROOM_NAME = "worker-room-ping-pong";
 const TIGHTEN_REPLAY_SAME_ID_ROOM_NAME = "worker-room-tighten-replay-same-id";
 const TIGHTEN_REPLAY_DIFFERENT_ID_ROOM_NAME = "worker-room-tighten-replay-different-id";
 const KICKED_GUEST_REPLAY_ROOM_NAME = "worker-room-kicked-guest-replay";
+const NEARER_DEADLINE_ROOM_NAME = "worker-room-nearer-deadline";
+const PURGE_DEDUPE_ROOM_NAME = "worker-room-purge-dedupe";
+const STALE_ROUND_SETTLE_ROOM_NAME = "worker-room-stale-round-settle";
 const GAME_ROOM_SMOKE_URL = "https://trader-titan.worker.test/room";
 const ROOM_COMMAND_URL = `${GAME_ROOM_SMOKE_URL}/command`;
 const ROOM_JOIN_URL = `${GAME_ROOM_SMOKE_URL}/join`;
@@ -87,6 +90,8 @@ const ROOM_SOCKET_URL = `${GAME_ROOM_SMOKE_URL}/socket`;
 const PUBLIC_ROOMS_URL = "https://trader-titan.worker.test/api/rooms";
 const TEST_ROOM_STORAGE_KEY = "room:persistence:v1";
 const TEST_PENDING_EFFECT_STORAGE_KEY = "room:pending-effect:v1";
+// Mirrors ROOM_COMMAND_DEDUPE_STORAGE_KEY in src/worker/index.ts.
+const TEST_COMMAND_DEDUPE_STORAGE_KEY = "room:command-dedupe:v1";
 // Mirrors PENDING_SETTLE_EFFECT_MAX_ATTEMPTS in src/worker/index.ts.
 const TEST_PENDING_SETTLE_EFFECT_MAX_ATTEMPTS = 5;
 const HTTP_BAD_REQUEST_STATUS = 400;
@@ -1753,6 +1758,189 @@ describe("Cloudflare worker scaffold", () => {
 
     await expect(storedRoomAlarm(stub)).resolves.toBe(ttlAfterResolution);
     expect(ttlAfterResolution).toBeGreaterThan(Date.now());
+
+    guestConnection.socket.close();
+  });
+
+  it("schedules the nearer of the two deadlines while a pending effect is not yet due", async () => {
+    // Closes a mutation gap: flipping scheduleNextAlarm's Math.min to Math.max
+    // (i.e. always scheduling the *farther* deadline, the exact failure its own
+    // docstring warns about) previously passed the entire suite.
+    //
+    // The neighbouring "multiplexes both outstanding deadlines" test cannot
+    // catch that, because it only observes the alarm either while the fixture
+    // has deliberately pinned it to the TTL, or after the effect has resolved
+    // and the marker is null -- and with a null marker scheduleNextAlarm
+    // short-circuits to the TTL without ever comparing the two deadlines.
+    //
+    // This exercises alarm()'s not-yet-due branch, which is the one place the
+    // comparison actually runs with a live marker: a pending effect whose
+    // notBeforeMs is in the future but well inside the room's TTL must leave
+    // the alarm armed at notBeforeMs, not at the TTL.
+    const stub = roomStub(NEARER_DEADLINE_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created nearer-deadline room.");
+    }
+
+    await joinRoom(stub, "Guest");
+
+    const ttlDeadline = await storedRoomExpiresAt(stub);
+    const notBeforeMs = Date.now() + 60_000;
+
+    expect(notBeforeMs).toBeLessThan(ttlDeadline);
+
+    await writePendingRoomEffectForTest(stub, {
+      kind: "settle",
+      roundId: "round-not-yet-due",
+      attempts: 0,
+      notBeforeMs
+    });
+
+    await runRoomCleanupAlarm(stub);
+
+    // The nearer deadline wins. Under Math.max this is ttlDeadline instead,
+    // and the pending settlement would not be retried until the room expired.
+    await expect(storedRoomAlarm(stub)).resolves.toBe(notBeforeMs);
+
+    // Not-yet-due means untouched: the marker must survive this tick intact.
+    await expect(readPendingRoomEffect(stub)).resolves.toMatchObject({
+      kind: "settle",
+      roundId: "round-not-yet-due",
+      attempts: 0,
+      notBeforeMs
+    });
+  });
+
+  it("purges the command dedupe table along with the rest of an expired room's state", async () => {
+    // Closes a mutation gap: deleting the dedupe-table line from
+    // purgeExpiredRoomState previously passed the entire suite, because every
+    // purge test asserted only on the room envelope and the private items.
+    //
+    // It matters because the Durable Object id is derived from the room slug
+    // (idFromName), so a reused slug lands in the same storage. Stale
+    // (role, commandId) entries surviving a purge would let a replay from a
+    // previous room be recognised as a dedupe hit in the new one.
+    const stub = roomStub(PURGE_DEDUPE_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created purge-dedupe room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+
+    await openRoomSocket(stub, joined.guestToken);
+    // A real command, so the dedupe entry is written by the production path
+    // rather than planted directly into storage.
+    await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    await expect(readCommandDedupeEntries(stub)).resolves.not.toHaveLength(0);
+
+    await expireStoredRoomEnvelope(stub);
+    await runRoomCleanupAlarm(stub);
+
+    await expect(readCommandDedupeEntries(stub)).resolves.toEqual([]);
+    await expect(readPendingRoomEffect(stub)).resolves.toBeNull();
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual(noPrivateItemKeys());
+    await expect(storedRoomAlarm(stub)).resolves.toBeNull();
+  });
+
+  it("ignores a settlement effect whose round no longer matches the stored room", async () => {
+    // Closes a mutation gap: removing the `item.round_id !== roundId` clause
+    // from receiveStoredSettlement's re-validation previously passed the whole
+    // suite. The test that claims to cover it ("does not double-settle when a
+    // manual retry races the alarm") is stopped one layer earlier by the
+    // reducer's phase guard, so the round_id clause itself was never reached.
+    //
+    // The guard defends a TOCTOU window: the room is re-read inside a fresh
+    // transaction, and the round may have moved on since the caller loaded it.
+    // Reproduced here by invoking receiveStoredSettlement with a room object
+    // whose round_id does not match what is actually persisted, which is
+    // precisely the state that window produces.
+    const stub = roomStub(STALE_ROUND_SETTLE_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created stale-round room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected generated item to be ready.");
+    }
+
+    const marketMakerToken = tokenForPlayer(
+      started.room.game.roles.marketMaker,
+      created.hostToken,
+      joined.guestToken
+    );
+    const traderToken = tokenForPlayer(
+      started.room.game.roles.trader,
+      created.hostToken,
+      joined.guestToken
+    );
+
+    await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_INITIAL_WIDTH",
+      credential: marketMakerToken,
+      width: 100
+    });
+    await applyRoomCommandWithoutTrueValue(stub, {
+      type: "TRADE_ON_WIDTH",
+      credential: traderToken
+    });
+    await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_MARKET_QUOTE",
+      credential: marketMakerToken,
+      quote: { bid: 3400, ask: 3500 }
+    });
+
+    const stuck = await forceStuckSettling(stub, traderToken, "BUY");
+
+    if (stuck.game.phase !== "settling") {
+      throw new Error("Expected forceStuckSettling to land in settling.");
+    }
+
+    const revisionBefore = stuck.revision;
+    const staleRoom = {
+      ...stuck,
+      game: {
+        ...stuck.game,
+        item: { ...stuck.game.item, round_id: "round-from-a-previous-round" }
+      }
+    };
+
+    await runInDurableObject(stub, async (instance) => {
+      await (
+        instance as unknown as {
+          receiveStoredSettlement(room: unknown, nowMs: number): Promise<unknown>;
+        }
+      ).receiveStoredSettlement(staleRoom, Date.now());
+    });
+
+    // The stale effect must not settle the round it no longer belongs to.
+    const after = await accessRoom(stub, created.hostToken);
+
+    expect(after.room.game.phase).toBe("settling");
+    expect(after.room.revision).toBe(revisionBefore);
+
+    // And the genuine, matching effect must still be able to settle it, so the
+    // guard rejects the stale round rather than wedging the room.
+    await runRoomCleanupAlarm(stub);
+
+    const resumed = await accessRoom(stub, created.hostToken);
+
+    expect(resumed.room.game.phase).toBe("settlement");
 
     guestConnection.socket.close();
   });
@@ -3496,6 +3684,14 @@ async function putStalePrivateGeneratedItem(
   });
 
   return key;
+}
+
+async function readCommandDedupeEntries(stub: GameRoomStub): Promise<unknown[]> {
+  return runInDurableObject(stub, async (_instance, state) => {
+    const value = await state.storage.get<unknown>(TEST_COMMAND_DEDUPE_STORAGE_KEY);
+
+    return Array.isArray(value) ? value : [];
+  });
 }
 
 async function storedRoomAlarm(stub: GameRoomStub): Promise<number | null> {

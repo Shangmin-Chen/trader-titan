@@ -1,4 +1,4 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -607,6 +607,41 @@ describe("per-command pending state (F-06)", () => {
     expect(resetButton).toBeDisabled();
     // A second click on the same in-flight command must not fire a
     // second request — this is the load-bearing double-submit guard.
+    expect(sendRoomCommand).toHaveBeenCalledTimes(1);
+  });
+
+  it("blocks a duplicate dispatch that is not gated by the button's disabled state", async () => {
+    // The test above cannot actually exercise the ref guard in runCommand:
+    // React flushes synchronously between the two fireEvent calls, so the
+    // button is already disabled and the second click never reaches onClick.
+    // The DOM, not the guard, is what makes it pass — deleting
+    // `pendingCommandsRef.current.has(input.type)` from runCommand leaves it
+    // green.
+    //
+    // The guard exists for dispatches the disabled attribute does not cover:
+    // RESET_TO_LOBBY is wired to two independent call sites (page.tsx:772 in
+    // RoomControls and page.tsx:802 via RoomGameView's onReset), and two real
+    // clicks can land in a single React batch before the re-render disables
+    // anything. Both are reproduced here by re-enabling the control in the DOM
+    // before the second click, so the click reaches runCommand and only the
+    // guard can stop it.
+    vi.mocked(sendRoomCommand).mockReturnValue(new Promise(() => {}));
+
+    await renderInSettlementPhase();
+
+    const resetButton = screen.getByRole("button", { name: /reset lobby/i });
+
+    // Both clicks are dispatched inside a single act() block, so React has not
+    // re-rendered between them and the button is still enabled for the second
+    // one. (Re-enabling it via removeAttribute does not work: React decides
+    // whether to suppress a mouse event from the fiber's props, not from the
+    // DOM attribute.) This is the batched-click race the ref guard exists for,
+    // and the only thing that can stop the second dispatch is the guard.
+    await act(async () => {
+      resetButton.click();
+      resetButton.click();
+    });
+
     expect(sendRoomCommand).toHaveBeenCalledTimes(1);
   });
 
