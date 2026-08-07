@@ -1609,10 +1609,18 @@ describe("Cloudflare worker scaffold", () => {
     }
 
     const firstConnection = await openRoomSocket(stub, created.hostToken);
-    const firstClosed = nextSocketClose(firstConnection.socket);
+    const firstClosed = nextSocketCloseCode(firstConnection.socket);
     const secondConnection = await openRoomSocket(stub, created.hostToken);
 
-    await expect(firstClosed).resolves.toBeUndefined();
+    // The client-side RoomSocketSupervisor treats 1008 as the one
+    // non-retryable "you were superseded" code (see
+    // isRetryableRoomSocketCloseCode in room-socket-supervisor.ts). Any
+    // other code here would make the evicted tab reconnect and evict the
+    // new socket right back, fighting forever.
+    await expect(firstClosed).resolves.toEqual({
+      code: 1008,
+      reason: "Room seat opened a new socket."
+    });
     expect(secondConnection.initial).toMatchObject({
       type: "ROOM_SNAPSHOT",
       room: roomWithPresence(created.room, { A: true, B: false })
@@ -2059,6 +2067,7 @@ describe("Cloudflare worker scaffold", () => {
 
     const CHURN_ATTEMPTS = 20;
     let lastGuestConnection: RoomSocketConnection | null = null;
+    let firstGuestClosed: Promise<{ code: number; reason: string }> | null = null;
 
     for (let attempt = 0; attempt < CHURN_ATTEMPTS; attempt += 1) {
       // Deliberately do not close the previous guest socket before opening
@@ -2066,12 +2075,25 @@ describe("Cloudflare worker scaffold", () => {
       // zombie sockets that still count toward presence for seat B.
       lastGuestConnection = await openRoomSocket(stub, joined.guestToken);
 
+      if (attempt === 0) {
+        // Capture the very first guest socket's close code: it is evicted
+        // by attempt 1 below, and that eviction must use the same
+        // non-retryable 1008 code as the host-eviction test above, or a
+        // churning guest client would reconnect-loop against itself.
+        firstGuestClosed = nextSocketCloseCode(lastGuestConnection.socket);
+      }
+
       expectRoomPresence(lastGuestConnection.initial.room, { A: true, B: true });
     }
 
-    if (lastGuestConnection === null) {
+    if (lastGuestConnection === null || firstGuestClosed === null) {
       throw new Error("Expected at least one churned guest connection.");
     }
+
+    await expect(firstGuestClosed).resolves.toEqual({
+      code: 1008,
+      reason: "Room seat opened a new socket."
+    });
 
     const seatKeys = await runInDurableObject(stub, (_instance, state) =>
       state.getWebSockets().map((socket) => {
@@ -2852,6 +2874,33 @@ function nextSocketClose(socket: WebSocket): Promise<void> {
       clearTimeout(timeout);
       socket.removeEventListener("close", onClose as EventListener);
       resolve();
+    };
+
+    socket.addEventListener("close", onClose as EventListener);
+  });
+}
+
+/**
+ * Like `nextSocketClose`, but surfaces the close code/reason instead of
+ * discarding them. The reconnect supervisor's entire "do not loop forever
+ * evicting yourself" guarantee (see `room-socket-supervisor.ts`) hinges on
+ * the server evicting a superseded socket with exactly code 1008 — that is
+ * the one non-retryable code the client treats as terminal instead of
+ * scheduling a reconnect. `nextSocketClose` alone would pass this test even
+ * if `closeSocketQuietly`'s primary `socket.close(1008, reason)` call
+ * silently threw and fell back to a codeless `socket.close()`, so callers
+ * that care about eviction specifically should assert on the code here.
+ */
+function nextSocketCloseCode(socket: WebSocket): Promise<{ code: number; reason: string }> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      socket.removeEventListener("close", onClose as EventListener);
+      reject(new Error("Timed out waiting for room socket close."));
+    }, SOCKET_MESSAGE_TIMEOUT_MS);
+    const onClose = (event: CloseEvent): void => {
+      clearTimeout(timeout);
+      socket.removeEventListener("close", onClose as EventListener);
+      resolve({ code: event.code, reason: event.reason });
     };
 
     socket.addEventListener("close", onClose as EventListener);
