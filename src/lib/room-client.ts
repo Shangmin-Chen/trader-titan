@@ -12,6 +12,17 @@ import {
 const PUBLIC_ROOMS_PATH = "/api/rooms";
 const ROOM_SESSION_STORAGE_PREFIX = "trader-titan.room-session.v1";
 
+// Mirrors the literal strings the edge WebSocket auto-response pair matches
+// in `src/worker/index.ts` (`ROOM_SOCKET_PING_MESSAGE` / `_PONG_MESSAGE`).
+// The edge replies to a raw "tt-ping" text frame with a raw "tt-pong" text
+// frame without waking the hibernating Durable Object, so both sides must
+// agree on the exact bytes; there is no shared module between the worker
+// and client bundles, so — like the `"tt-room-v1"` protocol literal in
+// `roomSocketProtocols` below — it is duplicated deliberately rather than
+// cross-importing worker code into the client bundle.
+export const ROOM_SOCKET_PING_MESSAGE = "tt-ping";
+export const ROOM_SOCKET_PONG_MESSAGE = "tt-pong";
+
 type JsonObject = Record<string, unknown>;
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 type WebSocketConstructor = new (

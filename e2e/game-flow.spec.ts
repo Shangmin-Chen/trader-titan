@@ -1,6 +1,19 @@
-import { expect, test, type Browser, type Page } from "@playwright/test";
+import {
+  expect,
+  test,
+  type Browser,
+  type BrowserContext,
+  type Page,
+} from "@playwright/test";
 
 const ROOM_PHASE_TIMEOUT_MS = 15_000;
+// The reconnect supervisor's heartbeat watchdog needs up to ~40s to notice a
+// socket that went silent without a clean close (20s ping interval, 10s pong
+// deadline, 2 missed pongs) before it force-closes the socket and the
+// backoff loop reopens it. Give assertions that depend on that full detour
+// through the watchdog (rather than an immediate transport-level close)
+// enough headroom.
+const HEARTBEAT_RECOVERY_TIMEOUT_MS = 75_000;
 
 test.describe("Cloudflare room invite flow", () => {
   test("creates an invite room, plays one round, and frees the guest slot", async ({
@@ -143,6 +156,129 @@ test.describe("Cloudflare room invite flow", () => {
     );
     await expect(host.getByRole("button", { name: "Start game" })).toBeEnabled();
   });
+
+  // T-4: unlike the reconnect tests above (which use guest.goto to simulate
+  // a drop, then guest.goto(inviteUrl) to "reconnect" — really a fresh page
+  // load and a brand-new socket), this exercises the actual client-side
+  // reconnect supervisor: the guest's page never navigates or reloads, so
+  // any recovery must come from src/lib/room-socket-supervisor.ts reopening
+  // the socket on its own after the drop.
+  //
+  // `browserContext.setOffline()` is deliberately NOT used here: it blocks
+  // new HTTP requests via CDP network emulation, but it does not tear down
+  // an already-established WebSocket, so the guest's socket stays alive and
+  // functional straight through it — no drop is actually simulated. Instead
+  // this uses `page.routeWebSocket()` to sit between the guest's real
+  // WebSocket and the real server and, on command, silently stop relaying
+  // frames in both directions without ever sending a close frame — a
+  // genuine "network black hole" that only the heartbeat watchdog (not a
+  // close/error event) can detect. That is specifically the scenario the
+  // watchdog exists for: an established connection that goes silent
+  // without a clean close (dead Wi-Fi radio, closed laptop lid, killed
+  // mobile app in the background).
+  test("guest socket reopens after a silent connection drop without a page reload, and both clients converge on the same phase (T-4)", async ({
+    baseURL,
+    browser,
+  }) => {
+    // Covers: room setup, one full round to settlement, the full
+    // heartbeat-watchdog detection cycle, and round 2 setup after recovery.
+    test.setTimeout(180_000);
+
+    let severed = false;
+
+    const { host, guest } = await createAndJoinRoom(browser, baseURL, {
+      totalRounds: 2,
+      async beforeGuestJoin(guestPage) {
+        // Must be installed before the guest's first socket connects (i.e.
+        // before the join-room click below), so it also governs the very
+        // socket that carries round 1 — not just a later reconnect.
+        await guestPage.routeWebSocket(/\/socket(?:\?.*)?$/, (route) => {
+          const server = route.connectToServer();
+
+          route.onMessage((message) => {
+            if (!severed) {
+              server.send(message);
+            }
+            // else: drop it on the floor. In particular this swallows the
+            // client's own "tt-ping" frames, so the real server never
+            // answers and the client-side watchdog is the only thing that
+            // can ever notice.
+          });
+
+          server.onMessage((message) => {
+            if (!severed) {
+              route.send(message);
+            }
+            // else: drop the real server's replies too (including any
+            // "tt-pong"), so nothing gets through in either direction.
+          });
+
+          // Overriding onClose disables the library's default close
+          // forwarding, so it must be redone by hand. The one behavior
+          // added on top: once the *page* side closes (which is always the
+          // client-side watchdog's own `socket.close(4000, ...)` call,
+          // since we are dropping everything else), stop severing so the
+          // reconnect supervisor's next attempt — routed through this same
+          // handler — passes through untouched and can actually succeed.
+          route.onClose((code, reason) => {
+            severed = false;
+            void server.close({ code, reason });
+          });
+        });
+      },
+    });
+
+    await expect(host.getByRole("button", { name: "Start game" })).toBeEnabled();
+    await host.getByRole("button", { name: "Start game" }).click();
+    await playDefaultQueryRoundToSettlement(host, guest);
+
+    severed = true;
+
+    // The server has no independent way to notice this — it never receives
+    // a close frame until the client's own watchdog eventually sends one
+    // (see the PR description's "Discovered, not fixed" section) — so this
+    // assertion can only pass once two ping/pong cycles have gone
+    // unanswered (~40-60s) and the watchdog force-closes the socket.
+    await expect(host.getByTestId("room-controls")).toContainText(
+      "Player B: Disconnected",
+      { timeout: HEARTBEAT_RECOVERY_TIMEOUT_MS },
+    );
+    await expect(host.getByRole("button", { name: "Next round" })).toBeDisabled();
+    await expect(host.getByTestId("settlement-panel")).toContainText(
+      "Player B is disconnected",
+    );
+
+    // No guest.reload() / guest.goto() / setOffline(false) anywhere below:
+    // recovery must come entirely from the reconnect supervisor's own
+    // backoff loop reopening a (this time unmolested) socket.
+    await expect(guest.getByTestId("room-controls")).toContainText(
+      "This browser: Live",
+      { timeout: HEARTBEAT_RECOVERY_TIMEOUT_MS },
+    );
+    await expect(host.getByTestId("room-controls")).toContainText(
+      "Player B: Connected",
+      { timeout: HEARTBEAT_RECOVERY_TIMEOUT_MS },
+    );
+
+    // Convergence, not just "a socket is open": the host can now advance
+    // the round, and round 2 (which requires the guest to submit the
+    // query, i.e. the guest's client has to be on the same phase the host
+    // just advanced it to) proceeds exactly as it would with an
+    // uninterrupted connection.
+    await expect(host.getByRole("button", { name: "Next round" })).toBeEnabled();
+    await host.getByRole("button", { name: "Next round" }).click();
+
+    await expect(guest.getByTestId("custom-amazon-query-form")).toBeVisible({
+      timeout: ROOM_PHASE_TIMEOUT_MS,
+    });
+    await guest.getByLabel("Search Term / Product Name").fill("standing desk");
+    await guest.getByRole("button", { name: "Submit & Scrape Price" }).click();
+
+    await expect(host.getByRole("button", { name: "Propose width" })).toBeEnabled({
+      timeout: ROOM_PHASE_TIMEOUT_MS,
+    });
+    await expect(guest.getByRole("button", { name: "Propose width" })).toBeDisabled();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -186,16 +322,32 @@ test.describe("Mobile viewport and a11y smoke", () => {
 async function createAndJoinRoom(
   browser: Browser,
   baseURL: string | undefined,
-  options: Readonly<{ totalRounds?: number }> = {},
+  options: Readonly<{
+    totalRounds?: number;
+    /**
+     * Runs right after the guest `Page` is created but before it navigates
+     * anywhere — i.e. strictly before the guest's first WebSocket connects.
+     * Lets a test install a `page.routeWebSocket()` interceptor (or similar)
+     * that must govern the *first* socket (the one carrying live gameplay),
+     * not just a later reconnect attempt.
+     */
+    beforeGuestJoin?: (guest: Page) => Promise<void>;
+  }> = {},
 ): Promise<{
   host: Page;
   guest: Page;
+  hostContext: BrowserContext;
+  guestContext: BrowserContext;
   inviteUrl: string;
 }> {
   const hostContext = await browser.newContext({ baseURL });
   const guestContext = await browser.newContext({ baseURL });
   const host = await hostContext.newPage();
   const guest = await guestContext.newPage();
+
+  if (options.beforeGuestJoin) {
+    await options.beforeGuestJoin(guest);
+  }
 
   await host.goto("/");
   await expect(host.getByTestId("create-room-form")).toBeVisible();
@@ -219,7 +371,7 @@ async function createAndJoinRoom(
   });
   await expect(guest.locator("#room-invite-link")).toHaveCount(0);
 
-  return { host, guest, inviteUrl };
+  return { host, guest, hostContext, guestContext, inviteUrl };
 }
 
 /**

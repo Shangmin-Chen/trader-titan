@@ -63,6 +63,10 @@ import {
   type RoomSession,
   type RoomSocketMessage,
 } from "../lib/room-client";
+import {
+  RoomSocketSupervisor,
+  type RoomSocketSupervisorStatus,
+} from "../lib/room-socket-supervisor";
 import styles from "./page.module.css";
 
 // ---------------------------------------------------------------------------
@@ -105,7 +109,12 @@ function phaseToStepId(phase: string): string | null {
 // Types
 // ---------------------------------------------------------------------------
 
-type ConnectionStatus = "idle" | "connecting" | "connected" | "disconnected";
+type ConnectionStatus =
+  | "idle"
+  | "connecting"
+  | "connected"
+  | "reconnecting"
+  | "disconnected";
 type LoadStatus = "loading" | "ready";
 type CreateRoomFieldErrors = Partial<
   Record<"hostName" | "mode" | "totalRounds", string>
@@ -154,7 +163,6 @@ function HomeContent() {
   const [isJoining, setIsJoining] = useState(false);
   const [isCommanding, setIsCommanding] = useState(false);
   const [isGeneratingCustomItem, setIsGeneratingCustomItem] = useState(false);
-  const socketRef = useRef<WebSocket | null>(null);
   const roomRef = useRef<PublicRoomSnapshot | null>(null);
   const setCurrentRoom = useCallback((nextRoom: PublicRoomSnapshot | null) => {
     roomRef.current = nextRoom;
@@ -313,78 +321,35 @@ function HomeContent() {
   }, [applyCurrentRoomSnapshot, setCurrentRoom]);
 
   useEffect(() => {
-    socketRef.current?.close(1000, "room session changed");
-    socketRef.current = null;
-
     if (socketRoomId === null || socketToken === null) {
       return;
     }
 
-    let closedByEffect = false;
-    const socket = openRoomSocket(socketRoomId, { token: socketToken });
-    socketRef.current = socket;
+    const roomId = socketRoomId;
+    const token = socketToken;
 
-    socket.addEventListener("open", () => {
-      setConnectionStatus("connected");
-    });
-
-    socket.addEventListener("message", (event) => {
-      const message = parseRoomSocketMessage(event.data);
-
-      if (message === null) {
-        setError("Received an unreadable room update.");
-        return;
-      }
-
-      if (message.type === "ROOM_SNAPSHOT") {
-        const accepted = applyCurrentRoomSnapshot(message.room);
-
-        if (!accepted) {
-          return;
-        }
-
-        if (
-          socketToken.role === "guest" &&
-          message.room.seats.guest.occupied === false
-        ) {
-          clearRoomSession(window.sessionStorage, message.room.id);
-          setCurrentRoom(null);
-          setSession(null);
-          setConnectionStatus("idle");
-          socket.close(1008, "guest seat changed");
-          return;
-        }
-
-        setError(null);
-      } else {
-        setError(message.error.message);
-      }
-    });
-
-    socket.addEventListener("error", () => {
-      setConnectionStatus("disconnected");
-    });
-
-    socket.addEventListener("close", () => {
-      socketRef.current = null;
-
-      if (!closedByEffect) {
-        setConnectionStatus("disconnected");
-
-        if (socketToken.role === "guest") {
-          void reconcileClosedGuestSocket(socketRoomId, socketToken);
-        }
-      }
-    });
-
-    async function reconcileClosedGuestSocket(
-      roomId: string,
-      token: RoomSession["token"],
-    ) {
+    // A close is either retryable (network drop, server error, watchdog
+    // timeout — anything that isn't the two deliberate codes below) or
+    // terminal. 1008 is the server's "you no longer belong on this socket"
+    // signal — either this seat opened a newer socket elsewhere, or the
+    // seat itself was vacated (kicked guest, lobby reset). Retrying either
+    // case would just hammer a room this session has been removed from (or
+    // fight the newer socket for the seat), so it is never retried here;
+    // `handleTerminalClose` below runs once to reconcile the stored
+    // session instead. See RoomSocketSupervisor's module doc for the full
+    // rationale.
+    async function reconcileGuestEviction() {
       try {
         await accessRoom(roomId, { credential: token });
+        // The stored session is still valid per the server (e.g. this tab
+        // lost a same-seat socket race to another tab, or a benign
+        // ordering race with the server-side eviction). Nothing to clear;
+        // the connection stays terminal until a deliberate session change
+        // (reload, rejoin) opens a fresh socket.
+        setConnectionStatus("disconnected");
       } catch (caughtError) {
         if (!isStaleGuestError(caughtError)) {
+          setConnectionStatus("disconnected");
           return;
         }
 
@@ -403,9 +368,92 @@ function HomeContent() {
       }
     }
 
+    function handleTerminalClose() {
+      if (token.role !== "guest") {
+        // Hosts are not evicted by normal room flows; surface the terminal
+        // state without attempting a stale-session reconciliation that
+        // only applies to guest capability tokens.
+        setConnectionStatus("disconnected");
+        return;
+      }
+
+      void reconcileGuestEviction();
+    }
+
+    function handleStatusChange(status: RoomSocketSupervisorStatus) {
+      setConnectionStatus(status);
+    }
+
+    function handleMessage(data: unknown) {
+      const message = parseRoomSocketMessage(data);
+
+      if (message === null) {
+        setError("Received an unreadable room update.");
+        return;
+      }
+
+      if (message.type === "ROOM_SNAPSHOT") {
+        const accepted = applyCurrentRoomSnapshot(message.room);
+
+        if (!accepted) {
+          return;
+        }
+
+        if (token.role === "guest" && message.room.seats.guest.occupied === false) {
+          // Defensive: in production the server excludes this socket from
+          // receiving a snapshot once the seat is vacated (it is closed
+          // with 1008 first — see `socketCanReceiveRoomSnapshot` in the
+          // worker), so this path is normally moot. It stays as a
+          // belt-and-suspenders self-close for any ordering the server
+          // doesn't cover; closing with 1008 here routes through the same
+          // non-retryable path as a server-initiated eviction, so
+          // `handleTerminalClose` runs exactly once from the resulting
+          // close event.
+          supervisor.close(1008, "guest seat changed");
+          return;
+        }
+
+        setError(null);
+      } else {
+        setError(message.error.message);
+      }
+    }
+
+    const supervisor = new RoomSocketSupervisor({
+      connect: () => openRoomSocket(roomId, { token }),
+      onGiveUp: handleTerminalClose,
+      onMessage: handleMessage,
+      onOpen: () => {
+        setError(null);
+      },
+      onStatusChange: handleStatusChange,
+    });
+
+    supervisor.start();
+
+    // A backgrounded tab's socket is very likely already dead by the time
+    // the user returns (mobile Safari and most proxies silently drop idle
+    // connections well under a minute); reconnect immediately instead of
+    // waiting out the backoff. `reconnectNow` is a no-op unless the
+    // supervisor is actually mid-backoff, so this cannot create a second
+    // live socket.
+    function handleVisible() {
+      if (document.visibilityState === "visible") {
+        supervisor.reconnectNow();
+      }
+    }
+
+    function handleOnline() {
+      supervisor.reconnectNow();
+    }
+
+    document.addEventListener("visibilitychange", handleVisible);
+    window.addEventListener("online", handleOnline);
+
     return () => {
-      closedByEffect = true;
-      socket.close(1000, "room session changed");
+      document.removeEventListener("visibilitychange", handleVisible);
+      window.removeEventListener("online", handleOnline);
+      supervisor.dispose();
     };
   }, [
     socketRoomId,
@@ -1827,6 +1875,8 @@ function connectionStatusLabel(status: ConnectionStatus): string {
       return "Live";
     case "connecting":
       return "Connecting";
+    case "reconnecting":
+      return "Reconnecting…";
     case "disconnected":
       return "Disconnected";
     default:
