@@ -2,7 +2,18 @@ import { expect, test } from "@playwright/test";
 import * as fs from "fs";
 import * as path from "path";
 
-const SCREENSHOTS_DIR = "/Users/shangminchen/.gemini/antigravity-cli/brain/47ae34cc-9c40-4334-96ed-56720caf70f1/screenshots";
+// Repo-relative by default. This was previously a hardcoded absolute path
+// into one developer's home directory, which made the whole file throw at
+// import time on any other machine -- including CI, where the mkdir fails
+// with EACCES before a single test runs.
+//
+// `test-results/` is already gitignored, and CI uploads it as an artifact,
+// so the screenshots are downloadable from a run instead of being written
+// somewhere only one machine can see. Override with
+// VISUAL_AUDIT_SCREENSHOTS_DIR to write them elsewhere locally.
+const SCREENSHOTS_DIR =
+  process.env.VISUAL_AUDIT_SCREENSHOTS_DIR ??
+  path.join(process.cwd(), "test-results", "visual-audit");
 
 // Ensure the directory exists
 if (!fs.existsSync(SCREENSHOTS_DIR)) {
