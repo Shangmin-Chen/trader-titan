@@ -29,6 +29,28 @@ const ROOM_SESSION_STORAGE_PREFIX = "trader-titan.room-session.v1";
  */
 const DEFAULT_ROOM_REQUEST_TIMEOUT_MS = 30_000;
 
+/**
+ * Longer timeout bound for the two commands whose synchronous worker-side
+ * work is not a fixed cost: `START_ROOM` (round 1) and
+ * `RETRY_ITEM_GENERATION`. In AI-generated Amazon mode, `pregenerateAllItems`
+ * (`src/worker/index.ts`) makes one batched Gemini call and then, still
+ * inside the same request, an *uncapped, sequential* Amazon price-lookup
+ * fetch per round — up to `MAX_ROUNDS` (99) of them, each with no
+ * server-side timeout of its own. A host who legitimately picks a
+ * double-digit round count in that mode can genuinely take well past 30s
+ * to get a real (non-hung) response; `DEFAULT_ROOM_REQUEST_TIMEOUT_MS`
+ * would report that as a client-side timeout even though the server is
+ * still working, which is a false positive, not a recovered hang.
+ *
+ * 120s is not a guarantee for every possible round count — nothing short
+ * of bounding each Amazon lookup server-side (or moving generation off the
+ * synchronous request path) fully closes that gap, and both are out of
+ * scope for a client-side timeout fix — but it comfortably covers the
+ * common multi-round case instead of the same 30s budget as a
+ * single-field command like `TIGHTEN_WIDTH`.
+ */
+export const ITEM_GENERATION_REQUEST_TIMEOUT_MS = 120_000;
+
 type JsonObject = Record<string, unknown>;
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 type WebSocketConstructor = new (

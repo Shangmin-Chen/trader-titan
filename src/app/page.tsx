@@ -51,6 +51,7 @@ import {
   clearRoomSession,
   createRoom,
   getRoomPreview,
+  ITEM_GENERATION_REQUEST_TIMEOUT_MS,
   joinRoom,
   loadRoomSession,
   openRoomSocket,
@@ -60,6 +61,7 @@ import {
   sendRoomCommand,
   submitCustomAmazonItem as submitRoomCustomAmazonItem,
   type RoomClientCommand,
+  type RoomClientOptions,
   type RoomSession,
   type RoomSocketMessage,
 } from "../lib/room-client";
@@ -122,6 +124,24 @@ type ClientCommandInput =
   | Readonly<{ type: "SUBMIT_MARKET_QUOTE"; quote: Quote }>
   | Readonly<{ type: "EXECUTE_TRADE"; side: TradeSide }>;
 
+// Every command `type` string used for the per-command pending-state guard
+// and for the disabled-state checks below is drawn from this union rather
+// than a bare `string`, so a typo in an `isCommandPending(...)` call site
+// (there are ~10 of them) is a compile error instead of a control that
+// silently never gets gated.
+type ClientCommandType = ClientCommandInput["type"];
+
+// START_ROOM (round 1) and RETRY_ITEM_GENERATION are the only commands
+// whose worker-side handling can run real, uncapped network calls
+// (batched Gemini + sequential per-round Amazon lookups) synchronously in
+// the request path — see ITEM_GENERATION_REQUEST_TIMEOUT_MS in
+// room-client.ts for why they get a longer timeout than every other
+// command here.
+const ITEM_GENERATION_COMMAND_TYPES: ReadonlySet<ClientCommandType> = new Set([
+  "START_ROOM",
+  "RETRY_ITEM_GENERATION",
+]);
+
 // ---------------------------------------------------------------------------
 // Root export — wraps the tree in LiveAnnouncerProvider so every descendant
 // component (including HomeContent) can call useAnnouncer().
@@ -163,10 +183,10 @@ function HomeContent() {
   // React re-renders), which would defeat the guard. The state copy exists
   // purely to trigger re-renders so the UI reflects pending/idle per
   // control.
-  const pendingCommandsRef = useRef<ReadonlySet<string>>(new Set());
-  const [pendingCommands, setPendingCommands] = useState<ReadonlySet<string>>(
-    new Set(),
-  );
+  const pendingCommandsRef = useRef<ReadonlySet<ClientCommandType>>(new Set());
+  const [pendingCommands, setPendingCommands] = useState<
+    ReadonlySet<ClientCommandType>
+  >(new Set());
   const [isGeneratingCustomItem, setIsGeneratingCustomItem] = useState(false);
   const socketRef = useRef<WebSocket | null>(null);
   const roomRef = useRef<PublicRoomSnapshot | null>(null);
@@ -442,7 +462,8 @@ function HomeContent() {
   const guestSeatOccupied = room?.seats.guest.occupied === true;
   const guestConnected = room?.presence.players.B === true;
   const isCommandPending = useCallback(
-    (...types: readonly string[]) => types.some((type) => pendingCommands.has(type)),
+    (...types: readonly ClientCommandType[]) =>
+      types.some((type) => pendingCommands.has(type)),
     [pendingCommands],
   );
   const isAnyCommandPending = pendingCommands.size > 0;
@@ -470,12 +491,22 @@ function HomeContent() {
       setPendingCommands(pendingCommandsRef.current);
       setError(null);
 
+      const commandOptions: RoomClientOptions = ITEM_GENERATION_COMMAND_TYPES.has(
+        input.type,
+      )
+        ? { signal: AbortSignal.timeout(ITEM_GENERATION_REQUEST_TIMEOUT_MS) }
+        : {};
+
       try {
-        const response = await sendRoomCommand(activeRoom.id, {
-          ...input,
-          credential: activeSession.token,
-          nowMs: Date.now(),
-        } as RoomClientCommand);
+        const response = await sendRoomCommand(
+          activeRoom.id,
+          {
+            ...input,
+            credential: activeSession.token,
+            nowMs: Date.now(),
+          } as RoomClientCommand,
+          commandOptions,
+        );
 
         applyCurrentRoomSnapshot(response.room);
       } catch (caughtError) {
@@ -1278,7 +1309,7 @@ type RoomGameViewProps = Readonly<{
    * didn't come from (e.g. a hung ADVANCE_ROUND doesn't touch controls
    * outside the settlement phase).
    */
-  isCommandPending: (...types: string[]) => boolean;
+  isCommandPending: (...types: ClientCommandType[]) => boolean;
   isGeneratingCustomItem: boolean;
   isHost: boolean;
   onAdvanceRound: () => void;
@@ -1614,18 +1645,18 @@ function LastError({ game }: LastErrorProps) {
 // ---------------------------------------------------------------------------
 
 function withPendingCommand(
-  pending: ReadonlySet<string>,
-  type: string,
-): ReadonlySet<string> {
+  pending: ReadonlySet<ClientCommandType>,
+  type: ClientCommandType,
+): ReadonlySet<ClientCommandType> {
   const next = new Set(pending);
   next.add(type);
   return next;
 }
 
 function withoutPendingCommand(
-  pending: ReadonlySet<string>,
-  type: string,
-): ReadonlySet<string> {
+  pending: ReadonlySet<ClientCommandType>,
+  type: ClientCommandType,
+): ReadonlySet<ClientCommandType> {
   const next = new Set(pending);
   next.delete(type);
   return next;

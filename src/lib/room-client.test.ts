@@ -3,6 +3,7 @@ import {
   clearRoomSession,
   createRoom,
   getRoomPreview,
+  ITEM_GENERATION_REQUEST_TIMEOUT_MS,
   joinRoom,
   loadRoomSession,
   openRoomSocket,
@@ -222,6 +223,30 @@ describe("room client", () => {
         { fetchImpl },
       ),
     ).resolves.toEqual({ ok: true, room: SNAPSHOT });
+  });
+
+  it("exposes a longer timeout budget for item-generation commands than the default", async () => {
+    // START_ROOM / RETRY_ITEM_GENERATION can run a batched Gemini call plus
+    // up to MAX_ROUNDS sequential, uncapped Amazon lookups synchronously in
+    // the worker request path (see the constant's doc comment). Callers are
+    // expected to pass this via `options.signal` for those two command
+    // types specifically, not for every room HTTP call.
+    expect(ITEM_GENERATION_REQUEST_TIMEOUT_MS).toBeGreaterThan(30_000);
+
+    let capturedSignal: AbortSignal | undefined;
+    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      capturedSignal = init?.signal ?? undefined;
+      return Response.json({ ok: true, room: SNAPSHOT });
+    });
+
+    await sendRoomCommand(
+      ROOM_ID,
+      { type: "RETRY_ITEM_GENERATION", credential: HOST_TOKEN, nowMs: 1 },
+      { fetchImpl, signal: AbortSignal.timeout(ITEM_GENERATION_REQUEST_TIMEOUT_MS) },
+    );
+
+    expect(capturedSignal).toBeInstanceOf(AbortSignal);
+    expect(capturedSignal?.aborted).toBe(false);
   });
 
   it("serializes retry item generation commands through the room command route", async () => {

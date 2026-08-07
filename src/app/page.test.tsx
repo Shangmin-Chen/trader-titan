@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
@@ -594,5 +594,59 @@ describe("per-command pending state (F-06)", () => {
     // A second click on the same in-flight command must not fire a
     // second request — this is the load-bearing double-submit guard.
     expect(sendRoomCommand).toHaveBeenCalledTimes(1);
+  });
+
+  // Regression coverage for the timeout-sizing gap noted during review:
+  // START_ROOM / RETRY_ITEM_GENERATION can run a batched Gemini call plus
+  // up to MAX_ROUNDS sequential, uncapped Amazon lookups synchronously in
+  // the worker request path, so they must not share the same default
+  // timeout budget as a single-field command like RESET_TO_LOBBY.
+  it("gives RETRY_ITEM_GENERATION a longer timeout signal than a plain command", async () => {
+    const ERROR_SNAPSHOT = {
+      ...BASE_SNAPSHOT,
+      lifecycle: "active",
+      presence: {
+        players: { A: true, B: true },
+      },
+      game: {
+        mode: "Chaos Quant",
+        players: {
+          A: { id: "A", name: "Ada" },
+          B: { id: "B", name: "Grace" },
+        },
+        scores: { A: 0, B: 0 },
+        roles: { marketMaker: "A", trader: "B" },
+        roundNumber: 1,
+        totalRounds: 3,
+        log: [],
+        phase: "error",
+        error: "Item generation failed.",
+        previousPhase: "generatingItem",
+      },
+    } satisfies PublicRoomSnapshot;
+
+    vi.mocked(accessRoom).mockResolvedValue({ ok: true, room: ERROR_SNAPSHOT });
+    vi.mocked(sendRoomCommand).mockReturnValue(new Promise(() => {}));
+
+    render(<Home />);
+    const errorPanel = await screen.findByTestId("error-panel");
+    const retryButton = within(errorPanel).getByRole("button", {
+      name: /retry generation/i,
+    });
+    const resetButton = within(errorPanel).getByRole("button", {
+      name: /reset lobby/i,
+    });
+
+    fireEvent.click(retryButton);
+
+    expect(sendRoomCommand).toHaveBeenCalledTimes(1);
+    const retryOptions = vi.mocked(sendRoomCommand).mock.calls[0]?.[2];
+    // A plain command (e.g. RESET_TO_LOBBY) gets no signal override — it
+    // relies on room-client's own default timeout.
+    fireEvent.click(resetButton);
+    const resetOptions = vi.mocked(sendRoomCommand).mock.calls[1]?.[2];
+
+    expect(retryOptions?.signal).toBeInstanceOf(AbortSignal);
+    expect(resetOptions?.signal).toBeUndefined();
   });
 });
