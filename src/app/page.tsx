@@ -51,6 +51,7 @@ import {
   clearRoomSession,
   createRoom,
   getRoomPreview,
+  ITEM_GENERATION_REQUEST_TIMEOUT_MS,
   joinRoom,
   loadRoomSession,
   openRoomSocket,
@@ -60,6 +61,7 @@ import {
   sendRoomCommand,
   submitCustomAmazonItem as submitRoomCustomAmazonItem,
   type RoomClientCommand,
+  type RoomClientOptions,
   type RoomSession,
   type RoomSocketMessage,
 } from "../lib/room-client";
@@ -131,6 +133,24 @@ type ClientCommandInput =
   | Readonly<{ type: "SUBMIT_MARKET_QUOTE"; quote: Quote }>
   | Readonly<{ type: "EXECUTE_TRADE"; side: TradeSide }>;
 
+// Every command `type` string used for the per-command pending-state guard
+// and for the disabled-state checks below is drawn from this union rather
+// than a bare `string`, so a typo in an `isCommandPending(...)` call site
+// (there are ~10 of them) is a compile error instead of a control that
+// silently never gets gated.
+type ClientCommandType = ClientCommandInput["type"];
+
+// START_ROOM (round 1) and RETRY_ITEM_GENERATION are the only commands
+// whose worker-side handling can run real, uncapped network calls
+// (batched Gemini + sequential per-round Amazon lookups) synchronously in
+// the request path — see ITEM_GENERATION_REQUEST_TIMEOUT_MS in
+// room-client.ts for why they get a longer timeout than every other
+// command here.
+const ITEM_GENERATION_COMMAND_TYPES: ReadonlySet<ClientCommandType> = new Set([
+  "START_ROOM",
+  "RETRY_ITEM_GENERATION",
+]);
+
 // ---------------------------------------------------------------------------
 // Root export — wraps the tree in LiveAnnouncerProvider so every descendant
 // component (including HomeContent) can call useAnnouncer().
@@ -161,7 +181,21 @@ function HomeContent() {
   const [error, setError] = useState<string | null>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [isJoining, setIsJoining] = useState(false);
-  const [isCommanding, setIsCommanding] = useState(false);
+  // Which room commands are currently in flight, keyed by command `type`.
+  // Per-command (not a single global flag) so a hung command only disables
+  // its own control — e.g. a stuck ADVANCE_ROUND must not take down the
+  // unrelated "Reset lobby"/"Kick guest" controls in RoomControls. The ref
+  // mirrors the state and is the actual source of truth for the
+  // double-submit guard in runCommand: reading from state there would risk
+  // a stale closure if the same command were submitted twice within the
+  // same synchronous tick (e.g. two rapid click events processed before
+  // React re-renders), which would defeat the guard. The state copy exists
+  // purely to trigger re-renders so the UI reflects pending/idle per
+  // control.
+  const pendingCommandsRef = useRef<ReadonlySet<ClientCommandType>>(new Set());
+  const [pendingCommands, setPendingCommands] = useState<
+    ReadonlySet<ClientCommandType>
+  >(new Set());
   const [isGeneratingCustomItem, setIsGeneratingCustomItem] = useState(false);
   const roomRef = useRef<PublicRoomSnapshot | null>(null);
   const setCurrentRoom = useCallback((nextRoom: PublicRoomSnapshot | null) => {
@@ -475,34 +509,65 @@ function HomeContent() {
   const isHost = session?.role === "host";
   const guestSeatOccupied = room?.seats.guest.occupied === true;
   const guestConnected = room?.presence.players.B === true;
+  const isCommandPending = useCallback(
+    (...types: readonly ClientCommandType[]) =>
+      types.some((type) => pendingCommands.has(type)),
+    [pendingCommands],
+  );
+  const isAnyCommandPending = pendingCommands.size > 0;
   const canStartRoom =
-    isHost && room?.lifecycle === "lobby" && guestConnected && !isCommanding;
-  const canHostControl = isHost && room !== null && !isCommanding;
+    isHost &&
+    room?.lifecycle === "lobby" &&
+    guestConnected &&
+    !isCommandPending("START_ROOM");
+  const canResetLobby = isHost && room !== null && !isCommandPending("RESET_TO_LOBBY");
+  const canKickGuest = isHost && room !== null && !isCommandPending("KICK_GUEST");
 
   const runCommand = useCallback(
     async (input: ClientCommandInput) => {
-      if (room === null || session === null || isCommanding) {
+      if (room === null || session === null || pendingCommandsRef.current.has(input.type)) {
         return;
       }
 
-      setIsCommanding(true);
+      const activeRoom = room;
+      const activeSession = session;
+
+      pendingCommandsRef.current = withPendingCommand(
+        pendingCommandsRef.current,
+        input.type,
+      );
+      setPendingCommands(pendingCommandsRef.current);
       setError(null);
 
+      const commandOptions: RoomClientOptions = ITEM_GENERATION_COMMAND_TYPES.has(
+        input.type,
+      )
+        ? { signal: AbortSignal.timeout(ITEM_GENERATION_REQUEST_TIMEOUT_MS) }
+        : {};
+
       try {
-        const response = await sendRoomCommand(room.id, {
-          ...input,
-          credential: session.token,
-          nowMs: Date.now(),
-        } as RoomClientCommand);
+        const response = await sendRoomCommand(
+          activeRoom.id,
+          {
+            ...input,
+            credential: activeSession.token,
+            nowMs: Date.now(),
+          } as RoomClientCommand,
+          commandOptions,
+        );
 
         applyCurrentRoomSnapshot(response.room);
       } catch (caughtError) {
         setError(errorMessage(caughtError, "Room command failed."));
       } finally {
-        setIsCommanding(false);
+        pendingCommandsRef.current = withoutPendingCommand(
+          pendingCommandsRef.current,
+          input.type,
+        );
+        setPendingCommands(pendingCommandsRef.current);
       }
     },
-    [applyCurrentRoomSnapshot, isCommanding, room, session],
+    [applyCurrentRoomSnapshot, room, session],
   );
 
   async function handleCreateRoom(config: CreateRoomConfig) {
@@ -687,13 +752,14 @@ function HomeContent() {
       {loadStatus === "ready" && room !== null && session !== null && game !== null ? (
         <>
           <RoomControls
-            canHostControl={canHostControl}
+            canKickGuest={canKickGuest}
+            canResetLobby={canResetLobby}
             canStartRoom={canStartRoom}
             connectionStatus={connectionStatus}
             guestConnected={guestConnected}
             guestSeatOccupied={guestSeatOccupied}
             inviteLink={inviteLink}
-            isCommanding={isCommanding}
+            isAnyCommandPending={isAnyCommandPending}
             isHost={isHost}
             room={room}
             session={session}
@@ -719,7 +785,7 @@ function HomeContent() {
             actor={actor}
             game={game}
             guestConnected={guestConnected}
-            isCommanding={isCommanding}
+            isCommandPending={isCommandPending}
             isGeneratingCustomItem={isGeneratingCustomItem}
             isHost={isHost}
             onAdvanceRound={() => {
@@ -1041,7 +1107,10 @@ function JoinRoomPanel({ disabled, error, room, onJoin }: JoinRoomPanelProps) {
 // ---------------------------------------------------------------------------
 
 type RoomControlsProps = Readonly<{
-  canHostControl: boolean;
+  /** Whether the "Kick guest" control's own command (KICK_GUEST) is free to fire. */
+  canKickGuest: boolean;
+  /** Whether the "Reset lobby" control's own command (RESET_TO_LOBBY) is free to fire. */
+  canResetLobby: boolean;
   canStartRoom: boolean;
   connectionStatus: ConnectionStatus;
   /** Whether player B currently has a live room connection. */
@@ -1049,7 +1118,8 @@ type RoomControlsProps = Readonly<{
   /** Whether the guest seat is occupied, independent of live presence. */
   guestSeatOccupied: boolean;
   inviteLink: string;
-  isCommanding: boolean;
+  /** Whether ANY room command is currently in flight (any type). */
+  isAnyCommandPending: boolean;
   isHost: boolean;
   room: PublicRoomSnapshot;
   session: RoomSession;
@@ -1060,13 +1130,14 @@ type RoomControlsProps = Readonly<{
 }>;
 
 function RoomControls({
-  canHostControl,
+  canKickGuest,
+  canResetLobby,
   canStartRoom,
   connectionStatus,
   guestConnected,
   guestSeatOccupied,
   inviteLink,
-  isCommanding,
+  isAnyCommandPending,
   isHost,
   room,
   session,
@@ -1125,7 +1196,7 @@ function RoomControls({
 
   // Anything inside this section can lose focus to nowhere: the "Start
   // game"/"Reset lobby"/"Kick guest" buttons all get `disabled` the instant
-  // they're clicked (the `isCommanding` guard), and browsers blur a
+  // they're clicked (the per-command pending guard), and browsers blur a
   // disabled focused control to <body> synchronously. The disclosure
   // auto-collapsing on a lifecycle change (which unmounts "Start game"
   // entirely) does the same thing. Both are indistinguishable from "the
@@ -1238,7 +1309,7 @@ function RoomControls({
           {isHost ? (
             <button
               className="secondary-button"
-              disabled={!canHostControl}
+              disabled={!canResetLobby}
               onClick={onReset}
               type="button"
             >
@@ -1249,7 +1320,7 @@ function RoomControls({
           {isHost ? (
             <button
               className="danger-button"
-              disabled={!canHostControl || !room.seats.guest.occupied}
+              disabled={!canKickGuest || !room.seats.guest.occupied}
               onClick={onKick}
               type="button"
             >
@@ -1259,7 +1330,7 @@ function RoomControls({
 
           <button
             className="secondary-button"
-            disabled={isCommanding}
+            disabled={isAnyCommandPending}
             onClick={onLeaveLocalSession}
             type="button"
           >
@@ -1279,7 +1350,14 @@ type RoomGameViewProps = Readonly<{
   actor: PlayerId | null;
   game: PublicRoomGameState;
   guestConnected: boolean;
-  isCommanding: boolean;
+  /**
+   * Reports whether any of the given command types is currently in
+   * flight. Each phase below passes only the command type(s) its own
+   * control submits, so a pending command never disables a control it
+   * didn't come from (e.g. a hung ADVANCE_ROUND doesn't touch controls
+   * outside the settlement phase).
+   */
+  isCommandPending: (...types: ClientCommandType[]) => boolean;
   isGeneratingCustomItem: boolean;
   isHost: boolean;
   onAdvanceRound: () => void;
@@ -1297,7 +1375,7 @@ function RoomGameView({
   actor,
   game,
   guestConnected,
-  isCommanding,
+  isCommandPending,
   isGeneratingCustomItem,
   isHost,
   onAdvanceRound,
@@ -1373,7 +1451,10 @@ function RoomGameView({
             <p className="eyebrow">Opening width</p>
             <h2>{game.players[game.roles.marketMaker].name}</h2>
             <SpreadWidthForm
-              disabled={isCommanding || actor !== game.roles.marketMaker}
+              disabled={
+                isCommandPending("SUBMIT_INITIAL_WIDTH") ||
+                actor !== game.roles.marketMaker
+              }
               onSubmit={onSubmitInitialWidth}
               submitLabel="Propose width"
             />
@@ -1397,7 +1478,10 @@ function RoomGameView({
         <div className="play-stack">
           <ItemPanel item={game.item} />
           <WidthNegotiationPanel
-            disabled={isCommanding || actor !== game.roles.trader}
+            disabled={
+              isCommandPending("TIGHTEN_WIDTH", "TRADE_ON_WIDTH") ||
+              actor !== game.roles.trader
+            }
             onTighten={onTightenWidth}
             onTrade={onTradeOnWidth}
             players={game.players}
@@ -1431,7 +1515,10 @@ function RoomGameView({
               generated automatically.
             </p>
             <MarketRangeForm
-              disabled={isCommanding || actor !== game.roles.marketMaker}
+              disabled={
+                isCommandPending("SUBMIT_MARKET_QUOTE") ||
+                actor !== game.roles.marketMaker
+              }
               onSubmit={onSubmitMarketQuote}
               spreadWidth={game.spreadWidth}
             />
@@ -1455,7 +1542,9 @@ function RoomGameView({
         <div className="play-stack">
           <ItemPanel item={game.item} />
           <TradeActionPanel
-            disabled={isCommanding || actor !== game.roles.trader}
+            disabled={
+              isCommandPending("EXECUTE_TRADE") || actor !== game.roles.trader
+            }
             onBuy={() => onExecuteTrade("BUY")}
             onSell={() => onExecuteTrade("SELL")}
             players={game.players}
@@ -1493,7 +1582,7 @@ function RoomGameView({
                 </p>
                 <button
                   className="secondary-button"
-                  disabled={isCommanding}
+                  disabled={isCommandPending("RETRY_ITEM_GENERATION")}
                   onClick={onRetryItemGeneration}
                   type="button"
                 >
@@ -1521,7 +1610,10 @@ function RoomGameView({
         <div className="play-stack">
           <ItemPanel item={game.item} revealTrueValue />
           <SettlementPanel
-            disabled={isCommanding || settlementDisabledReason !== undefined}
+            disabled={
+              isCommandPending("ADVANCE_ROUND") ||
+              settlementDisabledReason !== undefined
+            }
             disabledReason={settlementDisabledReason}
             isFinalRound={isFinalRound}
             onContinue={onAdvanceRound}
@@ -1555,7 +1647,7 @@ function RoomGameView({
         {isHost ? (
           <button
             className="primary-button"
-            disabled={isCommanding}
+            disabled={isCommandPending("RESET_TO_LOBBY")}
             onClick={onReset}
             type="button"
           >
@@ -1578,7 +1670,7 @@ function RoomGameView({
           {canRetry ? (
             <button
               className="primary-button"
-              disabled={isCommanding}
+              disabled={isCommandPending("RETRY_ITEM_GENERATION")}
               onClick={onRetryItemGeneration}
               type="button"
             >
@@ -1587,7 +1679,7 @@ function RoomGameView({
           ) : null}
           <button
             className={canRetry ? "secondary-button" : "primary-button"}
-            disabled={isCommanding}
+            disabled={isCommandPending("RESET_TO_LOBBY")}
             onClick={onReset}
             type="button"
           >
@@ -1618,6 +1710,24 @@ function LastError({ game }: LastErrorProps) {
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
+
+function withPendingCommand(
+  pending: ReadonlySet<ClientCommandType>,
+  type: ClientCommandType,
+): ReadonlySet<ClientCommandType> {
+  const next = new Set(pending);
+  next.add(type);
+  return next;
+}
+
+function withoutPendingCommand(
+  pending: ReadonlySet<ClientCommandType>,
+  type: ClientCommandType,
+): ReadonlySet<ClientCommandType> {
+  const next = new Set(pending);
+  next.delete(type);
+  return next;
+}
 
 type ApplyPublicRoomSnapshotOptions = Readonly<{
   allowRoomSwitch?: boolean;

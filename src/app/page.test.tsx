@@ -1,4 +1,5 @@
-import { describe, expect, it } from "vitest";
+import { fireEvent, render, screen, within } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
   parseCapabilityToken,
@@ -7,13 +8,41 @@ import {
   type PublicRoomInvitePreview,
   type PublicRoomSnapshot,
 } from "../lib/room";
-import { RoomClientRequestError, type RoomSession } from "../lib/room-client";
 import {
+  accessRoom,
+  loadRoomSession,
+  openRoomSocket,
+  RoomClientRequestError,
+  sendRoomCommand,
+  type RoomSession,
+} from "../lib/room-client";
+import Home, {
   applyPublicRoomSnapshotMonotonically,
   canRetryItemGeneration,
   parseRoomSocketMessage,
   resolveExistingRoomCreateState,
 } from "./page";
+
+// `Home` (default export) is rendered end-to-end in the "per-command
+// pending state" suite below, so every room-client network call it can
+// reach needs to be mocked — otherwise it hits `globalThis.fetch`, which
+// jsdom doesn't provide. `...actual` keeps the real pure helpers/classes
+// (RoomClientRequestError, roomSessionFromToken, etc.) so `instanceof`
+// checks inside page.tsx keep working against the same class identity.
+vi.mock("../lib/room-client", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../lib/room-client")>();
+  return {
+    ...actual,
+    accessRoom: vi.fn(),
+    createRoom: vi.fn(),
+    getRoomPreview: vi.fn(),
+    joinRoom: vi.fn(),
+    loadRoomSession: vi.fn(),
+    openRoomSocket: vi.fn(),
+    sendRoomCommand: vi.fn(),
+    submitCustomAmazonItem: vi.fn(),
+  };
+});
 
 const ROOM_A = parseTestRoomId("room-test-a");
 const ROOM_B = parseTestRoomId("room-test-b");
@@ -425,5 +454,213 @@ describe("room socket message parsing", () => {
         },
       })),
     ).toBeNull();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// F-06: per-command pending state
+//
+// Regression coverage for the wedge described in F-06: a global
+// `isCommanding` boolean meant one hung command (e.g. a stuck
+// ADVANCE_ROUND) disabled every control on the page, forever, with no
+// error shown. `runCommand` now tracks in-flight commands per command
+// `type`, so these tests render the real page end-to-end (network calls
+// mocked via the `../lib/room-client` mock above) and assert on actual
+// `disabled` state.
+// ---------------------------------------------------------------------------
+
+describe("per-command pending state (F-06)", () => {
+  const HOST_SESSION = session("host", ROOM_A);
+
+  const SETTLEMENT_SNAPSHOT = {
+    ...BASE_SNAPSHOT,
+    lifecycle: "active",
+    presence: {
+      players: { A: true, B: true },
+    },
+    game: {
+      mode: "Chaos Quant",
+      players: {
+        A: { id: "A", name: "Ada" },
+        B: { id: "B", name: "Grace" },
+      },
+      scores: { A: 5, B: -5 },
+      roles: { marketMaker: "A", trader: "B" },
+      roundNumber: 1,
+      totalRounds: 3,
+      log: [],
+      phase: "settlement",
+      spreadWidth: 4,
+      quote: { bid: 10, ask: 14 },
+      item: {
+        item_title: "Widget",
+        category: "Test",
+        context_clue: "A useful test item.",
+        round_id: "round-1",
+        true_value: 12,
+      },
+      settlement: {
+        roundNumber: 1,
+        itemTitle: "Widget",
+        side: "BUY",
+        transactionPrice: 12,
+        trueValue: 12,
+        trader: "B",
+        marketMaker: "A",
+        traderPnL: 0,
+        marketMakerPnL: 0,
+      },
+    },
+  } satisfies PublicRoomSnapshot;
+
+  // Minimal EventTarget-based stand-in for the real WebSocket the socket
+  // effect opens — the tests below never need it to emit anything.
+  class FakeRoomSocket extends EventTarget {
+    close(): void {
+      // no-op
+    }
+  }
+
+  beforeEach(() => {
+    vi.resetAllMocks();
+
+    // GameShell always renders ThemeToggle, which reads
+    // `window.matchMedia`; jsdom does not implement it.
+    Object.defineProperty(window, "matchMedia", {
+      configurable: true,
+      writable: true,
+      value: vi.fn().mockReturnValue({
+        matches: false,
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        addListener: vi.fn(),
+        removeListener: vi.fn(),
+        dispatchEvent: vi.fn(),
+      }),
+    });
+
+    window.history.pushState({}, "", `/?room=${ROOM_A}`);
+
+    vi.mocked(openRoomSocket).mockReturnValue(
+      new FakeRoomSocket() as unknown as WebSocket,
+    );
+    vi.mocked(loadRoomSession).mockReturnValue(HOST_SESSION);
+    vi.mocked(accessRoom).mockResolvedValue({
+      ok: true,
+      room: SETTLEMENT_SNAPSHOT,
+    });
+  });
+
+  afterEach(() => {
+    window.history.pushState({}, "", "/");
+  });
+
+  async function renderInSettlementPhase() {
+    render(<Home />);
+    return screen.findByTestId("settlement-panel");
+  }
+
+  it("does not let a hung command disable unrelated controls", async () => {
+    // ADVANCE_ROUND hangs forever (simulating F-06's unresponsive
+    // request); any other command type resolves normally.
+    vi.mocked(sendRoomCommand).mockImplementation((_roomId, command) => {
+      if (command.type === "ADVANCE_ROUND") {
+        return new Promise(() => {});
+      }
+      return Promise.resolve({ ok: true, room: SETTLEMENT_SNAPSHOT });
+    });
+
+    await renderInSettlementPhase();
+
+    const continueButton = screen.getByRole("button", { name: /next round/i });
+    const resetButton = screen.getByRole("button", { name: /reset lobby/i });
+    const kickButton = screen.getByRole("button", { name: /kick guest/i });
+
+    expect(continueButton).toBeEnabled();
+    expect(resetButton).toBeEnabled();
+    expect(kickButton).toBeEnabled();
+
+    fireEvent.click(continueButton);
+
+    // The command that hung disables its own control...
+    expect(continueButton).toBeDisabled();
+    // ...but must not take down controls tied to other commands.
+    expect(resetButton).toBeEnabled();
+    expect(kickButton).toBeEnabled();
+
+    expect(sendRoomCommand).toHaveBeenCalledTimes(1);
+    expect(vi.mocked(sendRoomCommand).mock.calls[0]?.[1]).toMatchObject({
+      type: "ADVANCE_ROUND",
+    });
+  });
+
+  it("still blocks a double-submit of the same command", async () => {
+    vi.mocked(sendRoomCommand).mockReturnValue(new Promise(() => {}));
+
+    await renderInSettlementPhase();
+
+    const resetButton = screen.getByRole("button", { name: /reset lobby/i });
+
+    fireEvent.click(resetButton);
+    fireEvent.click(resetButton);
+
+    expect(resetButton).toBeDisabled();
+    // A second click on the same in-flight command must not fire a
+    // second request — this is the load-bearing double-submit guard.
+    expect(sendRoomCommand).toHaveBeenCalledTimes(1);
+  });
+
+  // Regression coverage for the timeout-sizing gap noted during review:
+  // START_ROOM / RETRY_ITEM_GENERATION can run a batched Gemini call plus
+  // up to MAX_ROUNDS sequential, uncapped Amazon lookups synchronously in
+  // the worker request path, so they must not share the same default
+  // timeout budget as a single-field command like RESET_TO_LOBBY.
+  it("gives RETRY_ITEM_GENERATION a longer timeout signal than a plain command", async () => {
+    const ERROR_SNAPSHOT = {
+      ...BASE_SNAPSHOT,
+      lifecycle: "active",
+      presence: {
+        players: { A: true, B: true },
+      },
+      game: {
+        mode: "Chaos Quant",
+        players: {
+          A: { id: "A", name: "Ada" },
+          B: { id: "B", name: "Grace" },
+        },
+        scores: { A: 0, B: 0 },
+        roles: { marketMaker: "A", trader: "B" },
+        roundNumber: 1,
+        totalRounds: 3,
+        log: [],
+        phase: "error",
+        error: "Item generation failed.",
+        previousPhase: "generatingItem",
+      },
+    } satisfies PublicRoomSnapshot;
+
+    vi.mocked(accessRoom).mockResolvedValue({ ok: true, room: ERROR_SNAPSHOT });
+    vi.mocked(sendRoomCommand).mockReturnValue(new Promise(() => {}));
+
+    render(<Home />);
+    const errorPanel = await screen.findByTestId("error-panel");
+    const retryButton = within(errorPanel).getByRole("button", {
+      name: /retry generation/i,
+    });
+    const resetButton = within(errorPanel).getByRole("button", {
+      name: /reset lobby/i,
+    });
+
+    fireEvent.click(retryButton);
+
+    expect(sendRoomCommand).toHaveBeenCalledTimes(1);
+    const retryOptions = vi.mocked(sendRoomCommand).mock.calls[0]?.[2];
+    // A plain command (e.g. RESET_TO_LOBBY) gets no signal override — it
+    // relies on room-client's own default timeout.
+    fireEvent.click(resetButton);
+    const resetOptions = vi.mocked(sendRoomCommand).mock.calls[1]?.[2];
+
+    expect(retryOptions?.signal).toBeInstanceOf(AbortSignal);
+    expect(resetOptions?.signal).toBeUndefined();
   });
 });
