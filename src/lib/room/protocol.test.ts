@@ -55,6 +55,7 @@ describe("room protocol", () => {
         value: {
           type: "CONFIGURE_ROOM",
           credential,
+          commandId: "command-configure-room-1",
           config: { totalRounds: "3" },
         },
         code: "config_invalid",
@@ -63,6 +64,7 @@ describe("room protocol", () => {
         value: {
           type: "SUBMIT_INITIAL_WIDTH",
           credential,
+          commandId: "command-submit-initial-width-1",
           width: 0,
         },
         code: "width_invalid",
@@ -71,6 +73,7 @@ describe("room protocol", () => {
         value: {
           type: "SUBMIT_MARKET_QUOTE",
           credential,
+          commandId: "command-submit-market-quote-1",
           quote: { bid: 10, ask: 5 },
         },
         code: "quote_invalid",
@@ -79,9 +82,25 @@ describe("room protocol", () => {
         value: {
           type: "EXECUTE_TRADE",
           credential,
+          commandId: "command-execute-trade-1",
           side: "HOLD",
         },
         code: "trade_side_invalid",
+      },
+      {
+        value: {
+          type: "START_ROOM",
+          credential,
+        },
+        code: "command_id_invalid",
+      },
+      {
+        value: {
+          type: "START_ROOM",
+          credential,
+          commandId: "not a valid command id!",
+        },
+        code: "command_id_invalid",
       },
     ] as const;
 
@@ -115,6 +134,7 @@ describe("room protocol", () => {
       {
         type: "RETRY_ITEM_GENERATION",
         credential,
+        commandId: "command-retry-item-generation-1",
       },
       NOW_MS,
     );
@@ -124,9 +144,84 @@ describe("room protocol", () => {
       command: {
         type: "RETRY_ITEM_GENERATION",
         credential,
+        commandId: "command-retry-item-generation-1",
         nowMs: NOW_MS,
       },
     });
+  });
+
+  it("requires a bounded, character-restricted commandId on every non-JOIN_ROOM command", () => {
+    const rejected = [
+      undefined,
+      42,
+      "",
+      "a".repeat(129),
+      "has spaces",
+      "has/slash",
+    ] as const;
+
+    for (const commandId of rejected) {
+      const result = parseClientRoomCommand(
+        {
+          type: "START_ROOM",
+          credential,
+          ...(commandId === undefined ? {} : { commandId }),
+        },
+        NOW_MS,
+      );
+
+      expect(result.ok).toBe(false);
+
+      if (result.ok) {
+        throw new Error(`Expected commandId ${JSON.stringify(commandId)} to be rejected.`);
+      }
+
+      expect(result.error.code).toBe("command_id_invalid");
+      expect(result.error.path).toBe("commandId");
+    }
+
+    const accepted = ["a", "a".repeat(128), "22b1b1d6-2f3e-4c9e-9a11-8f2a7f6f9c11"];
+
+    for (const commandId of accepted) {
+      const result = parseClientRoomCommand(
+        {
+          type: "START_ROOM",
+          credential,
+          commandId,
+        },
+        NOW_MS,
+      );
+
+      expect(result).toEqual({
+        ok: true,
+        command: {
+          type: "START_ROOM",
+          credential,
+          commandId,
+          nowMs: NOW_MS,
+        },
+      });
+    }
+  });
+
+  it("does not require or accept a commandId on JOIN_ROOM, since guest token minting has different replay consequences", () => {
+    const result = parseClientRoomCommand(
+      {
+        type: "JOIN_ROOM",
+        guestTokenHash: "a".repeat(16),
+        guestName: "Grace",
+        commandId: "should-be-ignored",
+      },
+      NOW_MS,
+    );
+
+    expect(result.ok).toBe(true);
+
+    if (!result.ok) {
+      throw new Error("Expected JOIN_ROOM to decode.");
+    }
+
+    expect("commandId" in result.command).toBe(false);
   });
 
   it("rejects caller-supplied settlement data at the runtime boundary", () => {

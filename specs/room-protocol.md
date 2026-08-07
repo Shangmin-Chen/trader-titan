@@ -27,18 +27,27 @@ The room protocol is the boundary between client transports and the pure room do
 
 ## Client Commands
 
-- `JOIN_ROOM`: guest display name and guest token hash.
-- `CONFIGURE_ROOM`: host credential and partial config.
-- `START_ROOM`: host credential.
-- `RESET_TO_LOBBY`: host credential.
-- `KICK_GUEST`: host credential.
-- `ADVANCE_ROUND`: host credential.
-- `RETRY_ITEM_GENERATION`: host credential. Accepted for active rooms whose game is `error` with `previousPhase === "generatingItem"`, retrying generation, **or** whose game is `settling` (the room can become durably stuck here if the settlement effect never ran after `EXECUTE_TRADE` committed the transition), retrying settlement for the current round from the already-committed item, quote, and side without regenerating the item or restarting the round. Rejected with `invalid_game_phase` in every other phase.
-- `SUBMIT_INITIAL_WIDTH`: active player credential and width.
-- `TIGHTEN_WIDTH`: active player credential and width.
-- `TRADE_ON_WIDTH`: active player credential.
-- `SUBMIT_MARKET_QUOTE`: active player credential and quote.
-- `EXECUTE_TRADE`: active player credential and side.
+- `JOIN_ROOM`: guest display name and guest token hash. No `commandId` (see Command Identity And Replay below).
+- `CONFIGURE_ROOM`: host credential, `commandId`, and partial config.
+- `START_ROOM`: host credential and `commandId`.
+- `RESET_TO_LOBBY`: host credential and `commandId`.
+- `KICK_GUEST`: host credential and `commandId`.
+- `ADVANCE_ROUND`: host credential and `commandId`.
+- `RETRY_ITEM_GENERATION`: host credential and `commandId`. Accepted for active rooms whose game is `error` with `previousPhase === "generatingItem"`, retrying generation, **or** whose game is `settling` (the room can become durably stuck here if the settlement effect never ran after `EXECUTE_TRADE` committed the transition), retrying settlement for the current round from the already-committed item, quote, and side without regenerating the item or restarting the round. Rejected with `invalid_game_phase` in every other phase.
+- `SUBMIT_INITIAL_WIDTH`: active player credential, `commandId`, and width.
+- `TIGHTEN_WIDTH`: active player credential, `commandId`, and width.
+- `TRADE_ON_WIDTH`: active player credential and `commandId`.
+- `SUBMIT_MARKET_QUOTE`: active player credential, `commandId`, and quote.
+- `EXECUTE_TRADE`: active player credential, `commandId`, and side.
+
+## Command Identity And Replay
+
+- Every client command other than `JOIN_ROOM` carries a client-generated `commandId`: an opaque, bounded, character-restricted string (not a secret). It is decoded and shape-validated the same as any other untrusted field.
+- The Durable Object recognizes a replay by the pair `(credential role, commandId)`, scoped per role so a guest cannot forge a commandId to collide with -- and block -- a future host command, or vice versa. Only commands that already succeeded are recorded, so an unauthorized or otherwise-rejected attempt can never poison the record and block a legitimate later command with the same id.
+- Recognizing a replay and persisting a newly-applied command's id both happen inside the same storage transaction as the command dispatch itself, so a replay can never race a fresh copy of the same command.
+- A recognized replay does not re-run the command. It returns the room's current state as an `ok: true` response instead of an error, and does not re-run any automatic effect (item generation, settlement fetch) that already ran for the original attempt. The client's revision guard makes applying that snapshot again a no-op, so a lost HTTP or WebSocket response converges silently instead of surfacing a confusing failure for a command that already committed.
+- `JOIN_ROOM` does not carry a `commandId`: replaying it does not silently re-apply a past mutation, it mints a fresh guest token, which is a different (and already separately handled) concern from replaying a game-state mutation.
+- This mechanism provides server-side idempotency only. Clients do not yet automatically retry commands after a failed or lost response; that remains a manual retry (the user clicking again), which this mechanism now makes safe.
 
 ## System Events
 

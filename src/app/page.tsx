@@ -551,6 +551,7 @@ function HomeContent() {
           {
             ...input,
             credential: activeSession.token,
+            commandId: crypto.randomUUID(),
             nowMs: Date.now(),
           } as RoomClientCommand,
           commandOptions,

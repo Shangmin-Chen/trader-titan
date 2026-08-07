@@ -75,6 +75,7 @@ describe("room dispatcher", () => {
           {
             type: "CONFIGURE_ROOM",
             credential: present(hostToken),
+            commandId: "command-configure-room-1",
             config: { totalRounds: 1 },
           },
           NOW_MS + 2,
@@ -89,6 +90,7 @@ describe("room dispatcher", () => {
           {
             type: "START_ROOM",
             credential: present(hostToken),
+            commandId: "command-start-room-1",
           },
           NOW_MS + 3,
         ),
@@ -112,6 +114,7 @@ describe("room dispatcher", () => {
         {
           type: "CONFIGURE_ROOM",
           credential: present(guestToken),
+          commandId: "command-configure-room-2",
           config: { totalRounds: 2 },
         },
         NOW_MS + 2,
@@ -140,6 +143,7 @@ describe("room dispatcher", () => {
         {
           type: "START_ROOM",
           credential: present(hostToken),
+          commandId: "command-start-room-2",
         },
         NOW_MS + 2,
       ),
@@ -196,6 +200,7 @@ describe("room dispatcher", () => {
           {
             type: "RETRY_ITEM_GENERATION",
             credential: present(hostToken),
+            commandId: "command-retry-item-generation-1",
           },
           NOW_MS + 4,
         ),
