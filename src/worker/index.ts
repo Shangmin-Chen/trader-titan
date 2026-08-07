@@ -700,10 +700,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       );
 
       if (!loaded.ok) {
-        await deletePrivateGeneratedItems(transaction);
-        await transaction.delete(ROOM_STORAGE_KEY);
-        await transaction.delete(PENDING_ROOM_EFFECT_STORAGE_KEY);
-        await transaction.deleteAlarm();
+        await purgeExpiredRoomState(transaction);
         return null;
       }
 
@@ -776,6 +773,12 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         );
 
         if (!loaded.ok) {
+          // The room expired in the gap between alarm()'s outer transaction
+          // and this one. loadStoredRoomEnvelope reporting "not ok" here
+          // means nothing is left to reschedule for - purge fully so the
+          // expired envelope, its private items, and the stale marker don't
+          // outlive the alarm that would otherwise have cleaned them up.
+          await purgeExpiredRoomState(transaction);
           return;
         }
 
@@ -797,6 +800,11 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       );
 
       if (!loaded.ok) {
+        // Same gap as the self-heal branch above: the room expired between
+        // alarm()'s outer transaction and this one. Purge fully rather than
+        // leaving an expired envelope and its private items with no alarm
+        // armed to clean them up later.
+        await purgeExpiredRoomState(transaction);
         return false;
       }
 
@@ -847,6 +855,10 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       );
 
       if (!loaded.ok) {
+        // The room expired before this exhaustion fallback could run. Purge
+        // fully rather than leaving an expired envelope and its private
+        // items behind with no alarm armed to clean them up later.
+        await purgeExpiredRoomState(transaction);
         return;
       }
 
@@ -870,6 +882,13 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       );
 
       if (!eventResult.ok) {
+        // The reducer unexpectedly rejected SETTLEMENT_FAILED even though
+        // the phase/round_id check just above passed. Give up on this
+        // exhausted pending effect rather than looping, but re-arm the
+        // alarm against the room's TTL deadline so it isn't silently
+        // dropped - the marker itself is no longer trustworthy either way.
+        await writePendingRoomEffect(transaction, null);
+        await scheduleNextAlarm(transaction, loaded.room, null);
         return;
       }
 
@@ -2455,6 +2474,24 @@ async function deletePrivateGeneratedItems(
   if (keys.length > 0) {
     await transaction.delete(keys);
   }
+}
+
+/**
+ * Full teardown for a room envelope that loadStoredRoomEnvelope has just
+ * reported as missing/expired/invalid: private generated items (which hold
+ * true_value), the room envelope itself, any pending-effect marker, and the
+ * alarm slot. Every call site that discovers expiry this way must run this
+ * rather than returning bare - alarms are one-shot, so leaving the alarm
+ * unset here would strand the expired envelope and its private items with
+ * nothing left to purge them.
+ */
+async function purgeExpiredRoomState(
+  transaction: DurableObjectTransaction
+): Promise<void> {
+  await deletePrivateGeneratedItems(transaction);
+  await transaction.delete(ROOM_STORAGE_KEY);
+  await transaction.delete(PENDING_ROOM_EFFECT_STORAGE_KEY);
+  await transaction.deleteAlarm();
 }
 
 function shouldDeletePrivateGeneratedItemsAfterCommand(

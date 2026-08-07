@@ -51,6 +51,7 @@ const STUCK_SETTLING_TTL_ROOM_NAME = "worker-room-stuck-settling-ttl";
 const STUCK_SETTLING_BOTH_DEADLINES_ROOM_NAME = "worker-room-stuck-settling-both-deadlines";
 const STUCK_SETTLING_EXHAUSTION_ROOM_NAME = "worker-room-stuck-settling-exhaustion";
 const STUCK_SETTLING_NO_DOUBLE_SETTLE_ROOM_NAME = "worker-room-stuck-settling-no-double-settle";
+const STUCK_SETTLING_MID_ALARM_EXPIRY_ROOM_NAME = "worker-room-stuck-settling-mid-alarm-expiry";
 const RETRY_SUCCESS_ROOM_NAME = "worker-room-retry-success";
 const RETRY_FAILURE_ROOM_NAME = "worker-room-retry-failure";
 const RETRY_UNAUTHORIZED_ROOM_NAME = "worker-room-retry-unauthorized";
@@ -1692,6 +1693,101 @@ describe("Cloudflare worker scaffold", () => {
     guestConnection.socket.close();
   });
 
+  it("purges storage and clears the alarm rather than leaking an expired room when it disappears mid-alarm-invocation (regression)", async () => {
+    // alarm() reads the room and its pending-effect marker in one outer
+    // transaction, then (for the mismatch/self-heal path) re-reads the room
+    // in a second, separate transaction inside runDueSettleEffect. Both
+    // reads share the same frozen `nowMs`, so under normal conditions they
+    // agree on whether the room has expired. The only way the second read
+    // can find the room gone when the first read found it fine is a
+    // concurrent write landing in the gap between the two transactions -
+    // this test reproduces that outcome directly by expiring storage and
+    // then invoking the inner method with a stale marker that forces the
+    // mismatch branch, exactly the shape alarm() would have handed it just
+    // before such a race.
+    const stub = roomStub(STUCK_SETTLING_MID_ALARM_EXPIRY_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created mid-alarm-expiry room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected generated item to be ready.");
+    }
+
+    const marketMakerToken = tokenForPlayer(
+      started.room.game.roles.marketMaker,
+      created.hostToken,
+      joined.guestToken
+    );
+    const traderToken = tokenForPlayer(
+      started.room.game.roles.trader,
+      created.hostToken,
+      joined.guestToken
+    );
+
+    await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_INITIAL_WIDTH",
+      credential: marketMakerToken,
+      width: 100
+    });
+    await applyRoomCommandWithoutTrueValue(stub, {
+      type: "TRADE_ON_WIDTH",
+      credential: traderToken
+    });
+    const quoted = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_MARKET_QUOTE",
+      credential: marketMakerToken,
+      quote: { bid: 3400, ask: 3500 }
+    });
+
+    expect(quoted.room.game.phase).toBe("choosingSide");
+
+    const stuck = await forceStuckSettling(stub, traderToken, "BUY");
+
+    await expect(readPendingRoomEffect(stub)).resolves.not.toBeNull();
+    await expect(privateGeneratedItemKeys(stub)).resolves.not.toEqual(noPrivateItemKeys());
+
+    // The room expires (simulating the concurrent write that would have
+    // raced alarm()'s two transactions in production). Deliberately do NOT
+    // arm an overdue DO alarm here (unlike expireStoredRoomEnvelope) -
+    // workerd in this harness can fire an overdue alarm opportunistically
+    // the moment the object is next touched (see forceStuckSettling's own
+    // comment on the same hazard), which would race runDueSettleEffectDirect
+    // below via the real alarm() entrypoint instead of isolating the exact
+    // method call this test means to exercise. Leaving the actually-scheduled
+    // alarm at its existing future TTL deadline avoids that entirely.
+    await expireStoredRoomEnvelopeWithoutArmingAlarm(stub);
+
+    // A marker whose roundId no longer matches the (pre-expiry) room
+    // forces runDueSettleEffect's first branch: the mismatch/self-heal path
+    // that reloads the room fresh and, prior to this fix, returned bare on
+    // !loaded.ok instead of purging.
+    const staleMismatchedPendingEffect: TestPendingRoomEffect = {
+      kind: "settle",
+      roundId: "round-that-no-longer-matches",
+      attempts: 0,
+      notBeforeMs: Date.now()
+    };
+
+    await runDueSettleEffectDirect(stub, stuck, staleMismatchedPendingEffect, Date.now());
+
+    await expect(storedRoomEnvelopeExists(stub)).resolves.toBe(false);
+    await expect(readPendingRoomEffect(stub)).resolves.toBeNull();
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual(noPrivateItemKeys());
+    await expect(storedRoomAlarm(stub)).resolves.toBeNull();
+
+    guestConnection.socket.close();
+  });
+
   it("deletes private generated items when resetting to the lobby", async () => {
     const stub = roomStub(RESET_PRIVATE_ITEM_ROOM_NAME);
     const created = await createRoom(stub, "Host");
@@ -3015,6 +3111,36 @@ async function runRoomCleanupAlarm(stub: GameRoomStub): Promise<void> {
   });
 }
 
+/**
+ * Invokes the DO's private runDueSettleEffect directly, bypassing alarm()'s
+ * outer transaction. alarm() freezes a single `nowMs` for its whole
+ * invocation, so a room that alarm()'s outer transaction found loadable
+ * cannot flip to "expired" for a later transaction within that same
+ * invocation unless the underlying storage genuinely changed out from under
+ * it (e.g. a concurrent write racing the two transactions) - the exact
+ * narrow race this helper reproduces deterministically by expiring storage
+ * first and then entering the method with the room/marker snapshot alarm()
+ * would have captured before that expiry.
+ */
+async function runDueSettleEffectDirect(
+  stub: GameRoomStub,
+  room: RoomState,
+  pendingEffect: TestPendingRoomEffect,
+  nowMs: number
+): Promise<void> {
+  await runInDurableObject(stub, async (instance) => {
+    await (
+      instance as unknown as {
+        runDueSettleEffect(
+          room: RoomState,
+          pendingEffect: TestPendingRoomEffect,
+          nowMs: number
+        ): Promise<void>;
+      }
+    ).runDueSettleEffect(room, pendingEffect, nowMs);
+  });
+}
+
 async function putStalePrivateGeneratedItem(
   stub: GameRoomStub,
   suffix: string
@@ -3078,6 +3204,37 @@ async function expireStoredRoomEnvelope(stub: GameRoomStub): Promise<void> {
       JSON.parse(JSON.stringify(toPersistenceEnvelope(expiredRoom, expiredAtMs))) as unknown
     );
     await state.storage.setAlarm(Date.now() - 1);
+  });
+}
+
+/**
+ * Same content mutation as expireStoredRoomEnvelope (rewrites the stored
+ * room so any future loadStoredRoomEnvelope/loadPersistenceEnvelope call
+ * sees it as expired), but deliberately leaves the DO's actually-scheduled
+ * alarm untouched instead of arming an overdue one. Some tests need the
+ * room to *read back* as expired without triggering workerd's opportunistic
+ * overdue-alarm firing in this harness (see forceStuckSettling's comment on
+ * the same hazard) - e.g. when isolating a direct call to a private
+ * effect-resume method rather than going through the real alarm().
+ */
+async function expireStoredRoomEnvelopeWithoutArmingAlarm(stub: GameRoomStub): Promise<void> {
+  await runInDurableObject(stub, async (_instance, state) => {
+    const loaded = loadPersistenceEnvelope(
+      await state.storage.get<unknown>(TEST_ROOM_STORAGE_KEY),
+      Date.now()
+    );
+
+    if (!loaded.ok) {
+      throw new Error(`Expected loadable room envelope: ${loaded.error.code}`);
+    }
+
+    const expiredAtMs = 1;
+    const expiredRoom = roomWithStorageTimestamps(loaded.room, expiredAtMs);
+
+    await state.storage.put(
+      TEST_ROOM_STORAGE_KEY,
+      JSON.parse(JSON.stringify(toPersistenceEnvelope(expiredRoom, expiredAtMs))) as unknown
+    );
   });
 }
 
