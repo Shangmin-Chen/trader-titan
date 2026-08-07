@@ -7,6 +7,7 @@ import {
 } from "../api/request-guards";
 import type { GameMode, ProviderGeneratedItem, SettledGeneratedItem } from "../lib/game";
 import {
+  authorizeRoomAccess,
   authorizeRoomAction,
   createLobbyRoom,
   dispatchRoomCommand,
@@ -728,6 +729,24 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       );
 
       if (findCommandDedupeEntry(dedupeEntries, command) !== undefined) {
+        // A dedupe hit only means *some* past command from this role used
+        // this commandId -- it says nothing about whether the credential on
+        // *this* request is still valid right now. The room may have kicked
+        // this guest or otherwise rotated tokens since then, so the replay
+        // short-circuit must not skip the same access check the normal
+        // dispatch path would have performed. Otherwise a kicked guest could
+        // replay their own last (pre-kick) commandId forever and keep
+        // reading the room's current state with no valid credential at all.
+        const access = authorizeRoomAccess(loaded.room, command.credential, verifyToken);
+
+        if (!access.ok) {
+          return {
+            ok: false,
+            status: statusForDomainError(access.error),
+            error: access.error
+          } as const;
+        }
+
         return {
           ok: true,
           room: loaded.room,
@@ -1365,6 +1384,12 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
 
     await persistRoomEnvelope(transaction, room, nowMs);
     await deletePrivateGeneratedItems(transaction);
+    // A prior room in this same Durable Object may have expired without its
+    // alarm having fired yet, leaving its command-dedupe record behind.
+    // Clearing it here (as the alarm-driven full cleanup also does) keeps a
+    // brand new room's dedupe history empty rather than inheriting entries
+    // minted under a completely different room lifetime and token set.
+    await transaction.delete(ROOM_COMMAND_DEDUPE_STORAGE_KEY);
 
     return {
       ok: true,

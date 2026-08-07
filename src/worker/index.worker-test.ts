@@ -65,6 +65,7 @@ const ADVANCE_PRESENCE_ROOM_NAME = "worker-room-advance-presence";
 const RESET_STALE_SOCKET_ROOM_NAME = "worker-room-reset-stale-socket";
 const TIGHTEN_REPLAY_SAME_ID_ROOM_NAME = "worker-room-tighten-replay-same-id";
 const TIGHTEN_REPLAY_DIFFERENT_ID_ROOM_NAME = "worker-room-tighten-replay-different-id";
+const KICKED_GUEST_REPLAY_ROOM_NAME = "worker-room-kicked-guest-replay";
 const GAME_ROOM_SMOKE_URL = "https://trader-titan.worker.test/room";
 const ROOM_COMMAND_URL = `${GAME_ROOM_SMOKE_URL}/command`;
 const ROOM_JOIN_URL = `${GAME_ROOM_SMOKE_URL}/join`;
@@ -703,6 +704,92 @@ describe("Cloudflare worker scaffold", () => {
     );
 
     guestConnection.socket.close();
+  });
+
+  it("rejects a kicked guest's replay of their own pre-kick commandId instead of leaking current room state", async () => {
+    // A dedupe hit only proves *some* past command from this role used this
+    // commandId -- it says nothing about whether the credential on the
+    // replay request is still valid right now. If the replay short-circuit
+    // skipped authorization, a guest who was kicked (and whose token is now
+    // stale) could keep "successfully" replaying their last pre-kick
+    // commandId forever and read the room's current state -- who else has
+    // joined, current config, and so on -- with no valid credential at all.
+    // The commandId and credential used in the replay are genuinely the
+    // kicked guest's own, from a command that really did succeed before the
+    // kick, so this is not a guessing attack -- it must be rejected on
+    // authorization, not on the attacker failing to guess anything.
+    const stub = roomStub(KICKED_GUEST_REPLAY_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created kicked-guest-replay room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected a room ready for width proposal.");
+    }
+
+    const proposed = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_INITIAL_WIDTH",
+      credential: created.hostToken,
+      width: 10
+    });
+
+    if (proposed.room.game.phase !== "negotiatingWidth") {
+      throw new Error("Expected negotiating width phase.");
+    }
+
+    // aiGenerated rooms keep round-1 roles unswapped: A is marketMaker, B is
+    // trader, so the guest (B) is the active player for TIGHTEN_WIDTH here.
+    const guestTightenCommand = {
+      type: "TIGHTEN_WIDTH",
+      credential: joined.guestToken,
+      commandId: "kicked-guest-replay-tighten",
+      width: 6
+    };
+
+    const tightenResponse = await postRoomCommand(stub, guestTightenCommand);
+    const tightened = await expectPublicJson<CommandRoomResponse>(tightenResponse);
+
+    expect(tightenResponse.status).toBe(HTTP_OK_STATUS);
+
+    if (tightened.room.game.phase !== "negotiatingWidth") {
+      throw new Error("Expected negotiating width phase after tighten.");
+    }
+
+    expect(tightened.room.game.spreadWidth).toBe(6);
+
+    const guestClosed = nextSocketClose(guestConnection.socket);
+    const kicked = await applyRoomCommand(stub, {
+      type: "KICK_GUEST",
+      credential: created.hostToken
+    });
+
+    expect(kicked.room.lifecycle).toBe("lobby");
+    expect(kicked.room.seats.guest.occupied).toBe(false);
+    await expect(guestClosed).resolves.toBeUndefined();
+
+    // The kicked guest resends their own last pre-kick command verbatim.
+    const replayResponse = await postRoomCommand(stub, guestTightenCommand);
+    const replay = await expectPublicJson<{ ok: false; error: { code: string } }>(
+      replayResponse
+    );
+
+    expect(replayResponse.status).toBe(403);
+    expect(replay.ok).toBe(false);
+    expect(replay.error.code).toBe("stale_guest");
+
+    const persisted = await accessRoom(stub, created.hostToken);
+
+    expect(persisted.room).toEqual(kicked.room);
   });
 
   it("rejects HTTP START_ROOM when a joined guest has no live socket", async () => {
