@@ -1,0 +1,142 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# A newer push to the same PR makes the in-flight run obsolete. Cancel it.
+# `main` runs are not cancelled: each merge commit's result is worth recording
+# on its own, and they are what a future bisect reads.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  # Matches the Node version this project is developed against (@types/node ^26).
+  NODE_VERSION: "26"
+
+jobs:
+  # Fast feedback: everything that needs no browser and no Cloudflare build.
+  # Typically finishes in a couple of minutes, so a broken PR fails quickly
+  # instead of waiting on the e2e job.
+  check:
+    name: Typecheck, lint & tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      # `npm test` (jsdom) and `npm run worker-test` (real workerd via
+      # @cloudflare/vitest-pool-workers) are separate runners with separate
+      # configs, so both are required. Neither needs secrets: the worker pool
+      # supplies its bindings inline in vitest.worker.config.ts.
+      - name: Unit tests
+        run: npm test
+
+      - name: Worker tests
+        run: npm run worker-test
+
+  # Browser-level coverage. Split out because it needs a full OpenNext build,
+  # `wrangler dev`, and a Chromium download — minutes of setup the `check` job
+  # should never wait on.
+  e2e:
+    name: End-to-end (Playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Cache the browser binaries against the resolved Playwright version, so
+      # a dependency bump invalidates the cache instead of silently running the
+      # old browser against the new client.
+      - name: Resolve Playwright version
+        id: pw
+        run: echo "version=$(node -p "require('@playwright/test/package.json').version")" >> "$GITHUB_OUTPUT"
+
+      - name: Cache Playwright browsers
+        id: pw-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ steps.pw.outputs.version }}
+
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps chromium
+        if: steps.pw-cache.outputs.cache-hit != 'true'
+
+      # Even on a cache hit the OS-level shared libraries are not cached, so
+      # install just those.
+      - name: Install browser system dependencies
+        run: npx playwright install-deps chromium
+        if: steps.pw-cache.outputs.cache-hit == 'true'
+
+      # playwright.config.ts starts its own server via `webServer`
+      # (`npm run build:cloudflare && wrangler dev ... --port 8787`) and passes
+      # `--var WORKER_ITEM_PROVIDER:deterministic`, so no live Gemini or Amazon
+      # calls are made and no API key is required. scripts/build-cloudflare.mjs
+      # blanks GEMINI_API_KEY for the build and then fails if any secret value
+      # reaches the emitted artifacts.
+      #
+      # Only chromium runs here. The mobile-chrome project uses the same engine
+      # and only changes viewport, so it doubles the wall clock for very little
+      # additional signal on a PR.
+      - name: Run Playwright tests
+        run: npx playwright test --project=chromium
+
+      - name: Upload Playwright report
+        uses: actions/upload-artifact@v4
+        # Always upload: a red run is exactly when the trace and report matter.
+        if: ${{ !cancelled() }}
+        with:
+          name: playwright-report
+          path: |
+            playwright-report/
+            test-results/
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # A single required-status target. Branch protection can require just this
+  # one check instead of being updated every time a job is added or renamed.
+  # Depending on jobs is not enough on its own: a skipped or cancelled
+  # dependency still satisfies `needs`, so the results are asserted explicitly.
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    needs: [check, e2e]
+    if: always()
+    steps:
+      - name: Verify required jobs succeeded
+        run: |
+          echo "check: ${{ needs.check.result }}"
+          echo "e2e:   ${{ needs.e2e.result }}"
+          if [ "${{ needs.check.result }}" != "success" ] || [ "${{ needs.e2e.result }}" != "success" ]; then
+            echo "::error::One or more required CI jobs did not succeed."
+            exit 1
+          fi
