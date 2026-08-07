@@ -63,6 +63,9 @@ const SOCKET_ADVANCE_OFFLINE_ROOM_NAME = "worker-room-socket-advance-offline";
 const SOCKET_PRESENCE_ROOM_NAME = "worker-room-socket-presence";
 const ADVANCE_PRESENCE_ROOM_NAME = "worker-room-advance-presence";
 const RESET_STALE_SOCKET_ROOM_NAME = "worker-room-reset-stale-socket";
+const HOST_SOCKET_EVICTION_ROOM_NAME = "worker-room-host-socket-eviction";
+const GUEST_SOCKET_CHURN_ROOM_NAME = "worker-room-guest-socket-churn";
+const PING_PONG_ROOM_NAME = "worker-room-ping-pong";
 const GAME_ROOM_SMOKE_URL = "https://trader-titan.worker.test/room";
 const ROOM_COMMAND_URL = `${GAME_ROOM_SMOKE_URL}/command`;
 const ROOM_JOIN_URL = `${GAME_ROOM_SMOKE_URL}/join`;
@@ -1525,77 +1528,45 @@ describe("Cloudflare worker scaffold", () => {
       throw new Error("Expected a newly created WebSocket command room.");
     }
 
-    const firstConnection = await openRoomSocket(stub, created.hostToken);
-    const firstHostConnect = nextSocketMessage<RoomSnapshotSocketMessage>(firstConnection.socket);
-    const secondConnection = await openRoomSocket(stub, created.hostToken);
+    const hostConnection = await openRoomSocket(stub, created.hostToken);
 
-    expect(firstConnection.initial).toMatchObject({
-      type: "ROOM_SNAPSHOT",
-      room: roomWithPresence(created.room, { A: true, B: false })
-    });
-    expect(secondConnection.initial).toMatchObject({
-      type: "ROOM_SNAPSHOT",
-      room: roomWithPresence(created.room, { A: true, B: false })
-    });
-    await expect(firstHostConnect).resolves.toMatchObject({
+    expect(hostConnection.initial).toMatchObject({
       type: "ROOM_SNAPSHOT",
       room: roomWithPresence(created.room, { A: true, B: false })
     });
 
-    const firstJoin = nextSocketMessage<RoomSnapshotSocketMessage>(firstConnection.socket);
-    const secondJoin = nextSocketMessage<RoomSnapshotSocketMessage>(secondConnection.socket);
+    const hostJoin = nextSocketMessage<RoomSnapshotSocketMessage>(hostConnection.socket);
     const joined = await joinRoom(stub, "Guest");
 
-    await expect(firstJoin).resolves.toMatchObject({
-      type: "ROOM_SNAPSHOT",
-      room: joined.room
-    });
-    await expect(secondJoin).resolves.toMatchObject({
+    await expect(hostJoin).resolves.toMatchObject({
       type: "ROOM_SNAPSHOT",
       room: joined.room
     });
 
-    const firstGuestConnect = nextSocketMessage<RoomSnapshotSocketMessage>(firstConnection.socket);
-    const secondGuestConnect = nextSocketMessage<RoomSnapshotSocketMessage>(secondConnection.socket);
+    const hostGuestConnect = nextSocketMessage<RoomSnapshotSocketMessage>(hostConnection.socket);
     const guestConnection = await openRoomSocket(stub, joined.guestToken);
 
     expect(guestConnection.initial).toMatchObject({
       type: "ROOM_SNAPSHOT",
       room: roomWithPresence(joined.room, { A: true, B: true })
     });
-    await expect(firstGuestConnect).resolves.toMatchObject({
-      type: "ROOM_SNAPSHOT",
-      room: roomWithPresence(joined.room, { A: true, B: true })
-    });
-    await expect(secondGuestConnect).resolves.toMatchObject({
+    await expect(hostGuestConnect).resolves.toMatchObject({
       type: "ROOM_SNAPSHOT",
       room: roomWithPresence(joined.room, { A: true, B: true })
     });
 
-    const firstStarted = nextSocketMessage<RoomSnapshotSocketMessage>(firstConnection.socket);
-    const secondStarted = nextSocketMessage<RoomSnapshotSocketMessage>(secondConnection.socket);
+    const hostStarted = nextSocketMessage<RoomSnapshotSocketMessage>(hostConnection.socket);
     const guestStarted = nextSocketMessage<RoomSnapshotSocketMessage>(guestConnection.socket);
 
-    firstConnection.socket.send(JSON.stringify({
+    hostConnection.socket.send(JSON.stringify({
       type: "START_ROOM",
       credential: created.hostToken
     }));
 
-    const firstStartedMessage = await firstStarted;
-    const secondStartedMessage = await secondStarted;
+    const hostStartedMessage = await hostStarted;
     const guestStartedMessage = await guestStarted;
 
-    expect(firstStartedMessage).toMatchObject({
-      type: "ROOM_SNAPSHOT",
-      room: {
-        lifecycle: "active",
-        game: {
-          phase: "proposingWidth"
-        },
-        revision: 3
-      }
-    });
-    expect(secondStartedMessage).toMatchObject({
+    expect(hostStartedMessage).toMatchObject({
       type: "ROOM_SNAPSHOT",
       room: {
         lifecycle: "active",
@@ -1615,11 +1586,9 @@ describe("Cloudflare worker scaffold", () => {
         revision: 3
       }
     });
-    expectRoomPresence(firstStartedMessage.room, { A: true, B: true });
-    expectRoomPresence(secondStartedMessage.room, { A: true, B: true });
+    expectRoomPresence(hostStartedMessage.room, { A: true, B: true });
     expectRoomPresence(guestStartedMessage.room, { A: true, B: true });
-    expect(JSON.stringify(firstStartedMessage)).not.toContain("true_value");
-    expect(JSON.stringify(secondStartedMessage)).not.toContain("true_value");
+    expect(JSON.stringify(hostStartedMessage)).not.toContain("true_value");
     expect(JSON.stringify(guestStartedMessage)).not.toContain("true_value");
 
     const persisted = await accessRoom(roomStub(SOCKET_COMMAND_ROOM_NAME), created.hostToken);
@@ -1627,9 +1596,43 @@ describe("Cloudflare worker scaffold", () => {
     expect(persisted.room.lifecycle).toBe("active");
     expect(persisted.room.revision).toBe(3);
 
-    firstConnection.socket.close();
-    secondConnection.socket.close();
+    hostConnection.socket.close();
     guestConnection.socket.close();
+  });
+
+  it("evicts a prior host socket for the same seat when a new host socket connects", async () => {
+    const stub = roomStub(HOST_SOCKET_EVICTION_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created host eviction room.");
+    }
+
+    const firstConnection = await openRoomSocket(stub, created.hostToken);
+    const firstClosed = nextSocketCloseCode(firstConnection.socket);
+    const secondConnection = await openRoomSocket(stub, created.hostToken);
+
+    // The client-side RoomSocketSupervisor treats 1008 as the one
+    // non-retryable "you were superseded" code (see
+    // isRetryableRoomSocketCloseCode in room-socket-supervisor.ts). Any
+    // other code here would make the evicted tab reconnect and evict the
+    // new socket right back, fighting forever.
+    await expect(firstClosed).resolves.toEqual({
+      code: 1008,
+      reason: "Room seat opened a new socket."
+    });
+    expect(secondConnection.initial).toMatchObject({
+      type: "ROOM_SNAPSHOT",
+      room: roomWithPresence(created.room, { A: true, B: false })
+    });
+
+    const liveSocketReadyStates = await runInDurableObject(stub, (_instance, state) =>
+      state.getWebSockets().map((socket) => socket.readyState)
+    );
+
+    expect(liveSocketReadyStates).toEqual([WebSocket.OPEN]);
+
+    secondConnection.socket.close();
   });
 
   it("sends ROOM_ERROR for WebSocket START_ROOM when a joined guest is offline", async () => {
@@ -2042,6 +2045,122 @@ describe("Cloudflare worker scaffold", () => {
 
     expect(persisted.room).toEqual(roomWithPresence(joined.room, { A: true, B: false }));
     expect(persisted.room).not.toEqual(created.room);
+
+    connection.socket.close();
+  });
+
+  it("evicts churned guest sockets so presence never leaks a phantom seat", async () => {
+    const stub = roomStub(GUEST_SOCKET_CHURN_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created guest socket churn room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const hostConnection = await openRoomSocket(stub, created.hostToken);
+
+    expect(hostConnection.initial).toMatchObject({
+      type: "ROOM_SNAPSHOT",
+      room: roomWithPresence(joined.room, { A: true, B: false })
+    });
+
+    const CHURN_ATTEMPTS = 20;
+    let lastGuestConnection: RoomSocketConnection | null = null;
+    let firstGuestClosed: Promise<{ code: number; reason: string }> | null = null;
+
+    for (let attempt = 0; attempt < CHURN_ATTEMPTS; attempt += 1) {
+      // Deliberately do not close the previous guest socket before opening
+      // the next one. Without per-seat eviction, these would pile up as
+      // zombie sockets that still count toward presence for seat B.
+      lastGuestConnection = await openRoomSocket(stub, joined.guestToken);
+
+      if (attempt === 0) {
+        // Capture the very first guest socket's close code: it is evicted
+        // by attempt 1 below, and that eviction must use the same
+        // non-retryable 1008 code as the host-eviction test above, or a
+        // churning guest client would reconnect-loop against itself.
+        firstGuestClosed = nextSocketCloseCode(lastGuestConnection.socket);
+      }
+
+      expectRoomPresence(lastGuestConnection.initial.room, { A: true, B: true });
+    }
+
+    if (lastGuestConnection === null || firstGuestClosed === null) {
+      throw new Error("Expected at least one churned guest connection.");
+    }
+
+    await expect(firstGuestClosed).resolves.toEqual({
+      code: 1008,
+      reason: "Room seat opened a new socket."
+    });
+
+    const seatKeys = await runInDurableObject(stub, (_instance, state) =>
+      state.getWebSockets().map((socket) => {
+        const attachment = socket.deserializeAttachment() as {
+          role: string;
+          tokenHash: string;
+        };
+
+        return `${attachment.role}:${attachment.tokenHash}`;
+      })
+    );
+
+    // At most one live socket per (role, tokenHash): two seats, two sockets,
+    // no duplicates, regardless of how many times the guest reconnected.
+    expect(seatKeys.sort()).toHaveLength(2);
+    expect(new Set(seatKeys).size).toBe(2);
+
+    const stillConnected = await accessRoom(stub, created.hostToken);
+
+    expectRoomPresence(stillConnected.room, { A: true, B: true });
+    // Presence-only broadcasts (every churned connect/evict) must not
+    // increment the room revision; only real room mutations do.
+    expect(stillConnected.room.revision).toBe(joined.room.revision);
+
+    lastGuestConnection.socket.close();
+
+    const afterGuestClose = await waitForRoomPresence(stub, created.hostToken, {
+      A: true,
+      B: false
+    });
+
+    expectRoomPresence(afterGuestClose.room, { A: true, B: false });
+    expect(afterGuestClose.room.revision).toBe(joined.room.revision);
+
+    hostConnection.socket.close();
+  });
+
+  it("registers a tt-ping/tt-pong WebSocket auto-response pair that bypasses the room command handler", async () => {
+    const stub = roomStub(PING_PONG_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created ping-pong room.");
+    }
+
+    const registeredPair = await runInDurableObject(stub, (_instance, state) => {
+      const pair = state.getWebSocketAutoResponse();
+
+      return pair === null ? null : { request: pair.request, response: pair.response };
+    });
+
+    expect(registeredPair).toEqual({ request: "tt-ping", response: "tt-pong" });
+
+    const connection = await openRoomSocket(stub, created.hostToken);
+    const pong = nextRawSocketMessage(connection.socket);
+
+    connection.socket.send("tt-ping");
+
+    // The edge auto-responder must reply with the raw "tt-pong" string
+    // directly. If it fell through to webSocketMessage instead, that
+    // handler would try to JSON-decode "tt-ping" as a command and reply
+    // with a JSON ROOM_ERROR message instead of the raw pong text.
+    await expect(pong).resolves.toBe("tt-pong");
+
+    const persisted = await accessRoom(stub, created.hostToken);
+
+    expect(persisted.room.revision).toBe(created.room.revision);
 
     connection.socket.close();
   });
@@ -2717,6 +2836,34 @@ function nextSocketMessage<T>(socket: WebSocket): Promise<T> {
   });
 }
 
+/**
+ * Waits for the next raw text socket message without JSON-decoding it, for
+ * asserting on non-JSON protocol frames such as the "tt-pong" auto-response.
+ */
+function nextRawSocketMessage(socket: WebSocket): Promise<string> {
+  return new Promise<string>((resolve, reject) => {
+    const onMessage = (event: MessageEvent): void => {
+      clearTimeout(timeout);
+      socket.removeEventListener("message", onMessage as EventListener);
+
+      if (typeof event.data !== "string") {
+        reject(new Error("Expected room socket message data to be a string."));
+
+        return;
+      }
+
+      resolve(event.data);
+    };
+
+    const timeout = setTimeout(() => {
+      socket.removeEventListener("message", onMessage as EventListener);
+      reject(new Error("Timed out waiting for raw room socket message."));
+    }, SOCKET_MESSAGE_TIMEOUT_MS);
+
+    socket.addEventListener("message", onMessage as EventListener);
+  });
+}
+
 function nextSocketClose(socket: WebSocket): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     const timeout = setTimeout(() => {
@@ -2727,6 +2874,33 @@ function nextSocketClose(socket: WebSocket): Promise<void> {
       clearTimeout(timeout);
       socket.removeEventListener("close", onClose as EventListener);
       resolve();
+    };
+
+    socket.addEventListener("close", onClose as EventListener);
+  });
+}
+
+/**
+ * Like `nextSocketClose`, but surfaces the close code/reason instead of
+ * discarding them. The reconnect supervisor's entire "do not loop forever
+ * evicting yourself" guarantee (see `room-socket-supervisor.ts`) hinges on
+ * the server evicting a superseded socket with exactly code 1008 — that is
+ * the one non-retryable code the client treats as terminal instead of
+ * scheduling a reconnect. `nextSocketClose` alone would pass this test even
+ * if `closeSocketQuietly`'s primary `socket.close(1008, reason)` call
+ * silently threw and fell back to a codeless `socket.close()`, so callers
+ * that care about eviction specifically should assert on the code here.
+ */
+function nextSocketCloseCode(socket: WebSocket): Promise<{ code: number; reason: string }> {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      socket.removeEventListener("close", onClose as EventListener);
+      reject(new Error("Timed out waiting for room socket close."));
+    }, SOCKET_MESSAGE_TIMEOUT_MS);
+    const onClose = (event: CloseEvent): void => {
+      clearTimeout(timeout);
+      socket.removeEventListener("close", onClose as EventListener);
+      resolve({ code: event.code, reason: event.reason });
     };
 
     socket.addEventListener("close", onClose as EventListener);
