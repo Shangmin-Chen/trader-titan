@@ -2084,6 +2084,8 @@ function phaseLabel(phase: string): string {
       return "Setting market";
     case "choosingSide":
       return "Choosing side";
+    case "roundForfeited":
+      return "Round forfeited";
     case "gameOver":
       return "Game over";
     default:
