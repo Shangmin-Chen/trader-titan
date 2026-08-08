@@ -2,6 +2,7 @@ import { calculateSettlement } from "./settlement";
 import {
   createInitialGameState,
   executeTrade,
+  expireTurn,
   gameReducer,
   nextRound,
   receiveItem,
@@ -14,14 +15,15 @@ import {
   tightenWidth,
   tradeOnWidth,
 } from "./index";
-import type {
-  GameAction,
-  GameState,
-  GeneratedItem,
-  RoundSettlement,
-  SettledGeneratedItem,
-  StartGamePayload,
-  TradeSide,
+import {
+  PROPOSING_WIDTH_FORFEIT_PENALTY,
+  type GameAction,
+  type GameState,
+  type GeneratedItem,
+  type RoundSettlement,
+  type SettledGeneratedItem,
+  type StartGamePayload,
+  type TradeSide,
 } from "./types";
 
 const startPayload: StartGamePayload = {
@@ -131,13 +133,16 @@ describe("game reducer", () => {
 
     const invalidCases: Array<{ action: GameAction; state: GameState }> = [
       { state: generating, action: { type: "START_GAME", payload: startPayload } },
-      { state: setup, action: { type: "ITEM_RECEIVED", item } },
+      { state: setup, action: { type: "ITEM_RECEIVED", item, turnDeadlineMs: 0 } },
       { state: setup, action: { type: "ITEM_FAILED", error: "no item" } },
       { state: setup, action: { type: "RETRY_ITEM_GENERATION" } },
-      { state: setup, action: { type: "SUBMIT_INITIAL_WIDTH", width: 500 } },
-      { state: setup, action: { type: "TIGHTEN_WIDTH", width: 200 } },
-      { state: setup, action: { type: "TRADE_ON_WIDTH" } },
-      { state: setup, action: { type: "SUBMIT_MARKET_QUOTE", quote: { bid: 1, ask: 2 } } },
+      { state: setup, action: { type: "SUBMIT_INITIAL_WIDTH", width: 500, turnDeadlineMs: 0 } },
+      { state: setup, action: { type: "TIGHTEN_WIDTH", width: 200, turnDeadlineMs: 0 } },
+      { state: setup, action: { type: "TRADE_ON_WIDTH", turnDeadlineMs: 0 } },
+      {
+        state: setup,
+        action: { type: "SUBMIT_MARKET_QUOTE", quote: { bid: 1, ask: 2 }, turnDeadlineMs: 0 },
+      },
       { state: setup, action: { type: "MARKET_COMMIT_FAILED", error: "failed" } },
       { state: setup, action: { type: "EXECUTE_TRADE", side: "SELL" } },
       {
@@ -148,7 +153,9 @@ describe("game reducer", () => {
           settlement: settlementPayload.settlement,
         },
       },
-      { state: setup, action: { type: "SETTLEMENT_FAILED", error: "failed" } },
+      { state: setup, action: { type: "SETTLEMENT_FAILED", error: "failed", turnDeadlineMs: 0 } },
+      { state: setup, action: { type: "TURN_EXPIRED" } },
+      { state: settling, action: { type: "TURN_EXPIRED" } },
       { state: setup, action: { type: "NEXT_ROUND" } },
       { state: gameOver, action: { type: "EXECUTE_TRADE", side: "BUY" } },
     ];
@@ -252,12 +259,13 @@ describe("game reducer", () => {
     expect("true_value" in settling.item).toBe(false);
   });
 
-  it("returns to side choice without revealing true value after failed settlement", () => {
+  it("returns to side choice without revealing true value after failed settlement, with a fresh turn deadline", () => {
     const choosing = readyForSideChoice({ bid: 200, ask: 400 });
     const settling = executeTrade(choosing, "BUY");
     const failed = gameReducer(settling, {
       type: "SETTLEMENT_FAILED",
       error: "Settlement failed.",
+      turnDeadlineMs: 999,
     });
 
     expect(failed.phase).toBe("choosingSide");
@@ -271,6 +279,7 @@ describe("game reducer", () => {
     expect("true_value" in failed.item).toBe(false);
     expect("pendingSide" in failed).toBe(false);
     expect(failed.lastError).toBe("Settlement failed.");
+    expect(failed.turnDeadlineMs).toBe(999);
   });
 
   it("retries item generation errors without dropping round context or log history", () => {
@@ -322,6 +331,7 @@ describe("game reducer", () => {
     const failed = gameReducer(settling, {
       type: "SETTLEMENT_FAILED",
       error: "Settlement failed.",
+      turnDeadlineMs: 999,
     });
     const nonItemError: GameState = {
       ...failed,
@@ -460,5 +470,134 @@ describe("game reducer", () => {
     // Roles for Round 2 normally are { marketMaker: "B", trader: "A" }
     // For Amazon Custom Query, it should be swapped to { marketMaker: "A", trader: "B" }
     expect(round2State.roles).toEqual({ marketMaker: "A", trader: "B" });
+  });
+
+  describe("F-05 turn shot clock", () => {
+    it("forfeits the round on turn expiry and applies the zero-sum penalty against the width in play", () => {
+      // negotiatingWidth: the trader (B by default) is on the clock.
+      const negotiating = submitInitialWidth(readyForWidth(), 500);
+      const expired = expireTurn(negotiating);
+
+      expect(expired.phase).toBe("roundForfeited");
+
+      if (expired.phase !== "roundForfeited") {
+        throw new Error("Expected roundForfeited state.");
+      }
+      expect(expired.forfeit).toMatchObject({
+        roundNumber: 1,
+        itemTitle: item.item_title,
+        phase: "negotiatingWidth",
+        forfeitedBy: "B",
+        awardedTo: "A",
+        penalty: 500,
+      });
+      expect(expired.scores).toEqual({ A: 500, B: -500 });
+    });
+
+    it("forfeits proposingWidth using the named fallback penalty since no width has been proposed yet", () => {
+      // proposingWidth: the market maker (A by default) is on the clock.
+      const proposing = readyForWidth();
+      const expired = expireTurn(proposing);
+
+      expect(expired.phase).toBe("roundForfeited");
+
+      if (expired.phase !== "roundForfeited") {
+        throw new Error("Expected roundForfeited state.");
+      }
+      expect(expired.forfeit).toMatchObject({
+        phase: "proposingWidth",
+        forfeitedBy: "A",
+        awardedTo: "B",
+        penalty: PROPOSING_WIDTH_FORFEIT_PENALTY,
+      });
+      expect(expired.scores).toEqual({
+        A: -PROPOSING_WIDTH_FORFEIT_PENALTY,
+        B: PROPOSING_WIDTH_FORFEIT_PENALTY,
+      });
+    });
+
+    it("forfeits configuringMarket and choosingSide against whichever player is on the clock there", () => {
+      const configuring = tradeOnWidth(tightenWidth(submitInitialWidth(readyForWidth(), 500), 200));
+      const expiredMarket = expireTurn(configuring);
+
+      expect(expiredMarket.phase).toBe("roundForfeited");
+      if (expiredMarket.phase !== "roundForfeited") {
+        throw new Error("Expected roundForfeited state.");
+      }
+      // negotiatingWidth's TIGHTEN_WIDTH swapped roles, so B is now
+      // marketMaker and on the clock in configuringMarket.
+      expect(expiredMarket.forfeit).toMatchObject({
+        phase: "configuringMarket",
+        forfeitedBy: "B",
+        awardedTo: "A",
+        penalty: 200,
+      });
+
+      const choosing = submitMarketQuote(configuring, { bid: 100, ask: 300 });
+      const expiredSide = expireTurn(choosing);
+
+      expect(expiredSide.phase).toBe("roundForfeited");
+      if (expiredSide.phase !== "roundForfeited") {
+        throw new Error("Expected roundForfeited state.");
+      }
+      // choosingSide waits on the trader, which is A after the tighten swap.
+      expect(expiredSide.forfeit).toMatchObject({
+        phase: "choosingSide",
+        forfeitedBy: "A",
+        awardedTo: "B",
+        penalty: 200,
+      });
+    });
+
+    it("rejects TURN_EXPIRED outside the four actionable phases, leaving state untouched", () => {
+      const singleRoundPayload: StartGamePayload = { ...startPayload, totalRounds: 1 };
+      const setup = createInitialGameState();
+      const generating = startGame(setup, singleRoundPayload);
+      const choosing = readyForSideChoice({ bid: 200, ask: 400 });
+      const settling = executeTrade(choosing, "BUY");
+      const settlement = settleTrade(
+        submitMarketQuote(
+          tradeOnWidth(submitInitialWidth(receiveItem(generating, item), 200)),
+          { bid: 200, ask: 400 },
+        ),
+        "BUY",
+        300,
+      );
+      const gameOver = nextRound(settlement);
+
+      expect(gameOver.phase).toBe("gameOver");
+
+      for (const state of [setup, generating, settling, settlement, gameOver]) {
+        expect(gameReducer(state, { type: "TURN_EXPIRED" })).toBe(state);
+      }
+    });
+
+    it("advances from a round forfeit exactly like from settlement, including to game over on the final round", () => {
+      const singleRoundPayload: StartGamePayload = { ...startPayload, totalRounds: 1 };
+      const proposing = receiveItem(startGame(createInitialGameState(), singleRoundPayload), item);
+      const forfeited = expireTurn(proposing);
+
+      expect(forfeited.phase).toBe("roundForfeited");
+
+      const over = nextRound(forfeited);
+
+      expect(over.phase).toBe("gameOver");
+
+      if (over.phase !== "gameOver") {
+        throw new Error("Expected game over state.");
+      }
+      expect(over.scores.A + over.scores.B).toBe(0);
+      expect(over.winner).toBe("B");
+    });
+
+    it("advances a round forfeit into the next round (not final) with fresh roles", () => {
+      const proposing = readyForWidth();
+      const forfeited = expireTurn(proposing);
+      const round2 = nextRound(forfeited);
+
+      expect(round2.phase).toBe("generatingItem");
+      expect(round2.roundNumber).toBe(2);
+      expect(round2.roles).toEqual({ marketMaker: "B", trader: "A" });
+    });
   });
 });

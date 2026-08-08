@@ -19,11 +19,13 @@ import {
   LiveAnnouncerProvider,
   MarketRangeForm,
   PhaseStepper,
+  RoundForfeitPanel,
   Scoreboard,
   SettlementPanel,
   SpreadWidthForm,
   TradeActionPanel,
   TurnBanner,
+  TurnCountdown,
   WidthNegotiationPanel,
   useAnnouncer,
   type PhaseStep,
@@ -101,6 +103,7 @@ function phaseToStepId(phase: string): string | null {
       return "trade";
     case "settling":
     case "settlement":
+    case "roundForfeited":
       return "settle";
     default:
       return null;
@@ -282,6 +285,16 @@ function HomeContent() {
           );
         } else {
           announce(`Round ${room?.game?.roundNumber ?? ""} settled`);
+        }
+        break;
+      }
+      case "roundForfeited": {
+        const g = room?.game;
+        if (g?.phase === "roundForfeited") {
+          const forfeitedName = g.players[g.forfeit.forfeitedBy].name;
+          announce(`Round ${g.roundNumber} forfeited: ${forfeitedName} ran out of time.`);
+        } else {
+          announce(`Round ${room?.game?.roundNumber ?? ""} forfeited`);
         }
         break;
       }
@@ -515,10 +528,13 @@ function HomeContent() {
     [pendingCommands],
   );
   const isAnyCommandPending = pendingCommands.size > 0;
+  // F-04: presence gating was dropped entirely (the shot clock now handles
+  // an absent opponent), so starting no longer requires Player B to be
+  // live - only that a guest has joined the seat at all.
   const canStartRoom =
     isHost &&
     room?.lifecycle === "lobby" &&
-    guestConnected &&
+    guestSeatOccupied &&
     !isCommandPending("START_ROOM");
   const canResetLobby = isHost && room !== null && !isCommandPending("RESET_TO_LOBBY");
   const canKickGuest = isHost && room !== null && !isCommandPending("KICK_GUEST");
@@ -785,7 +801,6 @@ function HomeContent() {
           <RoomGameView
             actor={actor}
             game={game}
-            guestConnected={guestConnected}
             isCommandPending={isCommandPending}
             isGeneratingCustomItem={isGeneratingCustomItem}
             isHost={isHost}
@@ -1162,9 +1177,11 @@ function RoomControls({
   const playerBPresenceText = guestSeatOccupied
     ? `Player B: ${playerBPresenceLabel}`
     : "Player B: No guest";
-  const startHint = !guestSeatOccupied
-    ? "Waiting for player B to join"
-    : "Player B is disconnected";
+  // F-04: Start no longer needs Player B to be live (see canStartRoom) - a
+  // disconnected-but-seated guest is now a cosmetic presence badge only,
+  // not a reason Start is disabled. The only remaining blocking condition
+  // is an empty guest seat.
+  const startHint = "Waiting for player B to join";
 
   // Show a hint explaining why Start is disabled for stable guest states.
   // Do not mention the commanding state here; it is transient and not
@@ -1173,7 +1190,7 @@ function RoomControls({
     isHost &&
     room.lifecycle === "lobby" &&
     !canStartRoom &&
-    (!guestSeatOccupied || !guestConnected);
+    !guestSeatOccupied;
 
   // Room admin chrome (invite link, reset/kick/forget) is the primary task
   // in the lobby and on the game-over screen, so it starts expanded there.
@@ -1350,7 +1367,6 @@ function RoomControls({
 type RoomGameViewProps = Readonly<{
   actor: PlayerId | null;
   game: PublicRoomGameState;
-  guestConnected: boolean;
   /**
    * Reports whether any of the given command types is currently in
    * flight. Each phase below passes only the command type(s) its own
@@ -1375,7 +1391,6 @@ type RoomGameViewProps = Readonly<{
 function RoomGameView({
   actor,
   game,
-  guestConnected,
   isCommandPending,
   isGeneratingCustomItem,
   isHost,
@@ -1446,6 +1461,7 @@ function RoomGameView({
       <>
         {stepper}
         <TurnBanner isYourTurn={isYourTurn} waitingForName={waitingForName} />
+        <TurnCountdown turnDeadlineMs={game.turnDeadlineMs} />
         <div className="play-stack">
           <ItemPanel item={game.item} />
           <section className="phase-panel">
@@ -1476,6 +1492,7 @@ function RoomGameView({
       <>
         {stepper}
         <TurnBanner isYourTurn={isYourTurn} waitingForName={waitingForName} />
+        <TurnCountdown turnDeadlineMs={game.turnDeadlineMs} />
         <div className="play-stack">
           <ItemPanel item={game.item} />
           <WidthNegotiationPanel
@@ -1505,6 +1522,7 @@ function RoomGameView({
       <>
         {stepper}
         <TurnBanner isYourTurn={isYourTurn} waitingForName={waitingForName} />
+        <TurnCountdown turnDeadlineMs={game.turnDeadlineMs} />
         <div className="play-stack">
           <ItemPanel item={game.item} />
           <section className="phase-panel">
@@ -1540,6 +1558,7 @@ function RoomGameView({
       <>
         {stepper}
         <TurnBanner isYourTurn={isYourTurn} waitingForName={waitingForName} />
+        <TurnCountdown turnDeadlineMs={game.turnDeadlineMs} />
         <div className="play-stack">
           <ItemPanel item={game.item} />
           <TradeActionPanel
@@ -1599,11 +1618,12 @@ function RoomGameView({
 
   if (game.phase === "settlement") {
     const isFinalRound = game.roundNumber >= game.totalRounds;
+    // F-04: presence gating was dropped entirely (the shot clock now
+    // handles an absent opponent), so a disconnected Player B no longer
+    // blocks advancing the round - only host authorization does.
     const settlementDisabledReason = !isHost
       ? "Only the host can advance rounds."
-      : !isFinalRound && !guestConnected
-        ? "Player B is disconnected. Waiting for Player B to reconnect before starting the next round."
-        : undefined;
+      : undefined;
 
     return (
       <>
@@ -1620,6 +1640,32 @@ function RoomGameView({
             onContinue={onAdvanceRound}
             players={game.players}
             settlement={game.settlement}
+          />
+        </div>
+      </>
+    );
+  }
+
+  if (game.phase === "roundForfeited") {
+    const isFinalRound = game.roundNumber >= game.totalRounds;
+    const forfeitDisabledReason = !isHost
+      ? "Only the host can advance rounds."
+      : undefined;
+
+    return (
+      <>
+        {stepper}
+        <div className="play-stack">
+          <RoundForfeitPanel
+            disabled={
+              isCommandPending("ADVANCE_ROUND") ||
+              forfeitDisabledReason !== undefined
+            }
+            disabledReason={forfeitDisabledReason}
+            forfeit={game.forfeit}
+            isFinalRound={isFinalRound}
+            onContinue={onAdvanceRound}
+            players={game.players}
           />
         </div>
       </>

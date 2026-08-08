@@ -10,6 +10,7 @@ import {
   type ProviderGeneratedItem,
   type Quote,
   type Roles,
+  type RoundForfeit,
   type RoundLogEntry,
   type RoundSettlement,
   type ScrapedAmazonItem,
@@ -248,24 +249,27 @@ function decodeGameState(value: unknown): GameState | null {
     case "generatingItem":
       return hasOnlyKeys(value, baseGameKeysFor(value)) ? value as GameState : null;
     case "proposingWidth":
-      return hasOnlyKeys(value, [...baseGameKeysFor(value), "item"]) &&
+      return hasOnlyKeys(value, [...baseGameKeysFor(value), "item", "turnDeadlineMs"]) &&
         isGeneratedItem(value.item) &&
+        isUnixTimeMs(value.turnDeadlineMs) &&
         isActiveRoundNumber(value)
         ? value as GameState
         : null;
     case "negotiatingWidth":
     case "configuringMarket":
-      return hasOnlyKeys(value, [...baseGameKeysFor(value), "item", "spreadWidth"]) &&
+      return hasOnlyKeys(value, [...baseGameKeysFor(value), "item", "spreadWidth", "turnDeadlineMs"]) &&
         isGeneratedItem(value.item) &&
         isValidSpreadWidth(value.spreadWidth) &&
+        isUnixTimeMs(value.turnDeadlineMs) &&
         isActiveRoundNumber(value)
         ? value as GameState
         : null;
     case "choosingSide":
-      return hasOnlyKeys(value, [...baseGameKeysFor(value), "item", "spreadWidth", "quote"]) &&
+      return hasOnlyKeys(value, [...baseGameKeysFor(value), "item", "spreadWidth", "quote", "turnDeadlineMs"]) &&
         isGeneratedItem(value.item) &&
         isValidSpreadWidth(value.spreadWidth) &&
         isQuoteForWidth(value.quote, value.spreadWidth) &&
+        isUnixTimeMs(value.turnDeadlineMs) &&
         isActiveRoundNumber(value)
         ? value as GameState
         : null;
@@ -286,6 +290,12 @@ function decodeGameState(value: unknown): GameState | null {
         isRoundSettlement(value.settlement) &&
         isActiveRoundNumber(value) &&
         isSettlementConsistent(value)
+        ? value as GameState
+        : null;
+    case "roundForfeited":
+      return hasOnlyKeys(value, [...baseGameKeysFor(value), "forfeit"]) &&
+        isRoundForfeit(value.forfeit) &&
+        isActiveRoundNumber(value)
         ? value as GameState
         : null;
     case "gameOver":
@@ -461,6 +471,17 @@ function isRoundSettlement(value: unknown): value is RoundSettlement {
     isFiniteNumber(value.marketMakerPnL);
 }
 
+function isRoundForfeit(value: unknown): value is RoundForfeit {
+  return isRecord(value) &&
+    isPositiveInteger(value.roundNumber) &&
+    typeof value.itemTitle === "string" &&
+    isGamePhase(value.phase) &&
+    isPlayerId(value.forfeitedBy) &&
+    isPlayerId(value.awardedTo) &&
+    value.forfeitedBy !== value.awardedTo &&
+    isFiniteNumber(value.penalty);
+}
+
 function isSettlementConsistent(value: Record<string, unknown>): boolean {
   const settlement = value.settlement;
 
@@ -521,6 +542,7 @@ function isGamePhase(value: unknown): value is GamePhase {
       value === "choosingSide" ||
       value === "settling" ||
       value === "settlement" ||
+      value === "roundForfeited" ||
       value === "gameOver" ||
       value === "error"
     );

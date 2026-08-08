@@ -24,24 +24,12 @@ import {
   type TokenHash,
   type TokenVerifier,
 } from "./tokens";
-import type { RoomCommandResult, RoomPresence, RoomState, UnixTimeMs } from "./types";
+import type { RoomCommandResult, RoomState, UnixTimeMs } from "./types";
 
 const NOW_MS = 40_000;
 const ROOM_ID_VALUE = "room_dispatch_0001";
 const HOST_SECRET = "host_secret_dispatch_0001";
 const GUEST_SECRET = "guest_secret_dispatch_0001";
-const LIVE_PRESENCE = {
-  players: {
-    A: true,
-    B: true,
-  },
-} satisfies RoomPresence;
-const GUEST_OFFLINE_PRESENCE = {
-  players: {
-    A: true,
-    B: false,
-  },
-} satisfies RoomPresence;
 
 const item: GeneratedItem = {
   round_id: "round-dispatch-1",
@@ -65,7 +53,7 @@ describe("room dispatcher", () => {
           },
           NOW_MS + 1,
         ),
-        dispatchContext(LIVE_PRESENCE),
+        dispatchContext(),
       ),
     );
     const configured = expectOk(
@@ -80,7 +68,7 @@ describe("room dispatcher", () => {
           },
           NOW_MS + 2,
         ),
-        dispatchContext(LIVE_PRESENCE),
+        dispatchContext(),
       ),
     );
     const started = expectOk(
@@ -94,7 +82,7 @@ describe("room dispatcher", () => {
           },
           NOW_MS + 3,
         ),
-        dispatchContext(LIVE_PRESENCE),
+        dispatchContext(),
       ),
     );
 
@@ -119,7 +107,7 @@ describe("room dispatcher", () => {
         },
         NOW_MS + 2,
       ),
-      dispatchContext(LIVE_PRESENCE),
+      dispatchContext(),
     );
 
     expect(result.ok).toBe(false);
@@ -135,7 +123,7 @@ describe("room dispatcher", () => {
     });
   });
 
-  it("rejects start dispatch when Player B is offline in command context", () => {
+  it("allows start dispatch through command context even while Player B is offline (F-04)", () => {
     const { room, hostToken } = joinedRoom();
     const result = dispatchRoomCommand(
       room,
@@ -147,17 +135,15 @@ describe("room dispatcher", () => {
         },
         NOW_MS + 2,
       ),
-      dispatchContext(GUEST_OFFLINE_PRESENCE),
+      dispatchContext(),
     );
 
-    expect(result).toEqual({
-      ok: false,
-      room,
-      error: {
-        code: "player_offline",
-        message: "Player B must be connected before the room can continue.",
-      },
-    });
+    expect(result.ok).toBe(true);
+
+    if (!result.ok) {
+      throw new Error(result.error.message);
+    }
+    expect(result.room.lifecycle).toBe("active");
   });
 
   it("ignores runtime settlement fields and computes settlement server-side", () => {
@@ -204,7 +190,7 @@ describe("room dispatcher", () => {
           },
           NOW_MS + 4,
         ),
-        dispatchContext(LIVE_PRESENCE),
+        dispatchContext(),
       ),
     );
 
@@ -272,7 +258,6 @@ function activeRoom(): {
     room: expectOk(
       startRoom(room, {
         credential: present(hostToken),
-        presence: LIVE_PRESENCE,
         verifyToken,
         nowMs: NOW_MS + 2,
       }),
@@ -376,9 +361,8 @@ function hashFor(token: RoomCapabilityToken): TokenHash {
 
 const verifyToken: TokenVerifier = (token, expectedHash) => hashFor(token) === expectedHash;
 
-function dispatchContext(presence: RoomPresence) {
+function dispatchContext() {
   return {
-    presence,
     verifyToken,
   };
 }

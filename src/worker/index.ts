@@ -225,11 +225,13 @@ type PendingItemGeneration = Readonly<{
  * A durably-persisted marker for a room-level effect that must run outside
  * the storage transaction that committed the state transition requiring it
  * (see receiveStoredSettlement / F-02). A Durable Object has exactly one
- * alarm slot, so scheduleNextAlarm() always arms it for whichever is sooner
- * of the room's TTL or this marker's notBeforeMs - see that function for the
- * multiplexing contract. `kind` is a discriminant so a future effect (e.g.
- * F-05 turn timers) can extend this union instead of adding a second marker
- * or a second scheduler.
+ * alarm slot, so scheduleNextAlarm() always arms it for whichever of the
+ * room's TTL, this marker's notBeforeMs, or F-05's turn-clock deadline is
+ * soonest - see that function for the multiplexing contract. `kind` is a
+ * discriminant for future effects that, like "settle", need their own retry
+ * state; F-05's turn clock did not need one - its deadline is already
+ * durable as `turnDeadlineMs` on `room.game` itself, so scheduleNextAlarm
+ * derives it straight from `room` instead (see turnDeadlineForRoom()).
  */
 type PendingRoomEffect = Readonly<{
   kind: "settle";
@@ -474,7 +476,6 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
           nowMs
         },
         {
-          presence: this.currentRoomPresence(loaded.room),
           verifyToken: rejectTokenVerification
         }
       );
@@ -732,13 +733,19 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
-   * Multiplexes the Durable Object's single alarm slot between two concerns:
-   * room TTL housekeeping (unchanged from before F-02) and resuming a
-   * pending room effect that was durably committed but never ran (the F-02
-   * trapdoor - see receiveStoredSettlement). Each alarm invocation figures
-   * out which deadline actually fired and handles only that one; every
-   * write path that follows reschedules via scheduleNextAlarm() so the slot
-   * never falls out of sync with whichever deadline is now soonest.
+   * Multiplexes the Durable Object's single alarm slot between three
+   * concerns: room TTL housekeeping (unchanged from before F-02), resuming a
+   * pending settlement effect that was durably committed but never ran (the
+   * F-02 trapdoor - see receiveStoredSettlement), and F-05's turn shot
+   * clock. Each alarm invocation figures out which deadline actually fired
+   * and handles only that one; every write path that follows reschedules
+   * via scheduleNextAlarm() so the slot never falls out of sync with
+   * whichever deadline is now soonest. The pending-settle-effect and
+   * turn-clock deadlines can never both be due for the same room at once -
+   * a turn deadline only exists on the four actionable phases
+   * (proposingWidth / negotiatingWidth / configuringMarket / choosingSide)
+   * and a pending settle effect only exists in "settling", so there is no
+   * ordering to get wrong between them.
    */
   async alarm(): Promise<void> {
     const nowMs = currentUnixTimeMs();
@@ -757,24 +764,94 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       const pendingEffect = loadPendingRoomEffect(
         await transaction.get<unknown>(PENDING_ROOM_EFFECT_STORAGE_KEY)
       );
+      const turnDeadlineMs = turnDeadlineForRoom(loaded.room);
+      const pendingEffectDue = pendingEffect !== null && nowMs >= pendingEffect.notBeforeMs;
+      const turnDeadlineDue = turnDeadlineMs !== null && nowMs >= turnDeadlineMs;
 
-      if (pendingEffect === null || nowMs < pendingEffect.notBeforeMs) {
+      if (!pendingEffectDue && !turnDeadlineDue) {
         // The room's TTL hasn't actually expired (loadStoredRoomEnvelope
-        // would have reported that above), and no pending effect is due
-        // yet, so this tick is a no-op besides keeping the single alarm
-        // slot pointed at whichever deadline is now soonest.
+        // would have reported that above), and neither the pending settle
+        // effect nor the turn clock is due yet, so this tick is a no-op
+        // besides keeping the single alarm slot pointed at whichever
+        // deadline is now soonest.
         await scheduleNextAlarm(transaction, loaded.room, pendingEffect);
         return null;
       }
 
-      return { room: loaded.room, pendingEffect };
+      return turnDeadlineDue
+        ? ({ kind: "turnExpiry", room: loaded.room } as const)
+        : ({ kind: "pendingEffect", room: loaded.room, pendingEffect: pendingEffect as PendingRoomEffect } as const);
     });
 
     if (due === null) {
       return;
     }
 
+    if (due.kind === "turnExpiry") {
+      await this.runDueTurnExpiry(due.room, nowMs);
+      return;
+    }
+
     await this.runDuePendingRoomEffect(due.room, due.pendingEffect, nowMs);
+  }
+
+  /**
+   * F-05 turn-clock resume: re-validates the room is still on the same
+   * outstanding deadline before dispatching TURN_EXPIRED, exactly like
+   * runDueSettleEffect re-checks phase/round_id before resuming settlement.
+   * This is what keeps a stale alarm wake - the round already advanced past
+   * the deadline that armed this wake, between alarm()'s outer transaction
+   * and this one - from forfeiting a round that has already moved on.
+   */
+  private async runDueTurnExpiry(room: RoomState, nowMs: UnixTimeMs): Promise<void> {
+    await this.ctx.storage.transaction(async (transaction) => {
+      const loaded = loadStoredRoomEnvelope(
+        await transaction.get<unknown>(ROOM_STORAGE_KEY),
+        nowMs
+      );
+
+      if (!loaded.ok) {
+        // The room expired in the gap between alarm()'s outer transaction
+        // and this one. Purge fully rather than leaving an expired envelope
+        // and its private items behind with no alarm armed to clean them up.
+        await purgeExpiredRoomState(transaction);
+        return;
+      }
+
+      const pendingEffect = loadPendingRoomEffect(
+        await transaction.get<unknown>(PENDING_ROOM_EFFECT_STORAGE_KEY)
+      );
+      const turnDeadlineMs = turnDeadlineForRoom(loaded.room);
+
+      if (turnDeadlineMs === null || nowMs < turnDeadlineMs) {
+        // Stale wake: the round already advanced out of the turn-clocked
+        // phase (or a fresh deadline was stamped later than the one that
+        // armed this alarm) between this alarm firing and being processed.
+        // Reschedule against the freshly-loaded room instead of forfeiting
+        // a round that has already moved on.
+        await scheduleNextAlarm(transaction, loaded.room, pendingEffect);
+        return;
+      }
+
+      const eventResult = dispatchSystemRoomEvent(loaded.room, {
+        type: "TURN_EXPIRED",
+        nowMs
+      });
+
+      if (!eventResult.ok) {
+        // The reducer rejected TURN_EXPIRED even though the phase/deadline
+        // check above passed (should not happen - this guard mirrors the
+        // reducer's own phase guard exactly). Reschedule rather than
+        // looping on an alarm that cannot make progress.
+        await scheduleNextAlarm(transaction, loaded.room, pendingEffect);
+        return;
+      }
+
+      // A turn deadline never coexists with a pending settle effect (see
+      // the class-level alarm() comment), so there is nothing to carry
+      // forward here; passing null also self-heals any stale marker.
+      await persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
+    });
   }
 
   private async runDuePendingRoomEffect(
@@ -1010,7 +1087,6 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         loaded.room,
         command,
         {
-          presence: this.currentRoomPresence(loaded.room),
           verifyToken
         }
       );
@@ -2443,11 +2519,15 @@ async function persistRoomEnvelope(
 
 /**
  * The reusable alarm multiplexer. A Durable Object has exactly one alarm
- * slot, so every transaction that can change either deadline (room TTL or a
- * pending effect's next-attempt time) must call this rather than setAlarm()
- * directly, or the two concerns will race to clobber each other's schedule.
- * F-05 (turn timers) is expected to reuse this by giving PendingRoomEffect a
- * second `kind` rather than introducing a second scheduler.
+ * slot, so every transaction that can change any of the three deadlines
+ * (room TTL, a pending settle effect's next-attempt time, or F-05's turn
+ * clock) must call this rather than setAlarm() directly, or the concerns
+ * will race to clobber each other's schedule. The turn deadline is not a
+ * PendingRoomEffect: unlike the settle effect (which needs its own retry
+ * count and backoff state), it is already durably part of the committed
+ * `room.game` for exactly the four phases where a specific player must act,
+ * so it is derived straight from `room` here rather than threaded through
+ * as a fourth parameter - see turnDeadlineForRoom().
  */
 async function scheduleNextAlarm(
   transaction: DurableObjectTransaction,
@@ -2455,12 +2535,34 @@ async function scheduleNextAlarm(
   pendingEffect: PendingRoomEffect | null
 ): Promise<void> {
   const ttlDeadline = roomExpiresAtMs(room);
-  const deadline =
-    pendingEffect === null
-      ? ttlDeadline
-      : Math.min(ttlDeadline, pendingEffect.notBeforeMs);
+  const pendingEffectDeadline = pendingEffect === null ? Infinity : pendingEffect.notBeforeMs;
+  const turnDeadline = turnDeadlineForRoom(room);
+  const deadline = Math.min(
+    ttlDeadline,
+    pendingEffectDeadline,
+    turnDeadline === null ? Infinity : turnDeadline
+  );
 
   await transaction.setAlarm(deadline);
+}
+
+/**
+ * The outstanding F-05 shot-clock deadline for a room, or null when the
+ * current phase has none. Only the four actionable phases
+ * (proposingWidth / negotiatingWidth / configuringMarket / choosingSide)
+ * carry `turnDeadlineMs` at all - see the GameState union in
+ * src/lib/game/types.ts.
+ */
+function turnDeadlineForRoom(room: RoomState): UnixTimeMs | null {
+  switch (room.game.phase) {
+    case "proposingWidth":
+    case "negotiatingWidth":
+    case "configuringMarket":
+    case "choosingSide":
+      return room.game.turnDeadlineMs;
+    default:
+      return null;
+  }
 }
 
 async function writePendingRoomEffect(
@@ -2826,7 +2928,6 @@ function statusForDomainError(error: RoomDomainError): number {
     case "guest_slot_full":
     case "guest_slot_empty":
     case "guest_required":
-    case "player_offline":
     case "invalid_game_phase":
       return 409;
     default:

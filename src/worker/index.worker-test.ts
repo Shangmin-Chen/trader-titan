@@ -80,8 +80,12 @@ const TIGHTEN_REPLAY_SAME_ID_ROOM_NAME = "worker-room-tighten-replay-same-id";
 const TIGHTEN_REPLAY_DIFFERENT_ID_ROOM_NAME = "worker-room-tighten-replay-different-id";
 const KICKED_GUEST_REPLAY_ROOM_NAME = "worker-room-kicked-guest-replay";
 const NEARER_DEADLINE_ROOM_NAME = "worker-room-nearer-deadline";
+const NEAREST_OF_THREE_ROOM_NAME = "worker-room-nearest-of-three";
 const PURGE_DEDUPE_ROOM_NAME = "worker-room-purge-dedupe";
 const STALE_ROUND_SETTLE_ROOM_NAME = "worker-room-stale-round-settle";
+const TURN_EXPIRY_ALARM_ROOM_NAME = "worker-room-turn-expiry-alarm";
+const TURN_EXPIRY_TTL_ROOM_NAME = "worker-room-turn-expiry-ttl";
+const STALE_TURN_EXPIRY_ROOM_NAME = "worker-room-stale-turn-expiry";
 const GAME_ROOM_SMOKE_URL = "https://trader-titan.worker.test/room";
 const ROOM_COMMAND_URL = `${GAME_ROOM_SMOKE_URL}/command`;
 const ROOM_JOIN_URL = `${GAME_ROOM_SMOKE_URL}/join`;
@@ -813,7 +817,10 @@ describe("Cloudflare worker scaffold", () => {
     expect(persisted.room).toEqual(kicked.room);
   });
 
-  it("rejects HTTP START_ROOM when a joined guest has no live socket", async () => {
+  // F-04: presence gating was dropped entirely (the F-05 turn shot clock
+  // now handles an absent opponent instead), so HTTP START_ROOM succeeds
+  // even when the joined guest has no live socket.
+  it("allows HTTP START_ROOM when a joined guest has no live socket (F-04)", async () => {
     const stub = roomStub(START_OFFLINE_ROOM_NAME);
     const created = await createRoom(stub, "Host");
 
@@ -832,21 +839,14 @@ describe("Cloudflare worker scaffold", () => {
       type: "START_ROOM",
       credential: created.hostToken
     });
-    const rejected = await expectPublicJson<RoomErrorResponse>(startResponse);
+    const started = await expectPublicJsonWithoutTrueValue<CommandRoomResponse>(startResponse);
 
-    expect(startResponse.status).toBe(HTTP_CONFLICT_STATUS);
-    expect(rejected).toMatchObject({
-      ok: false,
-      error: {
-        code: "player_offline"
-      }
-    });
+    expect(startResponse.status).toBe(HTTP_OK_STATUS);
+    expect(started.room.lifecycle).toBe("active");
 
     const persisted = await accessRoom(stub, created.hostToken);
 
-    expect(persisted.room.lifecycle).toBe("lobby");
-    expect(persisted.room.game.phase).toBe("setup");
-    expect(persisted.room.revision).toBe(joined.room.revision);
+    expect(persisted.room.lifecycle).toBe("active");
     expect(persisted.room.seats.guest.occupied).toBe(true);
     expectRoomPresence(persisted.room, { A: false, B: false });
   });
@@ -1762,6 +1762,194 @@ describe("Cloudflare worker scaffold", () => {
     guestConnection.socket.close();
   });
 
+  it("fires a due F-05 turn deadline via the alarm and forfeits the round into roundForfeited", async () => {
+    const stub = roomStub(TURN_EXPIRY_ALARM_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created turn-expiry room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected generated item to be ready.");
+    }
+
+    const forced = await forcePastTurnDeadline(stub);
+
+    if (forced.game.phase !== "proposingWidth") {
+      throw new Error("Expected proposingWidth after forcing the deadline.");
+    }
+
+    const { marketMaker, trader } = forced.game.roles;
+
+    await runRoomCleanupAlarm(stub);
+
+    const resumed = await accessRoom(stub, created.hostToken);
+
+    expect(resumed.room.game.phase).toBe("roundForfeited");
+
+    if (resumed.room.game.phase !== "roundForfeited") {
+      throw new Error("Expected roundForfeited after the alarm fired.");
+    }
+    expect(resumed.room.game.forfeit).toMatchObject({
+      roundNumber: 1,
+      phase: "proposingWidth",
+      forfeitedBy: marketMaker,
+      awardedTo: trader
+    });
+    expect(resumed.room.revision).toBe(forced.revision + 1);
+
+    guestConnection.socket.close();
+  });
+
+  it("schedules the nearest of all three deadlines: the F-05 turn clock outranks the TTL when no settle effect is pending", async () => {
+    // Extends "schedules the nearer of the two deadlines..." above to the
+    // third deadline scheduleNextAlarm now multiplexes. A pending settle
+    // effect and a turn deadline are mutually exclusive (settle only exists
+    // in "settling"; a turn deadline only exists in the four other
+    // actionable phases - see the class-level alarm() comment), so this
+    // needs its own case: proposingWidth with a null pending effect, so
+    // Math.min's third argument is the only thing standing between the far
+    // TTL and the near turn clock. Flipping scheduleNextAlarm's Math.min to
+    // Math.max would pick Infinity (the null pending effect's placeholder)
+    // over both real deadlines, which the assertion below rules out.
+    const stub = roomStub(NEAREST_OF_THREE_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created nearest-of-three room.");
+    }
+
+    await joinRoom(stub, "Guest");
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected generated item to be ready.");
+    }
+
+    const ttlDeadline = await storedRoomExpiresAt(stub);
+    const turnDeadline = started.room.game.turnDeadlineMs;
+
+    expect(turnDeadline).toBeLessThan(ttlDeadline);
+    await expect(readPendingRoomEffect(stub)).resolves.toBeNull();
+
+    // Force the scheduled alarm to look overdue, then let alarm() re-derive
+    // and reschedule purely from the freshly-loaded room's candidate
+    // deadlines (none of which is actually due yet).
+    await setStoredRoomAlarm(stub, Date.now() - 1);
+    await runRoomCleanupAlarm(stub);
+
+    await expect(storedRoomAlarm(stub)).resolves.toBe(turnDeadline);
+  });
+
+  it("keeps a turn deadline outstanding reachable by TTL purge (regression)", async () => {
+    // Mirrors "still purges an expired room and its pending settlement
+    // marker when the TTL deadline wins the race" for F-05: a turn-clocked
+    // room whose TTL has also elapsed must still be purged, not stranded
+    // because the multiplexer favored the nearer turn deadline.
+    const stub = roomStub(TURN_EXPIRY_TTL_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created turn-expiry TTL room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected generated item to be ready.");
+    }
+
+    await expireStoredRoomEnvelope(stub);
+    await runRoomCleanupAlarm(stub);
+
+    await expect(storedRoomEnvelopeExists(stub)).resolves.toBe(false);
+    await expect(readPendingRoomEffect(stub)).resolves.toBeNull();
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual(noPrivateItemKeys());
+    await expect(storedRoomAlarm(stub)).resolves.toBeNull();
+
+    guestConnection.socket.close();
+  });
+
+  it("does not forfeit a round that already advanced past a stale turn-expiry wake (TOCTOU regression)", async () => {
+    // Mirrors "ignores a settlement effect whose round no longer matches
+    // the stored room" for F-05: runDueTurnExpiry is invoked directly with
+    // a deliberately stale room snapshot (proposingWidth, an old past
+    // deadline) while the actually-persisted room has already moved past
+    // that phase via a genuine player command - precisely the TOCTOU
+    // window between alarm()'s outer transaction and this method's own
+    // re-validating one.
+    const stub = roomStub(STALE_TURN_EXPIRY_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created stale turn-expiry room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected generated item to be ready.");
+    }
+
+    const staleRoom = await loadInternalRoomState(stub);
+
+    if (staleRoom.game.phase !== "proposingWidth") {
+      throw new Error("Expected internal room state in proposingWidth.");
+    }
+
+    const marketMakerToken = tokenForPlayer(
+      staleRoom.game.roles.marketMaker,
+      created.hostToken,
+      joined.guestToken
+    );
+
+    // The round genuinely advances out of proposingWidth before the stale
+    // wake is processed.
+    const advanced = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_INITIAL_WIDTH",
+      credential: marketMakerToken,
+      width: 100
+    });
+
+    expect(advanced.room.game.phase).toBe("negotiatingWidth");
+
+    const staleRoomWithPastDeadline: RoomState = {
+      ...staleRoom,
+      game: { ...staleRoom.game, turnDeadlineMs: Date.now() - 1 }
+    };
+
+    await runDueTurnExpiryDirect(stub, staleRoomWithPastDeadline, Date.now());
+
+    // The stale wake must not forfeit a round that already moved on.
+    const after = await accessRoom(stub, created.hostToken);
+
+    expect(after.room.game.phase).toBe("negotiatingWidth");
+    expect(after.room.revision).toBe(advanced.room.revision);
+
+    guestConnection.socket.close();
+  });
+
   it("schedules the nearer of the two deadlines while a pending effect is not yet due", async () => {
     // Closes a mutation gap: flipping scheduleNextAlarm's Math.min to Math.max
     // (i.e. always scheduling the *farther* deadline, the exact failure its own
@@ -2026,11 +2214,15 @@ describe("Cloudflare worker scaffold", () => {
     expect(afterExhaustion.room.revision).toBe(stuck.revision + 1);
     await expect(readPendingRoomEffect(stub)).resolves.toBeNull();
 
-    // The alarm slot must not spin: after exhaustion, only TTL remains
-    // scheduled, and a further alarm tick is a stable no-op.
+    // The alarm slot must not spin: the pending settle-effect marker is
+    // gone after exhaustion, so the only deadlines left are the room's TTL
+    // and the fresh F-05 turn clock SETTLEMENT_FAILED just armed on
+    // re-entering choosingSide - and the turn clock is far nearer than the
+    // two-hour TTL. Either way, a further alarm tick is a stable no-op.
     const alarmAfterExhaustion = await storedRoomAlarm(stub);
 
-    expect(alarmAfterExhaustion).toBe(await storedRoomExpiresAt(stub));
+    expect(alarmAfterExhaustion).toBe(afterExhaustion.room.game.turnDeadlineMs);
+    expect(alarmAfterExhaustion).toBeLessThan(await storedRoomExpiresAt(stub));
 
     await runRoomCleanupAlarm(stub);
 
@@ -2426,7 +2618,12 @@ describe("Cloudflare worker scaffold", () => {
     const privateItemKey = privateGeneratedItemStorageKey(
       started.room.game.item.round_id
     );
-    const expectedAlarm = await storedRoomExpiresAt(stub);
+    // The room is in proposingWidth, which now carries its own F-05 turn
+    // deadline - and that deadline (60s out) is far nearer than the
+    // two-hour TTL, so a reschedule must arm the alarm there, not at TTL.
+    const expectedAlarm = started.room.game.turnDeadlineMs;
+
+    expect(expectedAlarm).toBeLessThan(await storedRoomExpiresAt(stub));
 
     await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
       privateItemKey
@@ -2841,7 +3038,10 @@ describe("Cloudflare worker scaffold", () => {
     secondConnection.socket.close();
   });
 
-  it("sends ROOM_ERROR for WebSocket START_ROOM when a joined guest is offline", async () => {
+  // F-04: presence gating was dropped entirely, so a WebSocket START_ROOM
+  // now succeeds (broadcasting a fresh ROOM_SNAPSHOT) even while the joined
+  // guest has no live socket.
+  it("sends ROOM_SNAPSHOT for WebSocket START_ROOM even when a joined guest is offline (F-04)", async () => {
     const stub = roomStub(SOCKET_START_OFFLINE_ROOM_NAME);
     const created = await createRoom(stub, "Host");
 
@@ -2857,25 +3057,25 @@ describe("Cloudflare worker scaffold", () => {
       room: roomWithPresence(joined.room, { A: true, B: false })
     });
 
-    const errorMessage = nextSocketMessage<RoomSocketMessage>(hostConnection.socket);
+    const nextMessage = nextSocketMessage<RoomSocketMessage>(hostConnection.socket);
 
     hostConnection.socket.send(JSON.stringify(withTestCommandId({
       type: "START_ROOM",
       credential: created.hostToken
     })));
 
-    await expect(errorMessage).resolves.toMatchObject({
-      type: "ROOM_ERROR",
-      error: {
-        code: "player_offline"
-      }
-    });
+    const message = await nextMessage;
+
+    expect(message.type).toBe("ROOM_SNAPSHOT");
+
+    if (message.type !== "ROOM_SNAPSHOT") {
+      throw new Error("Expected a ROOM_SNAPSHOT message.");
+    }
+    expect(message.room.lifecycle).toBe("active");
 
     const persisted = await accessRoom(stub, created.hostToken);
 
-    expect(persisted.room.lifecycle).toBe("lobby");
-    expect(persisted.room.game.phase).toBe("setup");
-    expect(persisted.room.revision).toBe(joined.room.revision);
+    expect(persisted.room.lifecycle).toBe("active");
     expect(persisted.room.seats.guest.occupied).toBe(true);
     expectRoomPresence(persisted.room, { A: true, B: false });
 
@@ -2927,20 +3127,23 @@ describe("Cloudflare worker scaffold", () => {
     });
     expectRoomPresence(secondGuest.room, { A: false, B: false });
 
+    // F-04: presence gating was dropped entirely, so starting with the
+    // replacement guest still offline now succeeds (the turn shot clock
+    // handles the absence instead of a player_offline rejection).
     const replacementStartResponse = await postRoomCommand(stub, {
       type: "START_ROOM",
       credential: created.hostToken
     });
-    const replacementStart = await expectPublicJson<RoomErrorResponse>(replacementStartResponse);
+    const replacementStart = await expectPublicJsonWithoutTrueValue<CommandRoomResponse>(
+      replacementStartResponse
+    );
 
-    expect(replacementStartResponse.status).toBe(HTTP_CONFLICT_STATUS);
-    expect(replacementStart.error.code).toBe("player_offline");
+    expect(replacementStartResponse.status).toBe(HTTP_OK_STATUS);
+    expect(replacementStart.room.lifecycle).toBe("active");
 
     const afterReplacementStart = await accessRoom(stub, created.hostToken);
 
-    expect(afterReplacementStart.room.lifecycle).toBe("lobby");
-    expect(afterReplacementStart.room.game.phase).toBe("setup");
-    expect(afterReplacementStart.room.revision).toBe(secondGuest.room.revision);
+    expect(afterReplacementStart.room.lifecycle).toBe("active");
     expectRoomPresence(afterReplacementStart.room, { A: false, B: false });
     await expect(guestClosed).resolves.toBeUndefined();
 
@@ -3054,7 +3257,11 @@ describe("Cloudflare worker scaffold", () => {
     hostConnection.socket.close();
   });
 
-  it("uses guest socket presence for non-final and final round advancement", async () => {
+  // F-04: presence gating was dropped entirely (the F-05 turn shot clock
+  // now handles an absent opponent instead), so both a non-final and the
+  // final round advance succeed while Player B's socket is offline - only
+  // the presence badge on the snapshot reflects the disconnect.
+  it("advances both non-final and final rounds while Player B's socket is offline (F-04)", async () => {
     const stub = roomStub(ADVANCE_PRESENCE_ROOM_NAME);
     const created = await createRoom(stub, "Host", { totalRounds: 2 });
 
@@ -3063,7 +3270,7 @@ describe("Cloudflare worker scaffold", () => {
     }
 
     const joined = await joinRoom(stub, "Guest");
-    let guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
 
     expectRoomPresence(guestConnection.initial.room, { A: false, B: true });
 
@@ -3090,28 +3297,6 @@ describe("Cloudflare worker scaffold", () => {
 
     await waitForRoomPresence(stub, created.hostToken, { A: false, B: false });
 
-    const rejectedAdvanceResponse = await postRoomCommand(stub, {
-      type: "ADVANCE_ROUND",
-      credential: created.hostToken
-    });
-    const rejectedAdvance = await expectPublicJson<RoomErrorResponse>(rejectedAdvanceResponse);
-
-    expect(rejectedAdvanceResponse.status).toBe(HTTP_CONFLICT_STATUS);
-    expect(rejectedAdvance.error.code).toBe("player_offline");
-
-    const afterRejectedAdvance = await accessRoom(stub, created.hostToken);
-
-    expect(afterRejectedAdvance.room.game.phase).toBe("settlement");
-    expect(afterRejectedAdvance.room.revision).toBe(firstSettlement.revision);
-    expectRoomPresence(afterRejectedAdvance.room, { A: false, B: false });
-
-    guestConnection = await openRoomSocket(stub, joined.guestToken);
-
-    expect(guestConnection.initial).toMatchObject({
-      type: "ROOM_SNAPSHOT",
-      room: roomWithPresence(firstSettlement, { A: false, B: true })
-    });
-
     const advanced = await applyRoomCommandWithoutTrueValue(stub, {
       type: "ADVANCE_ROUND",
       credential: created.hostToken
@@ -3119,7 +3304,7 @@ describe("Cloudflare worker scaffold", () => {
 
     expect(advanced.room.game.phase).toBe("proposingWidth");
     expect(advanced.room.game.roundNumber).toBe(2);
-    expectRoomPresence(advanced.room, { A: false, B: true });
+    expectRoomPresence(advanced.room, { A: false, B: false });
 
     const finalSettlement = await settleCurrentRound(
       stub,
@@ -3131,10 +3316,6 @@ describe("Cloudflare worker scaffold", () => {
     expect(finalSettlement.game.phase).toBe("settlement");
     expect(finalSettlement.game.roundNumber).toBe(2);
 
-    guestConnection.socket.close();
-
-    await waitForRoomPresence(stub, created.hostToken, { A: false, B: false });
-
     const finished = await applyRoomCommand(stub, {
       type: "ADVANCE_ROUND",
       credential: created.hostToken
@@ -3145,7 +3326,10 @@ describe("Cloudflare worker scaffold", () => {
     expectRoomPresence(finished.room, { A: false, B: false });
   });
 
-  it("sends ROOM_ERROR for WebSocket ADVANCE_ROUND when Player B disconnects before a non-final advance", async () => {
+  // F-04: presence gating was dropped entirely, so a WebSocket ADVANCE_ROUND
+  // now succeeds (broadcasting a fresh ROOM_SNAPSHOT) even after Player B
+  // disconnects before a non-final advance.
+  it("sends ROOM_SNAPSHOT for WebSocket ADVANCE_ROUND even after Player B disconnects before a non-final advance (F-04)", async () => {
     const stub = roomStub(SOCKET_ADVANCE_OFFLINE_ROOM_NAME);
     const created = await createRoom(stub, "Host", { totalRounds: 2 });
 
@@ -3188,24 +3372,26 @@ describe("Cloudflare worker scaffold", () => {
       room: roomWithPresence(firstSettlement, { A: true, B: false })
     });
 
-    const errorMessage = nextSocketMessage<RoomSocketMessage>(hostConnection.socket);
+    const nextMessage = nextSocketMessage<RoomSocketMessage>(hostConnection.socket);
 
     hostConnection.socket.send(JSON.stringify(withTestCommandId({
       type: "ADVANCE_ROUND",
       credential: created.hostToken
     })));
 
-    await expect(errorMessage).resolves.toMatchObject({
-      type: "ROOM_ERROR",
-      error: {
-        code: "player_offline"
-      }
-    });
+    const message = await nextMessage;
+
+    expect(message.type).toBe("ROOM_SNAPSHOT");
+
+    if (message.type !== "ROOM_SNAPSHOT") {
+      throw new Error("Expected a ROOM_SNAPSHOT message.");
+    }
+    expect(message.room.game.phase).toBe("proposingWidth");
 
     const persisted = await accessRoom(stub, created.hostToken);
 
-    expect(persisted.room.game.phase).toBe("settlement");
-    expect(persisted.room.revision).toBe(firstSettlement.revision);
+    expect(persisted.room.game.phase).toBe("proposingWidth");
+    expect(persisted.room.game.roundNumber).toBe(2);
     expectRoomPresence(persisted.room, { A: true, B: false });
 
     hostConnection.socket.close();
@@ -3559,7 +3745,6 @@ async function forceStuckSettling(
         nowMs
       },
       {
-        presence: { players: { A: true, B: true } },
         verifyToken: () => true
       }
     );
@@ -3593,6 +3778,89 @@ async function forceStuckSettling(
     await state.storage.setAlarm(roomExpiresAtMs(result.room));
 
     return result.room;
+  });
+}
+
+/**
+ * F-05 analogue of forceStuckSettling: directly patches the persisted
+ * room's turnDeadlineMs into the past (production code has no way to stamp
+ * a past deadline, since it always computes nowMs + a positive duration),
+ * so a test can exercise the alarm's due-turn-clock path without waiting
+ * out a real 30-60s duration. Requires the room to already be in one of
+ * the four turn-clocked phases. Like forceStuckSettling, the *scheduled* DO
+ * alarm is deliberately left at the room's TTL rather than the forced past
+ * deadline, so it does not fire opportunistically before a test explicitly
+ * ticks it via runRoomCleanupAlarm().
+ */
+async function forcePastTurnDeadline(stub: GameRoomStub): Promise<RoomState> {
+  return runInDurableObject(stub, async (_instance, state) => {
+    const nowMs = Date.now();
+    const loaded = loadPersistenceEnvelope(
+      await state.storage.get<unknown>(TEST_ROOM_STORAGE_KEY),
+      nowMs
+    );
+
+    if (!loaded.ok) {
+      throw new Error(`Expected loadable room envelope: ${loaded.error.code}`);
+    }
+
+    if (
+      loaded.room.game.phase !== "proposingWidth" &&
+      loaded.room.game.phase !== "negotiatingWidth" &&
+      loaded.room.game.phase !== "configuringMarket" &&
+      loaded.room.game.phase !== "choosingSide"
+    ) {
+      throw new Error(`Expected a turn-clocked phase, got ${loaded.room.game.phase}.`);
+    }
+
+    const patchedRoom: RoomState = {
+      ...loaded.room,
+      game: { ...loaded.room.game, turnDeadlineMs: nowMs - 1 }
+    };
+
+    await state.storage.put(
+      TEST_ROOM_STORAGE_KEY,
+      JSON.parse(JSON.stringify(toPersistenceEnvelope(patchedRoom, nowMs))) as unknown
+    );
+    await state.storage.setAlarm(roomExpiresAtMs(patchedRoom));
+
+    return patchedRoom;
+  });
+}
+
+async function runDueTurnExpiryDirect(
+  stub: GameRoomStub,
+  room: RoomState,
+  nowMs: number
+): Promise<void> {
+  await runInDurableObject(stub, async (instance) => {
+    await (
+      instance as unknown as {
+        runDueTurnExpiry(room: RoomState, nowMs: number): Promise<void>;
+      }
+    ).runDueTurnExpiry(room, nowMs);
+  });
+}
+
+/**
+ * Reads the private, internal RoomState straight out of storage - unlike
+ * CommandRoomResponse.room (a PublicRoomSnapshot), this carries host/guest
+ * seat token hashes and is what runDueTurnExpiryDirect / forceStuckSettling
+ * expect, since production only ever passes internal RoomState objects
+ * between these methods, never redacted public snapshots.
+ */
+async function loadInternalRoomState(stub: GameRoomStub): Promise<RoomState> {
+  return runInDurableObject(stub, async (_instance, state) => {
+    const loaded = loadPersistenceEnvelope(
+      await state.storage.get<unknown>(TEST_ROOM_STORAGE_KEY),
+      Date.now()
+    );
+
+    if (!loaded.ok) {
+      throw new Error(`Expected loadable room envelope: ${loaded.error.code}`);
+    }
+
+    return loaded.room;
   });
 }
 

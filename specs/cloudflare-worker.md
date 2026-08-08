@@ -64,9 +64,9 @@ The Durable Object is the authoritative source for live room presence:
 - Presence is never written to Durable Object storage or room persistence envelopes.
 - Seat occupancy is not live presence. An occupied guest seat means the room has a current guest token hash; it does not prove Player B has an accepted socket.
 - Every authenticated public room snapshot includes presence booleans. Presence-only snapshots can keep the same room revision because the room state did not mutate.
-- HTTP joins, HTTP commands, WebSocket commands, and authenticated access responses use the same `currentRoomPresence` source when dispatching commands or returning full public snapshots.
+- HTTP joins, HTTP commands, WebSocket commands, and authenticated access responses use the same `currentRoomPresence` source when returning full public snapshots.
 
-`START_ROOM` is rejected with `player_offline` when Player B is disconnected. `ADVANCE_ROUND` is also rejected with `player_offline` for non-final settlements while Player B is disconnected. Final-round `ADVANCE_ROUND` that moves the room to `finished` with a `gameOver` game state remains allowed while Player B is disconnected.
+Presence does not gate any room command (F-04). `START_ROOM` and `ADVANCE_ROUND` (both non-final and final-round, which moves the room to `finished` with a `gameOver` game state) succeed regardless of whether Player B is connected. An idle or absent opponent is instead handled by the F-05 turn shot clock, which forfeits the round they are on the clock for; presence is a purely cosmetic connection indicator in the snapshot.
 
 ## Private Item Storage And Effects
 
@@ -80,6 +80,18 @@ The Durable Object is the gameplay authority for generated item values and settl
 - If provider generation fails, including after a retry command, the Durable Object dispatches `ITEM_FAILED` and persists the room error snapshot without resetting scores, roles, lifecycle, or prior log entries. If the private settlement item is missing, it dispatches `SETTLEMENT_FAILED` rather than accepting client-provided values.
 - Successful `RESET_TO_LOBBY` and `KICK_GUEST` commands persist the lobby replacement and delete all `room:private-generated-item:v1:*` keys for the room object in the same storage transaction.
 - Room envelope writes schedule a Durable Object alarm for the room persistence expiration. When the alarm runs and the room envelope is missing, expired, or invalid, the Durable Object deletes all `room:private-generated-item:v1:*` keys and clears the alarm; if the room is still loadable, the alarm is rescheduled to the current room expiration.
+
+## Turn Shot Clock Alarm (F-05)
+
+A Durable Object has exactly one alarm slot. `scheduleNextAlarm` multiplexes it across up to three candidate deadlines and arms it at whichever is soonest:
+
+1. The room's TTL expiration (unchanged, see above).
+2. A pending settlement-retry marker's next-attempt time (F-02; see the settlement retry/backoff behavior).
+3. The F-05 turn shot clock's `turnDeadlineMs`, read directly off the room's current game state rather than a separate persisted marker - it is already durable as part of the committed room envelope for the four turn-clocked phases (`proposingWidth`, `negotiatingWidth`, `configuringMarket`, `choosingSide`).
+
+A pending settlement marker and a turn deadline can never both be outstanding for the same room at once: the former only exists while the game is `settling`, the latter only in the four other actionable phases. When the alarm fires and a turn deadline is the one that is due, the Durable Object re-loads the room in a fresh transaction, re-validates that the same phase and deadline are still outstanding, and only then dispatches `TURN_EXPIRED` through the room command layer and persists the result. This re-validation is what keeps a stale alarm wake from forfeiting a round that has already advanced past that phase.
+
+If the alarm fires while the room envelope is missing, expired, or invalid, the Durable Object purges the room's private items, envelope, and any pending markers exactly as the plain TTL case above - a turn deadline being simultaneously outstanding does not suppress this cleanup.
 
 ## Room WebSocket Contract
 
@@ -97,7 +109,7 @@ Incoming text messages are JSON client room commands with the same shape accepte
 { "type": "ROOM_ERROR", "error": { "code": "<code>", "message": "<message>" } }
 ```
 
-Successful WebSocket commands are dispatched through the room command layer with the same presence source used by HTTP commands, persisted as room persistence envelopes, and broadcast as `ROOM_SNAPSHOT` only to sockets whose attached token hash still matches the current host or guest seat. Stale kicked/reset/replaced guest sockets are closed before broadcast. Successful HTTP joins and HTTP commands also broadcast a new public snapshot so HTTP and WebSocket clients remain synchronized.
+Successful WebSocket commands are dispatched through the same room command layer as HTTP commands (presence is not an input to dispatch - see Room Presence above), persisted as room persistence envelopes, and broadcast as `ROOM_SNAPSHOT` only to sockets whose attached token hash still matches the current host or guest seat. Stale kicked/reset/replaced guest sockets are closed before broadcast. Successful HTTP joins and HTTP commands also broadcast a new public snapshot so HTTP and WebSocket clients remain synchronized.
 
 ## Environment
 

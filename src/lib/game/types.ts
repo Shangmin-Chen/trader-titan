@@ -9,7 +9,30 @@ export const GAME_MODES = [
 export const MAX_ROUNDS = 99;
 export const MAX_PLAYABLE_ABSOLUTE_VALUE = 1_000_000_000_000;
 
+// F-05 turn shot-clock durations. Per-phase because a binary choice
+// (choosingSide) needs less thinking time than making a market
+// (configuringMarket), which needs less than the opening proposal
+// (proposingWidth, where the player is also still reading the item).
+export const PROPOSING_WIDTH_TURN_DURATION_MS = 60_000;
+export const NEGOTIATING_WIDTH_TURN_DURATION_MS = 45_000;
+export const CONFIGURING_MARKET_TURN_DURATION_MS = 60_000;
+export const CHOOSING_SIDE_TURN_DURATION_MS = 30_000;
+
+// proposingWidth has no spread width yet when the clock runs out (the market
+// maker never proposed one), so a forfeit there needs its own fixed stake
+// rather than "the width in play". Settlement PnL scales with the item's
+// true value, which this repo's own fixtures and static market config put
+// anywhere from double digits (Amazon, Chaos Quant) to the tens of
+// thousands (Cosmic Scale, Fermi Math) - and the default game mode (Chaos
+// Quant) has a true_value median in the same 2-3 digit neighborhood as the
+// spread widths already used throughout this codebase's own tests (100,
+// 200, 300, 500). 100 keeps an early-round forfeit a real stake in that
+// mode instead of a token amount that would make stalling free.
+export const PROPOSING_WIDTH_FORFEIT_PENALTY = 100;
+
 export type GameMode = (typeof GAME_MODES)[number];
+
+export type UnixTimeMs = number;
 
 export type PlayerId = "A" | "B";
 
@@ -70,6 +93,7 @@ export type GamePhase =
   | "choosingSide"
   | "settling"
   | "settlement"
+  | "roundForfeited"
   | "gameOver"
   | "error";
 
@@ -83,6 +107,22 @@ export type RoundSettlement = {
   marketMaker: PlayerId;
   traderPnL: number;
   marketMakerPnL: number;
+};
+
+/**
+ * Records a round that ended because a player's shot clock expired rather
+ * than through a trade. `phase` is the actionable phase the clock ran out
+ * in (never "settling" or any non-clocked phase - see TURN_EXPIRED in the
+ * reducer). Zero-sum like RoundSettlement: forfeitedBy loses `penalty`,
+ * awardedTo gains it.
+ */
+export type RoundForfeit = {
+  roundNumber: number;
+  itemTitle: string;
+  phase: GamePhase;
+  forfeitedBy: PlayerId;
+  awardedTo: PlayerId;
+  penalty: number;
 };
 
 export type RoundLogEntry = {
@@ -116,18 +156,21 @@ export type GeneratingItemGameState = GameStateBase & {
 export type ProposingWidthGameState = GameStateBase & {
   phase: "proposingWidth";
   item: GeneratedItem;
+  turnDeadlineMs: UnixTimeMs;
 };
 
 export type NegotiatingWidthGameState = GameStateBase & {
   phase: "negotiatingWidth";
   item: GeneratedItem;
   spreadWidth: number;
+  turnDeadlineMs: UnixTimeMs;
 };
 
 export type ConfiguringMarketGameState = GameStateBase & {
   phase: "configuringMarket";
   item: GeneratedItem;
   spreadWidth: number;
+  turnDeadlineMs: UnixTimeMs;
 };
 
 export type ChoosingSideGameState = GameStateBase & {
@@ -135,6 +178,7 @@ export type ChoosingSideGameState = GameStateBase & {
   item: GeneratedItem;
   spreadWidth: number;
   quote: Quote;
+  turnDeadlineMs: UnixTimeMs;
 };
 
 export type SettlingGameState = GameStateBase & {
@@ -151,6 +195,11 @@ export type SettlementGameState = GameStateBase & {
   spreadWidth: number;
   quote: Quote;
   settlement: RoundSettlement;
+};
+
+export type RoundForfeitedGameState = GameStateBase & {
+  phase: "roundForfeited";
+  forfeit: RoundForfeit;
 };
 
 export type GameOverState = GameStateBase & {
@@ -173,6 +222,7 @@ export type GameState =
   | ChoosingSideGameState
   | SettlingGameState
   | SettlementGameState
+  | RoundForfeitedGameState
   | GameOverState
   | ErrorGameState;
 
@@ -187,13 +237,13 @@ export type StartGamePayload = {
 
 export type GameAction =
   | { type: "START_GAME"; payload: StartGamePayload }
-  | { type: "ITEM_RECEIVED"; item: GeneratedItem }
+  | { type: "ITEM_RECEIVED"; item: GeneratedItem; turnDeadlineMs: UnixTimeMs }
   | { type: "ITEM_FAILED"; error: string }
   | { type: "RETRY_ITEM_GENERATION" }
-  | { type: "SUBMIT_INITIAL_WIDTH"; width: number }
-  | { type: "TIGHTEN_WIDTH"; width: number }
-  | { type: "TRADE_ON_WIDTH" }
-  | { type: "SUBMIT_MARKET_QUOTE"; quote: Quote }
+  | { type: "SUBMIT_INITIAL_WIDTH"; width: number; turnDeadlineMs: UnixTimeMs }
+  | { type: "TIGHTEN_WIDTH"; width: number; turnDeadlineMs: UnixTimeMs }
+  | { type: "TRADE_ON_WIDTH"; turnDeadlineMs: UnixTimeMs }
+  | { type: "SUBMIT_MARKET_QUOTE"; quote: Quote; turnDeadlineMs: UnixTimeMs }
   | { type: "MARKET_COMMIT_FAILED"; error: string }
   | { type: "EXECUTE_TRADE"; side: TradeSide }
   | {
@@ -201,7 +251,12 @@ export type GameAction =
       item: SettledGeneratedItem;
       settlement: RoundSettlement;
     }
-  | { type: "SETTLEMENT_FAILED"; error: string }
+  | { type: "SETTLEMENT_FAILED"; error: string; turnDeadlineMs: UnixTimeMs }
+  // Server-only: dispatched by the Worker alarm when a stamped turnDeadlineMs
+  // elapses. Never decoded from client input (see protocol.ts) - the reducer
+  // trusts it exactly like SETTLEMENT_RECEIVED trusts its settlement input,
+  // because both only ever originate from trusted server-side callers.
+  | { type: "TURN_EXPIRED" }
   | { type: "NEXT_ROUND" }
   | { type: "RESET" };
 
