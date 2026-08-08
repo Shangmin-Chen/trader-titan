@@ -1,12 +1,6 @@
-import {
-  expect,
-  test,
-  type Browser,
-  type BrowserContext,
-  type Page,
-} from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
+import { createAndJoinRoom, ROOM_PHASE_TIMEOUT_MS } from "./helpers";
 
-const ROOM_PHASE_TIMEOUT_MS = 15_000;
 // The reconnect supervisor's heartbeat watchdog needs up to ~40s to notice a
 // socket that went silent without a clean close (20s ping interval, 10s pong
 // deadline, 2 missed pongs) before it force-closes the socket and the
@@ -327,61 +321,6 @@ test.describe("Mobile viewport and a11y smoke", () => {
     await expect(skipLink).toHaveCount(1);
   });
 });
-
-async function createAndJoinRoom(
-  browser: Browser,
-  baseURL: string | undefined,
-  options: Readonly<{
-    totalRounds?: number;
-    /**
-     * Runs right after the guest `Page` is created but before it navigates
-     * anywhere — i.e. strictly before the guest's first WebSocket connects.
-     * Lets a test install a `page.routeWebSocket()` interceptor (or similar)
-     * that must govern the *first* socket (the one carrying live gameplay),
-     * not just a later reconnect attempt.
-     */
-    beforeGuestJoin?: (guest: Page) => Promise<void>;
-  }> = {},
-): Promise<{
-  host: Page;
-  guest: Page;
-  hostContext: BrowserContext;
-  guestContext: BrowserContext;
-  inviteUrl: string;
-}> {
-  const hostContext = await browser.newContext({ baseURL });
-  const guestContext = await browser.newContext({ baseURL });
-  const host = await hostContext.newPage();
-  const guest = await guestContext.newPage();
-
-  if (options.beforeGuestJoin) {
-    await options.beforeGuestJoin(guest);
-  }
-
-  await host.goto("/");
-  await expect(host.getByTestId("create-room-form")).toBeVisible();
-  await host.getByTestId("create-room-form").getByLabel("Your name").fill("Ada");
-  await host.getByLabel("Total rounds").fill(String(options.totalRounds ?? 1));
-  await host.getByRole("button", { name: "Create invite room" }).click();
-  await expect(host.getByTestId("room-controls")).toBeVisible({
-    timeout: ROOM_PHASE_TIMEOUT_MS,
-  });
-  await expect(host.getByRole("button", { name: "Start game" })).toBeDisabled();
-
-  const inviteUrl = await host.locator("#room-invite-link").inputValue();
-
-  await guest.goto(inviteUrl);
-  await expect(guest.getByTestId("join-room-form")).toBeVisible();
-  await expect(guest.getByTestId("create-room-form")).toHaveCount(0);
-  await guest.getByTestId("join-room-form").getByLabel("Your name").fill("Grace");
-  await guest.getByRole("button", { name: "Join as player B" }).click();
-  await expect(guest.getByTestId("room-controls")).toBeVisible({
-    timeout: ROOM_PHASE_TIMEOUT_MS,
-  });
-  await expect(guest.locator("#room-invite-link")).toHaveCount(0);
-
-  return { host, guest, hostContext, guestContext, inviteUrl };
-}
 
 /**
  * Plays round 1 to settlement under the default player-entered-query flow:
