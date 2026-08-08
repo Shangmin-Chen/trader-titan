@@ -117,6 +117,27 @@ describe("game reducer", () => {
     expect(nextState).toBe(state);
   });
 
+  it("EXECUTE_TRADE's own settling transition drops turnDeadlineMs, just like the F-06 timeout path does", () => {
+    // Mirrors the F-06 "drops turnDeadlineMs" assertion below for the
+    // timeout-forced transition into settling: that test alone left this
+    // ordinary (trader actually chose a side) transition unguarded, and
+    // reintroducing `...state` on EXECUTE_TRADE's own case (see the
+    // reducer's "Deliberately not `...state`" comment) typechecks clean and
+    // passes every other unit test, since TS does not flag excess
+    // properties introduced via spread.
+    const choosing = readyForSideChoice({ bid: 200, ask: 400 });
+    const settling = executeTrade(choosing, "BUY");
+
+    expect(settling.phase).toBe("settling");
+
+    if (settling.phase !== "settling") {
+      throw new Error("Expected settling state.");
+    }
+
+    expect(settling.pendingTrade).toEqual({ kind: "chosen", side: "BUY" });
+    expect("turnDeadlineMs" in settling).toBe(false);
+  });
+
   it("guards non-reset actions outside their valid phases", () => {
     const setup = createInitialGameState();
     const generating = startGame(setup, startPayload);
