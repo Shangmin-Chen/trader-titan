@@ -402,7 +402,7 @@ describe("item generation retry affordance", () => {
       item: { round_id: "round-1", item_title: "Item", category: "Cat", context_clue: "Clue" },
       spreadWidth: 100,
       quote: { bid: 900, ask: 1000 },
-      pendingSide: "BUY",
+      pendingTrade: { kind: "chosen", side: "BUY" },
     } satisfies PublicRoomSnapshot["game"];
 
     expect(canRetryItemGeneration(settling, true)).toBe(true);
@@ -509,6 +509,7 @@ describe("per-command pending state (F-06)", () => {
         marketMaker: "A",
         traderPnL: 0,
         marketMakerPnL: 0,
+        forcedByTimeout: false,
       },
     },
   } satisfies PublicRoomSnapshot;

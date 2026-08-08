@@ -86,6 +86,9 @@ const STALE_ROUND_SETTLE_ROOM_NAME = "worker-room-stale-round-settle";
 const TURN_EXPIRY_ALARM_ROOM_NAME = "worker-room-turn-expiry-alarm";
 const TURN_EXPIRY_TTL_ROOM_NAME = "worker-room-turn-expiry-ttl";
 const STALE_TURN_EXPIRY_ROOM_NAME = "worker-room-stale-turn-expiry";
+const CHOOSING_SIDE_TIMEOUT_BUY_WORSE_ROOM_NAME = "worker-room-choosing-side-timeout-buy-worse";
+const CHOOSING_SIDE_TIMEOUT_SELL_WORSE_ROOM_NAME = "worker-room-choosing-side-timeout-sell-worse";
+const CHOOSING_SIDE_TIMEOUT_TIE_ROOM_NAME = "worker-room-choosing-side-timeout-tie";
 const GAME_ROOM_SMOKE_URL = "https://trader-titan.worker.test/room";
 const ROOM_COMMAND_URL = `${GAME_ROOM_SMOKE_URL}/command`;
 const ROOM_JOIN_URL = `${GAME_ROOM_SMOKE_URL}/join`;
@@ -1807,6 +1810,97 @@ describe("Cloudflare worker scaffold", () => {
     expect(resumed.room.revision).toBe(forced.revision + 1);
 
     guestConnection.socket.close();
+  });
+
+  // F-06: closes the shot-clock exploit where a trader who reads the quote
+  // as badly mispriced against them could deliberately stall choosingSide's
+  // clock to cap their loss at the spread width instead of taking a larger
+  // settlement loss. A choosingSide timeout must settle - via the exact same
+  // settling -> SETTLEMENT_RECEIVED path EXECUTE_TRADE uses, not a
+  // roundForfeited shortcut - against whichever side is worse for the
+  // trader, so stalling can never beat acting. The deterministic item
+  // provider (WORKER_ITEM_PROVIDER=deterministic, see vitest.worker.config.ts)
+  // fixes true_value at 3600 for every room in this file.
+  it("settles a choosingSide timeout against BUY when BUY is the worse side for the trader (F-06)", async () => {
+    const stub = roomStub(CHOOSING_SIDE_TIMEOUT_BUY_WORSE_ROOM_NAME);
+    // trueValue 3600, quote 3600/3800: buyPnL = 3600-3800 = -200,
+    // sellPnL = 3600-3600 = 0. BUY is worse.
+    const { hostToken, quoted } = await readyChoosingSide(stub, { bid: 3600, ask: 3800 });
+
+    const forced = await forcePastTurnDeadline(stub);
+
+    if (forced.game.phase !== "choosingSide") {
+      throw new Error("Expected choosingSide after forcing the deadline.");
+    }
+
+    await runRoomCleanupAlarm(stub);
+
+    const resumed = await accessRoom(stub, hostToken);
+
+    expect(resumed.room.game.phase).toBe("settlement");
+
+    if (resumed.room.game.phase !== "settlement") {
+      throw new Error("Expected settlement after the F-06 forced settle effect ran.");
+    }
+    expect(resumed.room.game.settlement.side).toBe("BUY");
+    expect(resumed.room.game.settlement.forcedByTimeout).toBe(true);
+    expect(resumed.room.game.settlement.traderPnL).toBe(-200);
+    expect(resumed.room.game.item.true_value).toBe(3600);
+    expect(resumed.room.revision).toBe(quoted.room.revision + 2);
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual(noPrivateItemKeys());
+  });
+
+  it("settles a choosingSide timeout against SELL when SELL is the worse side for the trader (F-06)", async () => {
+    const stub = roomStub(CHOOSING_SIDE_TIMEOUT_SELL_WORSE_ROOM_NAME);
+    // trueValue 3600, quote 3300/3500: buyPnL = 3600-3500 = 100,
+    // sellPnL = 3300-3600 = -300. SELL is worse.
+    const { hostToken } = await readyChoosingSide(stub, { bid: 3300, ask: 3500 });
+
+    const forced = await forcePastTurnDeadline(stub);
+
+    if (forced.game.phase !== "choosingSide") {
+      throw new Error("Expected choosingSide after forcing the deadline.");
+    }
+
+    await runRoomCleanupAlarm(stub);
+
+    const resumed = await accessRoom(stub, hostToken);
+
+    expect(resumed.room.game.phase).toBe("settlement");
+
+    if (resumed.room.game.phase !== "settlement") {
+      throw new Error("Expected settlement after the F-06 forced settle effect ran.");
+    }
+    expect(resumed.room.game.settlement.side).toBe("SELL");
+    expect(resumed.room.game.settlement.forcedByTimeout).toBe(true);
+    expect(resumed.room.game.settlement.traderPnL).toBe(-300);
+  });
+
+  it("breaks an exact choosingSide-timeout PnL tie by deterministically forcing BUY (F-06)", async () => {
+    const stub = roomStub(CHOOSING_SIDE_TIMEOUT_TIE_ROOM_NAME);
+    // trueValue 3600, quote 3500/3700: buyPnL = 3600-3700 = -100,
+    // sellPnL = 3500-3600 = -100. Tied - must resolve to BUY, not depend on
+    // iteration order or floating point.
+    const { hostToken } = await readyChoosingSide(stub, { bid: 3500, ask: 3700 });
+
+    const forced = await forcePastTurnDeadline(stub);
+
+    if (forced.game.phase !== "choosingSide") {
+      throw new Error("Expected choosingSide after forcing the deadline.");
+    }
+
+    await runRoomCleanupAlarm(stub);
+
+    const resumed = await accessRoom(stub, hostToken);
+
+    expect(resumed.room.game.phase).toBe("settlement");
+
+    if (resumed.room.game.phase !== "settlement") {
+      throw new Error("Expected settlement after the F-06 forced settle effect ran.");
+    }
+    expect(resumed.room.game.settlement.side).toBe("BUY");
+    expect(resumed.room.game.settlement.forcedByTimeout).toBe(true);
+    expect(resumed.room.game.settlement.traderPnL).toBe(-100);
   });
 
   it("schedules the nearest of all three deadlines: the F-05 turn clock outranks the TTL when no settle effect is pending", async () => {
@@ -4267,6 +4361,69 @@ async function applyRoomCommandWithoutTrueValue(
   expect(response.status).toBe(HTTP_OK_STATUS);
 
   return expectPublicJsonWithoutTrueValue<CommandRoomResponse>(response);
+}
+
+/**
+ * Builds a fresh room up through choosingSide with a caller-controlled
+ * quote, for the F-06 forced-worst-side-settlement tests: they each need a
+ * specific bid/ask against the deterministic provider's fixed true_value
+ * (3600) to steer which side ends up worse for the trader. Width is derived
+ * from the quote itself so the two always agree.
+ */
+async function readyChoosingSide(
+  stub: GameRoomStub,
+  quote: { bid: number; ask: number }
+): Promise<{
+  hostToken: RoomCapabilityToken;
+  guestToken: RoomCapabilityToken;
+  quoted: CommandRoomResponse;
+}> {
+  const created = await createRoom(stub, "Host");
+
+  if (!created.created) {
+    throw new Error("Expected a newly created room.");
+  }
+
+  const joined = await joinRoom(stub, "Guest");
+  const started = await applyRoomCommandWithoutTrueValue(stub, {
+    type: "START_ROOM",
+    credential: created.hostToken
+  });
+
+  if (started.room.game.phase !== "proposingWidth") {
+    throw new Error("Expected generated item to be ready.");
+  }
+
+  const width = await applyRoomCommandWithoutTrueValue(stub, {
+    type: "SUBMIT_INITIAL_WIDTH",
+    credential: created.hostToken,
+    width: quote.ask - quote.bid
+  });
+
+  if (width.room.game.phase !== "negotiatingWidth") {
+    throw new Error("Expected negotiatingWidth phase.");
+  }
+
+  const configuring = await applyRoomCommandWithoutTrueValue(stub, {
+    type: "TRADE_ON_WIDTH",
+    credential: joined.guestToken
+  });
+
+  if (configuring.room.game.phase !== "configuringMarket") {
+    throw new Error("Expected configuringMarket phase.");
+  }
+
+  const quoted = await applyRoomCommandWithoutTrueValue(stub, {
+    type: "SUBMIT_MARKET_QUOTE",
+    credential: created.hostToken,
+    quote
+  });
+
+  if (quoted.room.game.phase !== "choosingSide") {
+    throw new Error("Expected choosingSide phase.");
+  }
+
+  return { hostToken: created.hostToken, guestToken: joined.guestToken, quoted };
 }
 
 async function settleCurrentRound(

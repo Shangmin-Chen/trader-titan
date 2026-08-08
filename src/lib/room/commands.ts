@@ -3,7 +3,7 @@ import {
   gameReducer,
   startGame as startGameReducer,
 } from "../game/reducer";
-import { calculateSettlement } from "../game/settlement";
+import { calculateSettlement, resolvePendingTradeSide } from "../game/settlement";
 import {
   CHOOSING_SIDE_TURN_DURATION_MS,
   CONFIGURING_MARKET_TURN_DURATION_MS,
@@ -327,11 +327,14 @@ export function failRoomItem(
  * unchanged; see specs/room-protocol.md.
  *
  * The settling branch intentionally does not touch the reducer: the room
- * is left exactly as EXECUTE_TRADE committed it (same item, quote, and
- * pendingSide), and the caller re-runs the settlement effect
- * (Worker `applyAutomaticRoomEffects` -> `receiveStoredSettlement`) against
- * that unchanged state. Settlement is a pure function of
- * (item, quote, side), so retrying cannot change or re-roll the outcome.
+ * is left exactly as EXECUTE_TRADE (or an F-06 choosingSide timeout)
+ * committed it (same item, quote, and pendingTrade), and the caller re-runs
+ * the settlement effect (Worker `applyAutomaticRoomEffects` ->
+ * `receiveStoredSettlement`) against that unchanged state. Settlement is a
+ * pure function of (item, quote, side), so retrying cannot change or re-roll
+ * the outcome - including which side a forced timeout resolves to, since
+ * that is itself a pure function of (quote, true_value) via
+ * resolvePendingTradeSide.
  */
 export function retryRoomItemGeneration(
   room: RoomState,
@@ -462,13 +465,20 @@ export function receiveRoomSettlement(
     return commandFailure(room, "invalid_game_phase", "Settlements can only be received while the room is settling.");
   }
 
+  // F-06: pendingTrade is either a trader's own EXECUTE_TRADE choice or a
+  // choosingSide clock expiry deferred here specifically because this is the
+  // one place the private true_value (from `item`) and the pending decision
+  // are both in scope at once - see resolvePendingTradeSide and
+  // PendingTradeDecision.
+  const side = resolvePendingTradeSide(room.game.pendingTrade, room.game.quote, item.true_value);
   const settlement = calculateSettlement({
     roundNumber: room.game.roundNumber,
     itemTitle: room.game.item.item_title,
     trueValue: item.true_value,
     quote: room.game.quote,
-    side: room.game.pendingSide,
+    side,
     roles: room.game.roles,
+    forcedByTimeout: room.game.pendingTrade.kind === "timeoutForcedWorstSide",
   });
 
   return applySystemGameAction(
@@ -507,9 +517,10 @@ export function failRoomSettlement(
  * elapses (see scheduleNextAlarm / alarm() in src/worker/index.ts). Routed
  * through the reducer exactly like receiveRoomSettlement routes
  * SETTLEMENT_RECEIVED, so the FSM stays the single source of truth: a
- * late-arriving player command against a room already moved to
- * roundForfeited is a harmless no-op via the same phase guard every other
- * command already relies on.
+ * late-arriving player command against a room already moved on - to
+ * roundForfeited for proposingWidth/negotiatingWidth/configuringMarket, or
+ * to settling for an F-06 choosingSide timeout - is a harmless no-op via the
+ * same phase guard every other command already relies on.
  */
 export function expireRoomTurn(
   room: RoomState,

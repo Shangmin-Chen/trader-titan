@@ -28,6 +28,19 @@ export const CHOOSING_SIDE_TURN_DURATION_MS = 30_000;
 // spread widths already used throughout this codebase's own tests (100,
 // 200, 300, 500). 100 keeps an early-round forfeit a real stake in that
 // mode instead of a token amount that would make stalling free.
+//
+// This flat-penalty forfeit still applies to proposingWidth, negotiatingWidth,
+// and configuringMarket. It deliberately does NOT apply to choosingSide any
+// more (F-06): by choosingSide the trader has already seen the market
+// maker's two-sided quote, and settlement PnL (trueValue - transactionPrice)
+// is unbounded and unrelated to the spread width. A flat, width-sized
+// penalty there let a trader who read the quote as badly mispriced against
+// them deliberately stall out the clock to cap their loss at the spread
+// width instead of taking a much larger settlement loss - the shot clock
+// handed them a free downside-capped option. See TURN_EXPIRED in the
+// reducer and resolvePendingTradeSide in settlement.ts for the fix: a
+// choosingSide timeout now settles as if the trader took whichever side is
+// worse for them, so stalling can never beat acting.
 export const PROPOSING_WIDTH_FORFEIT_PENALTY = 100;
 
 export type GameMode = (typeof GAME_MODES)[number];
@@ -107,14 +120,28 @@ export type RoundSettlement = {
   marketMaker: PlayerId;
   traderPnL: number;
   marketMakerPnL: number;
+  // F-06: true when this settlement was not a trade the trader chose, but a
+  // side forced by their choosingSide clock expiring (see
+  // resolvePendingTradeSide in settlement.ts). `side` above always records
+  // the side actually settled against either way, so the log and settlement
+  // UI stay honest about the transaction itself; this flag is what lets
+  // them also be honest about *why* - the trader did not pick `side`, the
+  // clock did, picking whichever of BUY/SELL was worse for the trader.
+  forcedByTimeout: boolean;
 };
 
 /**
  * Records a round that ended because a player's shot clock expired rather
  * than through a trade. `phase` is the actionable phase the clock ran out
- * in (never "settling" or any non-clocked phase - see TURN_EXPIRED in the
- * reducer). Zero-sum like RoundSettlement: forfeitedBy loses `penalty`,
- * awardedTo gains it.
+ * in - `proposingWidth`, `negotiatingWidth`, or `configuringMarket` (never
+ * `choosingSide`, `settling`, or any other non-clocked phase). choosingSide's
+ * clock expiring is handled differently: see F-06 in TURN_EXPIRED in the
+ * reducer - by choosingSide the trader has already seen a quote, so a flat
+ * forfeit penalty would let them cap a bad settlement loss at the spread
+ * width instead of taking it. That case routes through `settling` and
+ * RoundSettlement (with `forcedByTimeout: true`) instead of RoundForfeit.
+ * Zero-sum like RoundSettlement: forfeitedBy loses `penalty`, awardedTo
+ * gains it.
  */
 export type RoundForfeit = {
   roundNumber: number;
@@ -124,6 +151,21 @@ export type RoundForfeit = {
   awardedTo: PlayerId;
   penalty: number;
 };
+
+/**
+ * What `settling` is waiting to resolve into an actual TradeSide once the
+ * private true_value is known server-side (see receiveRoomSettlement in
+ * src/lib/room/commands.ts, the one place that has both this and true_value
+ * at the same time). "chosen" is a trader's own EXECUTE_TRADE. F-06's
+ * "timeoutForcedWorstSide" is a choosingSide clock expiry: the reducer
+ * cannot pick a side for it at TURN_EXPIRED time (true_value is private and
+ * never reaches the client-visible GameState), so it defers the decision by
+ * carrying this sentinel into settling instead of a resolved TradeSide - see
+ * resolvePendingTradeSide in settlement.ts for where it is finally resolved.
+ */
+export type PendingTradeDecision =
+  | { kind: "chosen"; side: TradeSide }
+  | { kind: "timeoutForcedWorstSide" };
 
 export type RoundLogEntry = {
   id: number;
@@ -186,7 +228,7 @@ export type SettlingGameState = GameStateBase & {
   item: GeneratedItem;
   spreadWidth: number;
   quote: Quote;
-  pendingSide: TradeSide;
+  pendingTrade: PendingTradeDecision;
 };
 
 export type SettlementGameState = GameStateBase & {

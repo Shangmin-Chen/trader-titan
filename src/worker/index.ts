@@ -745,7 +745,11 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
    * a turn deadline only exists on the four actionable phases
    * (proposingWidth / negotiatingWidth / configuringMarket / choosingSide)
    * and a pending settle effect only exists in "settling", so there is no
-   * ordering to get wrong between them.
+   * ordering to get wrong between them. (F-06's choosingSide timeout moves
+   * the room INTO "settling" as part of processing a turn-clock wake, so a
+   * turnExpiry tick can itself durably write a fresh pending settle effect -
+   * see runDueTurnExpiry - but that is a one-way transition, never a state
+   * where both were simultaneously due for the same tick.)
    */
   async alarm(): Promise<void> {
     const nowMs = currentUnixTimeMs();
@@ -802,9 +806,19 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
    * This is what keeps a stale alarm wake - the round already advanced past
    * the deadline that armed this wake, between alarm()'s outer transaction
    * and this one - from forfeiting a round that has already moved on.
+   *
+   * F-06: when the expired deadline was choosingSide's, TURN_EXPIRED moves
+   * the room into "settling" instead of "roundForfeited" (see the reducer).
+   * That is the exact same "committed a transition into settling but the
+   * settlement effect might never run" shape EXECUTE_TRADE's own commit path
+   * guards against (see the F-02 comment on applyDecodedRoomCommand and
+   * pendingEffectForCommittedRoom), so it needs the identical treatment: a
+   * fresh pending-settle-effect marker written in the SAME transaction as
+   * the phase transition, and an immediate attempt at the settle effect
+   * afterward rather than waiting for the alarm's own next tick.
    */
   private async runDueTurnExpiry(room: RoomState, nowMs: UnixTimeMs): Promise<void> {
-    await this.ctx.storage.transaction(async (transaction) => {
+    const committed = await this.ctx.storage.transaction(async (transaction) => {
       const loaded = loadStoredRoomEnvelope(
         await transaction.get<unknown>(ROOM_STORAGE_KEY),
         nowMs
@@ -815,7 +829,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         // and this one. Purge fully rather than leaving an expired envelope
         // and its private items behind with no alarm armed to clean them up.
         await purgeExpiredRoomState(transaction);
-        return;
+        return null;
       }
 
       const pendingEffect = loadPendingRoomEffect(
@@ -830,7 +844,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         // Reschedule against the freshly-loaded room instead of forfeiting
         // a round that has already moved on.
         await scheduleNextAlarm(transaction, loaded.room, pendingEffect);
-        return;
+        return null;
       }
 
       const eventResult = dispatchSystemRoomEvent(loaded.room, {
@@ -844,14 +858,31 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         // reducer's own phase guard exactly). Reschedule rather than
         // looping on an alarm that cannot make progress.
         await scheduleNextAlarm(transaction, loaded.room, pendingEffect);
-        return;
+        return null;
       }
 
-      // A turn deadline never coexists with a pending settle effect (see
-      // the class-level alarm() comment), so there is nothing to carry
-      // forward here; passing null also self-heals any stale marker.
-      await persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
+      // Only an F-06 choosingSide timeout lands in "settling" here; a
+      // forfeit into "roundForfeited" carries no pending effect, same as
+      // before this case existed.
+      const nextPendingEffect =
+        eventResult.room.lifecycle === "active" && eventResult.room.game.phase === "settling"
+          ? freshSettlePendingEffect(eventResult.room.game.item.round_id, nowMs)
+          : null;
+
+      await persistRoomEnvelope(transaction, eventResult.room, nextPendingEffect, nowMs);
+
+      return nextPendingEffect === null ? null : eventResult.room;
     });
+
+    if (committed === null) {
+      return;
+    }
+
+    // Mirrors applyAutomaticRoomEffects' EXECUTE_TRADE handling: attempt the
+    // settle effect immediately instead of waiting for the alarm's own next
+    // tick. If this isolate is evicted mid-effect, the pending-effect marker
+    // just persisted above is the same F-02 trapdoor that resumes it later.
+    await this.receiveStoredSettlement(committed, nowMs);
   }
 
   private async runDuePendingRoomEffect(

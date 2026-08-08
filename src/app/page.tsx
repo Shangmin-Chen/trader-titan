@@ -34,6 +34,7 @@ import {
   GAME_MODES,
   MAX_ROUNDS,
   formatSignedNumber,
+  formatTradeSide,
   parseNumericInput,
   validateStartGame,
   type GameMode,
@@ -1587,11 +1588,27 @@ function RoomGameView({
           <ItemPanel item={game.item} />
           <section className="phase-panel" data-testid="settling-panel">
             <p className="eyebrow">Settling trade</p>
-            <h2>
-              {game.players[game.roles.trader].name} chose{" "}
-              {game.pendingSide === "BUY" ? "Buy" : "Sell"}
-            </h2>
-            <p>The server is revealing the true value and computing PnL.</p>
+            {game.pendingTrade.kind === "chosen" ? (
+              <>
+                <h2>
+                  {game.players[game.roles.trader].name} chose{" "}
+                  {formatTradeSide(game.pendingTrade.side)}
+                </h2>
+                <p>The server is revealing the true value and computing PnL.</p>
+              </>
+            ) : (
+              <>
+                <h2>{game.players[game.roles.trader].name} ran out of time</h2>
+                <p
+                  className="settlement-panel__forced-note"
+                  data-testid="settling-forced-note"
+                >
+                  The clock expired before a side was chosen, so the round
+                  will settle against whichever side is worse for{" "}
+                  {game.players[game.roles.trader].name}.
+                </p>
+              </>
+            )}
             <div className="loading-line" aria-label="Loading" />
             {canRetry ? (
               <div className="room-actions">

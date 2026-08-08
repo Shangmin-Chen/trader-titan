@@ -3,6 +3,7 @@ import {
   FINISHED_ROOM_TTL_MS,
   createLobbyRoom,
   executeTrade,
+  expireRoomTurn,
   isRoomExpired,
   joinRoom,
   loadPersistenceEnvelope,
@@ -229,7 +230,255 @@ describe("room persistence", () => {
       });
     }
   });
+
+  it("round-trips a settling room with a trader-chosen pendingTrade", () => {
+    const { room, hostToken, guestToken } = joinedRoom();
+    const settling = settlingRoomChosen(room, hostToken, guestToken);
+    const envelope = toPersistenceEnvelope(settling, NOW_MS + 12);
+
+    expect(settling.game.phase).toBe("settling");
+    expect(loadPersistenceEnvelope(envelope, envelope.expiresAtMs - 1)).toEqual({
+      ok: true,
+      room: settling,
+    });
+  });
+
+  it("round-trips a settling room with an F-06 timeout-forced pendingTrade", () => {
+    const { room, hostToken, guestToken } = joinedRoom();
+    const settling = settlingRoomForcedByTimeout(room, hostToken, guestToken);
+    const envelope = toPersistenceEnvelope(settling, NOW_MS + 12);
+
+    expect(settling.game.phase).toBe("settling");
+
+    if (settling.game.phase !== "settling") {
+      throw new Error("Expected settling phase.");
+    }
+    expect(settling.game.pendingTrade).toEqual({ kind: "timeoutForcedWorstSide" });
+    expect(loadPersistenceEnvelope(envelope, envelope.expiresAtMs - 1)).toEqual({
+      ok: true,
+      room: settling,
+    });
+  });
+
+  it("rejects a settling room whose pendingTrade carries an unexpected shape", () => {
+    const { room, hostToken, guestToken } = joinedRoom();
+    const settling = settlingRoomChosen(room, hostToken, guestToken);
+    const envelope = toPersistenceEnvelope(settling, NOW_MS + 12);
+
+    for (const badPendingTrade of [
+      // "chosen" with an invalid side.
+      { kind: "chosen", side: "HOLD" },
+      // "chosen" carrying a stray extra field.
+      { kind: "chosen", side: "BUY", forced: false },
+      // "timeoutForcedWorstSide" must not also carry a side.
+      { kind: "timeoutForcedWorstSide", side: "BUY" },
+      // Unknown kind entirely.
+      { kind: "cancelled" },
+    ]) {
+      expect(loadPersistenceEnvelope(
+        {
+          ...envelope,
+          room: {
+            ...settling,
+            game: {
+              ...settling.game,
+              pendingTrade: badPendingTrade,
+            },
+          },
+        },
+        envelope.expiresAtMs - 1,
+      )).toEqual({
+        ok: false,
+        error: {
+          code: "persistence_invalid",
+          message: "Room persistence envelope is invalid.",
+        },
+      });
+    }
+  });
+
+  it("round-trips a forced settlement (F-06) with forcedByTimeout intact", () => {
+    const { room, hostToken, guestToken } = joinedRoom();
+    const settling = settlingRoomForcedByTimeout(room, hostToken, guestToken);
+
+    if (settling.game.phase !== "settling") {
+      throw new Error("Expected settling phase.");
+    }
+
+    const settled = normalizeForPersistence(
+      expectOk(
+        receiveRoomSettlement(
+          settling,
+          { ...settling.game.item, true_value: 3600 },
+          NOW_MS + 9,
+        ),
+      ),
+    );
+
+    expect(settled.game.phase).toBe("settlement");
+
+    if (settled.game.phase !== "settlement") {
+      throw new Error("Expected settlement phase.");
+    }
+    expect(settled.game.settlement.forcedByTimeout).toBe(true);
+
+    const envelope = toPersistenceEnvelope(settled, NOW_MS + 12);
+
+    expect(loadPersistenceEnvelope(envelope, envelope.expiresAtMs - 1)).toEqual({
+      ok: true,
+      room: settled,
+    });
+  });
+
+  it("rejects a settlement whose forcedByTimeout is missing or not a boolean", () => {
+    const { room, hostToken, guestToken } = joinedRoom();
+    const settling = settlingRoomForcedByTimeout(room, hostToken, guestToken);
+
+    if (settling.game.phase !== "settling") {
+      throw new Error("Expected settling phase.");
+    }
+
+    const settled = normalizeForPersistence(
+      expectOk(
+        receiveRoomSettlement(
+          settling,
+          { ...settling.game.item, true_value: 3600 },
+          NOW_MS + 9,
+        ),
+      ),
+    );
+
+    if (settled.game.phase !== "settlement") {
+      throw new Error("Expected settlement phase.");
+    }
+
+    const envelope = toPersistenceEnvelope(settled, NOW_MS + 12);
+
+    const settlementWithoutForcedByTimeout: Record<string, unknown> = {
+      ...settled.game.settlement,
+    };
+    delete settlementWithoutForcedByTimeout.forcedByTimeout;
+
+    for (const badSettlement of [
+      // forcedByTimeout entirely missing.
+      settlementWithoutForcedByTimeout,
+      // forcedByTimeout present but the wrong type.
+      { ...settled.game.settlement, forcedByTimeout: "true" },
+    ]) {
+      expect(loadPersistenceEnvelope(
+        {
+          ...envelope,
+          room: {
+            ...settled,
+            game: {
+              ...settled.game,
+              settlement: badSettlement,
+            },
+          },
+        },
+        envelope.expiresAtMs - 1,
+      )).toEqual({
+        ok: false,
+        error: {
+          code: "persistence_invalid",
+          message: "Room persistence envelope is invalid.",
+        },
+      });
+    }
+  });
 });
+
+/**
+ * The reducer explicitly sets `lastError: undefined` on most transitions
+ * (an own key with an undefined value), which real Durable Object storage
+ * silently drops on write (structured-clone semantics, like JSON) but which
+ * survives untouched on an in-memory object. hasOnlyKeys checks the actual
+ * own keys, so a raw in-memory round-trip of these states spuriously fails
+ * where storage-backed persistence would not. Mirrors how the worker test
+ * suite's own forcePastTurnDeadline works around the identical gap
+ * (JSON.parse(JSON.stringify(...)) before persisting).
+ */
+function normalizeForPersistence<T>(value: T): T {
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function settlingRoomChosen(
+  room: RoomState,
+  hostToken: RoomCapabilityToken,
+  guestToken: RoomCapabilityToken,
+): RoomState & { game: Extract<RoomState["game"], { phase: "settling" }> } {
+  const started = expectOk(
+    startRoom(room, { credential: present(hostToken), verifyToken, nowMs: NOW_MS + 2 }),
+  );
+  const item = {
+    round_id: "round-persist-settling",
+    item_title: "Widget",
+    category: "Chaos Quant",
+    context_clue: "A test item.",
+  };
+  const withItem = expectOk(receiveRoomItem(started, item, NOW_MS + 3));
+  const width = expectOk(
+    submitInitialWidth(withItem, 200, { credential: present(hostToken), verifyToken, nowMs: NOW_MS + 4 }),
+  );
+  const configuring = expectOk(
+    tradeOnWidth(width, { credential: present(guestToken), verifyToken, nowMs: NOW_MS + 5 }),
+  );
+  const choosing = expectOk(
+    submitMarketQuote(configuring, { bid: 3500, ask: 3700 }, {
+      credential: present(hostToken),
+      verifyToken,
+      nowMs: NOW_MS + 6,
+    }),
+  );
+  const settling = normalizeForPersistence(
+    expectOk(
+      executeTrade(choosing, "BUY", { credential: present(guestToken), verifyToken, nowMs: NOW_MS + 7 }),
+    ),
+  );
+
+  if (settling.game.phase !== "settling") {
+    throw new Error("Expected settling phase.");
+  }
+
+  return settling as RoomState & { game: Extract<RoomState["game"], { phase: "settling" }> };
+}
+
+function settlingRoomForcedByTimeout(
+  room: RoomState,
+  hostToken: RoomCapabilityToken,
+  guestToken: RoomCapabilityToken,
+): RoomState & { game: Extract<RoomState["game"], { phase: "settling" }> } {
+  const started = expectOk(
+    startRoom(room, { credential: present(hostToken), verifyToken, nowMs: NOW_MS + 2 }),
+  );
+  const item = {
+    round_id: "round-persist-forced-settling",
+    item_title: "Widget",
+    category: "Chaos Quant",
+    context_clue: "A test item.",
+  };
+  const withItem = expectOk(receiveRoomItem(started, item, NOW_MS + 3));
+  const width = expectOk(
+    submitInitialWidth(withItem, 200, { credential: present(hostToken), verifyToken, nowMs: NOW_MS + 4 }),
+  );
+  const configuring = expectOk(
+    tradeOnWidth(width, { credential: present(guestToken), verifyToken, nowMs: NOW_MS + 5 }),
+  );
+  const choosing = expectOk(
+    submitMarketQuote(configuring, { bid: 3600, ask: 3800 }, {
+      credential: present(hostToken),
+      verifyToken,
+      nowMs: NOW_MS + 6,
+    }),
+  );
+  const settling = normalizeForPersistence(expectOk(expireRoomTurn(choosing, NOW_MS + 7)));
+
+  if (settling.game.phase !== "settling") {
+    throw new Error("Expected settling phase.");
+  }
+
+  return settling as RoomState & { game: Extract<RoomState["game"], { phase: "settling" }> };
+}
 
 function joinedRoom(): {
   room: RoomState;

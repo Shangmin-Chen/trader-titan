@@ -6,6 +6,7 @@ import {
   type GamePhase,
   type GameState,
   type GeneratedItem,
+  type PendingTradeDecision,
   type PlayerId,
   type ProviderGeneratedItem,
   type Quote,
@@ -274,11 +275,11 @@ function decodeGameState(value: unknown): GameState | null {
         ? value as GameState
         : null;
     case "settling":
-      return hasOnlyKeys(value, [...baseGameKeysFor(value), "item", "spreadWidth", "quote", "pendingSide"]) &&
+      return hasOnlyKeys(value, [...baseGameKeysFor(value), "item", "spreadWidth", "quote", "pendingTrade"]) &&
         isGeneratedItem(value.item) &&
         isValidSpreadWidth(value.spreadWidth) &&
         isQuoteForWidth(value.quote, value.spreadWidth) &&
-        isTradeSide(value.pendingSide) &&
+        isPendingTradeDecision(value.pendingTrade) &&
         isActiveRoundNumber(value)
         ? value as GameState
         : null;
@@ -468,7 +469,8 @@ function isRoundSettlement(value: unknown): value is RoundSettlement {
     isPlayerId(value.marketMaker) &&
     value.trader !== value.marketMaker &&
     isFiniteNumber(value.traderPnL) &&
-    isFiniteNumber(value.marketMakerPnL);
+    isFiniteNumber(value.marketMakerPnL) &&
+    typeof value.forcedByTimeout === "boolean";
 }
 
 function isRoundForfeit(value: unknown): value is RoundForfeit {
@@ -502,6 +504,7 @@ function isSettlementConsistent(value: Record<string, unknown>): boolean {
     quote: value.quote,
     side: settlement.side,
     roles: value.roles,
+    forcedByTimeout: settlement.forcedByTimeout,
   });
 
   return roundSettlementsEqual(settlement, expected);
@@ -519,7 +522,8 @@ function roundSettlementsEqual(
     left.trader === right.trader &&
     left.marketMaker === right.marketMaker &&
     left.traderPnL === right.traderPnL &&
-    left.marketMakerPnL === right.marketMakerPnL;
+    left.marketMakerPnL === right.marketMakerPnL &&
+    left.forcedByTimeout === right.forcedByTimeout;
 }
 
 function decodeTokenHash(value: unknown): TokenHash | null {
@@ -550,6 +554,27 @@ function isGamePhase(value: unknown): value is GamePhase {
 
 function isTradeSide(value: unknown): value is TradeSide {
   return value === "BUY" || value === "SELL";
+}
+
+/**
+ * F-06: mirrors PendingTradeDecision's two variants exactly - a "chosen"
+ * trade requires a validated TradeSide and nothing else, while
+ * "timeoutForcedWorstSide" carries no extra fields (the actual side is
+ * resolved later - see resolvePendingTradeSide - so persisting one here
+ * would be recomputable-but-stale data, not a fact about the pending
+ * decision). hasOnlyKeys on both branches keeps an illegal blend (e.g. a
+ * "timeoutForcedWorstSide" that also carries a stray `side`) unrepresentable.
+ */
+function isPendingTradeDecision(value: unknown): value is PendingTradeDecision {
+  if (!isRecord(value)) {
+    return false;
+  }
+
+  if (value.kind === "chosen") {
+    return hasOnlyKeys(value, ["kind", "side"]) && isTradeSide(value.side);
+  }
+
+  return value.kind === "timeoutForcedWorstSide" && hasOnlyKeys(value, ["kind"]);
 }
 
 function isPlayerId(value: unknown): value is PlayerId {

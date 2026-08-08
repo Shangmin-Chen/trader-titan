@@ -1459,6 +1459,23 @@ select.form-field__control {
   line-height: 1.45;
 }
 
+/* F-06: flags a settlement (or an in-progress settling round) that was
+   forced by a choosingSide clock expiry rather than chosen by the trader. */
+.settlement-panel__forced-note {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2xs);
+  margin: 0;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  background: var(--warn-dim);
+  border: 1px solid var(--warn-border);
+  color: var(--warn);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  line-height: 1.45;
+}
+
 /* PnL row colors — player A / player B */
 .settlement-panel__details .settlement-panel__detail:nth-child(4) dd {
   color: var(--player-a);

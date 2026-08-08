@@ -1,4 +1,12 @@
-import type { Quote, Roles, RoundForfeit, RoundSettlement, Scores, TradeSide } from "./types";
+import type {
+  PendingTradeDecision,
+  Quote,
+  Roles,
+  RoundForfeit,
+  RoundSettlement,
+  Scores,
+  TradeSide,
+} from "./types";
 
 type SettlementInput = {
   roundNumber: number;
@@ -7,6 +15,7 @@ type SettlementInput = {
   quote: Quote;
   side: TradeSide;
   roles: Roles;
+  forcedByTimeout: boolean;
 };
 
 export function calculateSettlement(input: SettlementInput): RoundSettlement {
@@ -23,6 +32,7 @@ export function calculateSettlement(input: SettlementInput): RoundSettlement {
       marketMaker: input.roles.marketMaker,
       traderPnL,
       marketMakerPnL: -traderPnL,
+      forcedByTimeout: input.forcedByTimeout,
     };
   }
 
@@ -38,7 +48,35 @@ export function calculateSettlement(input: SettlementInput): RoundSettlement {
     marketMaker: input.roles.marketMaker,
     traderPnL,
     marketMakerPnL: -traderPnL,
+    forcedByTimeout: input.forcedByTimeout,
   };
+}
+
+/**
+ * F-06: resolves what `settling` is waiting on (see PendingTradeDecision)
+ * into the actual TradeSide to settle against. A trader's own EXECUTE_TRADE
+ * passes straight through unchanged. A choosingSide clock expiry instead
+ * forces whichever side is worse for the trader - BUY pays trueValue - ask,
+ * SELL pays bid - trueValue (mirrors calculateSettlement's own PnL math) -
+ * so that letting the clock run out can never beat acting, closing the
+ * capped-downside exploit a flat forfeit penalty would otherwise leave open
+ * once the trader has already seen the quote. Ties are resolved to BUY
+ * deterministically rather than depending on floating point or iteration
+ * order.
+ */
+export function resolvePendingTradeSide(
+  pendingTrade: PendingTradeDecision,
+  quote: Quote,
+  trueValue: number,
+): TradeSide {
+  if (pendingTrade.kind === "chosen") {
+    return pendingTrade.side;
+  }
+
+  const buyPnL = trueValue - quote.ask;
+  const sellPnL = quote.bid - trueValue;
+
+  return buyPnL <= sellPnL ? "BUY" : "SELL";
 }
 
 export function applySettlementToScores(

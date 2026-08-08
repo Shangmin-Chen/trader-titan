@@ -32,7 +32,7 @@ The room protocol is the boundary between client transports and the pure room do
 - `RESET_TO_LOBBY`: host credential and `commandId`.
 - `KICK_GUEST`: host credential and `commandId`.
 - `ADVANCE_ROUND`: host credential and `commandId`.
-- `RETRY_ITEM_GENERATION`: host credential and `commandId`. Accepted for active rooms whose game is `error` with `previousPhase === "generatingItem"`, retrying generation, **or** whose game is `settling` (the room can become durably stuck here if the settlement effect never ran after `EXECUTE_TRADE` committed the transition), retrying settlement for the current round from the already-committed item, quote, and side without regenerating the item or restarting the round. Rejected with `invalid_game_phase` in every other phase.
+- `RETRY_ITEM_GENERATION`: host credential and `commandId`. Accepted for active rooms whose game is `error` with `previousPhase === "generatingItem"`, retrying generation, **or** whose game is `settling` (the room can become durably stuck here if the settlement effect never ran after `EXECUTE_TRADE`, or after an F-06 choosingSide timeout, committed the transition), retrying settlement for the current round from the already-committed item, quote, and pending trade decision without regenerating the item or restarting the round. Rejected with `invalid_game_phase` in every other phase.
 - `SUBMIT_INITIAL_WIDTH`: active player credential, `commandId`, and width.
 - `TIGHTEN_WIDTH`: active player credential, `commandId`, and width.
 - `TRADE_ON_WIDTH`: active player credential and `commandId`.
@@ -54,7 +54,7 @@ The room protocol is the boundary between client transports and the pure room do
 - `ITEM_FAILED`: safe error message.
 - `SETTLEMENT_RECEIVED`: settled private item. No caller-provided settlement is accepted.
 - `SETTLEMENT_FAILED`: safe error message.
-- `TURN_EXPIRED`: F-05 turn shot-clock expiry. Carries no caller-supplied data beyond the server's own timestamp; the room command layer derives who forfeits, who is awarded, and the penalty entirely from the room's own current state (active role for the phase, and the spread width in play, or a named fallback constant in `proposingWidth` where no width has been proposed yet). Valid only while the room is in `proposingWidth`, `negotiatingWidth`, `configuringMarket`, or `choosingSide`; rejected with `invalid_game_phase` everywhere else. Dispatched only by the Worker's Durable Object alarm when a stamped `turnDeadlineMs` elapses - never accepted from a client.
+- `TURN_EXPIRED`: F-05 turn shot-clock expiry. Carries no caller-supplied data beyond the server's own timestamp. For `proposingWidth`, `negotiatingWidth`, and `configuringMarket`, the room command layer derives who forfeits, who is awarded, and the penalty entirely from the room's own current state (active role for the phase, and the spread width in play, or a named fallback constant in `proposingWidth` where no width has been proposed yet). For `choosingSide`, F-06 instead moves the room to `settling` with an unresolved `pendingTrade` (`{ kind: "timeoutForcedWorstSide" }`) - see room-domain.md - rather than forfeiting, since the trader has already seen a quote by that point. Valid only while the room is in `proposingWidth`, `negotiatingWidth`, `configuringMarket`, or `choosingSide`; rejected with `invalid_game_phase` everywhere else. Dispatched only by the Worker's Durable Object alarm when a stamped `turnDeadlineMs` elapses - never accepted from a client.
 
 ## Transport Notes
 

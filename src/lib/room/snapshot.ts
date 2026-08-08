@@ -268,7 +268,7 @@ export function toPublicGameState(game: GameState): PublicRoomGameState {
           bid: game.quote.bid,
           ask: game.quote.ask,
         },
-        pendingSide: game.pendingSide,
+        pendingTrade: game.pendingTrade,
       };
     default:
       return assertNever(game);
@@ -368,6 +368,7 @@ function toPublicSettlement(settlement: RoundSettlement): RoundSettlement {
     marketMaker: settlement.marketMaker,
     traderPnL: settlement.traderPnL,
     marketMakerPnL: settlement.marketMakerPnL,
+    forcedByTimeout: settlement.forcedByTimeout,
   };
 }
 

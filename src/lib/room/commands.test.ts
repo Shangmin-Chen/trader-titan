@@ -345,7 +345,7 @@ describe("room commands", () => {
   it("lets the host retry a stuck settlement without mutating the room or the private item", () => {
     // The room command layer does not resolve the settlement itself; it
     // leaves the room exactly as EXECUTE_TRADE committed it (same item,
-    // quote, pendingSide) and reports success so the Worker layer can
+    // quote, pendingTrade) and reports success so the Worker layer can
     // re-run the settlement effect for the current round. See the
     // worker-level F-02 recovery test for the full end-to-end path.
     const { room, hostToken } = settlingRoom();
@@ -604,6 +604,102 @@ describe("room commands", () => {
       A: -PROPOSING_WIDTH_FORFEIT_PENALTY,
       B: PROPOSING_WIDTH_FORFEIT_PENALTY,
     });
+  });
+
+  it("moves a choosingSide timeout to settling with an unresolved pendingTrade instead of forfeiting (F-06)", () => {
+    const { room, hostToken, guestToken } = activeRoom();
+    const withItem = expectOk(receiveRoomItem(room, item, NOW_MS + 4));
+    const opened = expectOk(
+      submitInitialWidth(withItem, 200, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 5,
+      }),
+    );
+    const configuring = expectOk(
+      tradeOnWidth(opened, {
+        credential: present(guestToken),
+        verifyToken,
+        nowMs: NOW_MS + 6,
+      }),
+    );
+    const choosing = expectOk(
+      submitMarketQuote(configuring, { bid: 900, ask: 1100 }, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 7,
+      }),
+    );
+
+    expect(choosing.game.phase).toBe("choosingSide");
+
+    const expired = expireRoomTurn(choosing, NOW_MS + 8);
+
+    expect(expired.ok).toBe(true);
+
+    if (!expired.ok) {
+      throw new Error(expired.error.message);
+    }
+    expect(expired.room.game.phase).toBe("settling");
+
+    if (expired.room.game.phase !== "settling") {
+      throw new Error("Expected settling phase.");
+    }
+    expect(expired.room.game.pendingTrade).toEqual({ kind: "timeoutForcedWorstSide" });
+    // Unlike a forfeit, no penalty is applied at this point - the round is
+    // not over yet, it is still waiting on the private true_value.
+    expect(expired.room.game.scores).toEqual(choosing.game.scores);
+  });
+
+  it("resolves a choosingSide timeout's forced settlement against whichever side is worse for the trader", () => {
+    const { room, hostToken, guestToken } = activeRoom();
+    const withItem = expectOk(receiveRoomItem(room, item, NOW_MS + 4));
+    const opened = expectOk(
+      submitInitialWidth(withItem, 200, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 5,
+      }),
+    );
+    const configuring = expectOk(
+      tradeOnWidth(opened, {
+        credential: present(guestToken),
+        verifyToken,
+        nowMs: NOW_MS + 6,
+      }),
+    );
+    // Default round-1 roles: trader is B. Quote 3600/3800 against a true
+    // value of 3600 makes BUY (traderPnL -200) worse than SELL (0).
+    const choosing = expectOk(
+      submitMarketQuote(configuring, { bid: 3600, ask: 3800 }, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 7,
+      }),
+    );
+    const settling = expectOk(expireRoomTurn(choosing, NOW_MS + 8));
+
+    if (settling.game.phase !== "settling") {
+      throw new Error("Expected settling phase.");
+    }
+
+    const settled = expectOk(
+      receiveRoomSettlement(
+        settling,
+        { ...settling.game.item, true_value: 3600 },
+        NOW_MS + 9,
+      ),
+    );
+
+    expect(settled.game.phase).toBe("settlement");
+
+    if (settled.game.phase !== "settlement") {
+      throw new Error("Expected settlement phase.");
+    }
+    expect(settled.game.settlement.side).toBe("BUY");
+    expect(settled.game.settlement.forcedByTimeout).toBe(true);
+    expect(settled.game.settlement.traderPnL).toBe(-200);
+    expect(settled.game.scores).toEqual({ A: 200, B: -200 });
   });
 
   it("rejects turn expiry outside the four actionable phases without mutating the room", () => {

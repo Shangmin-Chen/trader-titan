@@ -14,6 +14,7 @@ import type {
   RoundLogEntry,
   Scores,
   SettledGeneratedItem,
+  SettlingGameState,
   StartGamePayload,
   TradeSide,
   UnixTimeMs,
@@ -149,15 +150,17 @@ function roleName(state: GameState, playerId: PlayerId): string {
 
 /**
  * The player whose action the clock is currently running against, mirroring
- * which role each of these four phases waits on (see the SUBMIT_INITIAL_WIDTH
- * / TIGHTEN_WIDTH / TRADE_ON_WIDTH / SUBMIT_MARKET_QUOTE / EXECUTE_TRADE
+ * which role each of these three phases waits on (see the
+ * SUBMIT_INITIAL_WIDTH / TIGHTEN_WIDTH / TRADE_ON_WIDTH / SUBMIT_MARKET_QUOTE
  * cases above and expectedPlayer() in src/lib/room/commands.ts, which
- * authorizes those same commands against the same roles).
+ * authorizes those same commands against the same roles). choosingSide is
+ * deliberately excluded: F-06 routes its clock expiry through settling
+ * instead of the flat-penalty forfeit this function backs - see TURN_EXPIRED.
  */
 function turnOwnerForPhase(
   state: Extract<
     GameState,
-    { phase: "proposingWidth" | "negotiatingWidth" | "configuringMarket" | "choosingSide" }
+    { phase: "proposingWidth" | "negotiatingWidth" | "configuringMarket" }
   >,
 ): PlayerId {
   switch (state.phase) {
@@ -165,7 +168,6 @@ function turnOwnerForPhase(
     case "configuringMarket":
       return state.roles.marketMaker;
     case "negotiatingWidth":
-    case "choosingSide":
       return state.roles.trader;
     default:
       return assertNeverPhase(state);
@@ -174,6 +176,44 @@ function turnOwnerForPhase(
 
 function assertNeverPhase(value: never): never {
   throw new Error(`Unhandled turn-clocked phase: ${JSON.stringify(value)}`);
+}
+
+/**
+ * F-06: builds the settling state a choosingSide clock expiry transitions
+ * into. Deliberately not `...state`, for the exact same reason EXECUTE_TRADE
+ * above spells out: choosingSide carries turnDeadlineMs (F-05), but settling
+ * is not a turn-clocked phase and must not inherit a stray one - the
+ * persistence decoder's per-phase key allowlist (src/lib/room/persistence.ts)
+ * rejects an unexpected field. `pendingTrade` is left unresolved
+ * ("timeoutForcedWorstSide") rather than a concrete TradeSide because the
+ * reducer has no true_value to decide which side is worse for the trader
+ * with - only the Worker, once it has fetched the private item, does (see
+ * receiveRoomSettlement in src/lib/room/commands.ts).
+ */
+function settlingStateFromChoosingSideTimeout(
+  state: Extract<GameState, { phase: "choosingSide" }>,
+): SettlingGameState {
+  return {
+    phase: "settling",
+    mode: state.mode,
+    ...(state.customAmazonQuery === undefined
+      ? {}
+      : { customAmazonQuery: state.customAmazonQuery }),
+    ...(state.aiGenerated === undefined
+      ? {}
+      : { aiGenerated: state.aiGenerated }),
+    players: state.players,
+    scores: state.scores,
+    roles: state.roles,
+    roundNumber: state.roundNumber,
+    totalRounds: state.totalRounds,
+    log: state.log,
+    item: state.item,
+    spreadWidth: state.spreadWidth,
+    quote: state.quote,
+    pendingTrade: { kind: "timeoutForcedWorstSide" },
+    lastError: undefined,
+  };
 }
 
 function winnerFromScores(scores: Scores): PlayerId | "Tie" {
@@ -455,7 +495,7 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         item: state.item,
         spreadWidth: state.spreadWidth,
         quote: state.quote,
-        pendingSide: action.side,
+        pendingTrade: { kind: "chosen", side: action.side },
         lastError: undefined,
       };
 
@@ -536,11 +576,27 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
     }
 
     case "TURN_EXPIRED": {
+      // F-06: choosingSide's clock expiring does NOT forfeit like the other
+      // three turn-clocked phases (see PROPOSING_WIDTH_FORFEIT_PENALTY's and
+      // RoundForfeit's doc comments for why: by choosingSide the trader has
+      // already seen the quote, so a flat penalty would cap a bad settlement
+      // loss instead of the trader having to take it). Route it through
+      // settling exactly like EXECUTE_TRADE, but with the actual side left
+      // unresolved - the reducer has no true_value to decide "worse for the
+      // trader" with here; see resolvePendingTradeSide in settlement.ts for
+      // where that happens once true_value is known server-side.
+      if (state.phase === "choosingSide") {
+        return withLog(
+          settlingStateFromChoosingSideTimeout(state),
+          "settling",
+          `${roleName(state, state.roles.trader)} ran out of time. Settling the round against ${roleName(state, state.roles.trader)}'s worse side.`,
+        );
+      }
+
       if (
         state.phase !== "proposingWidth" &&
         state.phase !== "negotiatingWidth" &&
-        state.phase !== "configuringMarket" &&
-        state.phase !== "choosingSide"
+        state.phase !== "configuringMarket"
       ) {
         return state;
       }
@@ -644,8 +700,13 @@ function settlementLogMessage(state: Extract<GameState, { phase: "settlement" }>
   const verb = side === "BUY" ? "bought" : "sold";
   const traderName = roleName(state, state.settlement.trader);
   const mmName = roleName(state, state.settlement.marketMaker);
+  // F-06: a forced settlement was never a choice the trader made, so the log
+  // says so instead of phrasing it like one - see RoundSettlement.forcedByTimeout.
+  const action = state.settlement.forcedByTimeout
+    ? `ran out of time and was settled as if they ${verb}`
+    : verb;
 
-  return `${traderName} ${verb} at ${state.settlement.transactionPrice}. True value was ${state.settlement.trueValue}. ${traderName} PnL ${state.settlement.traderPnL}; ${mmName} PnL ${state.settlement.marketMakerPnL}.`;
+  return `${traderName} ${action} at ${state.settlement.transactionPrice}. True value was ${state.settlement.trueValue}. ${traderName} PnL ${state.settlement.traderPnL}; ${mmName} PnL ${state.settlement.marketMakerPnL}.`;
 }
 
 export function startGame(
