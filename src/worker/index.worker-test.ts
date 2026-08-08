@@ -50,6 +50,8 @@ const STUCK_SETTLING_AUTO_RESUME_ROOM_NAME = "worker-room-stuck-settling-auto-re
 const STUCK_SETTLING_TTL_ROOM_NAME = "worker-room-stuck-settling-ttl";
 const STUCK_SETTLING_BOTH_DEADLINES_ROOM_NAME = "worker-room-stuck-settling-both-deadlines";
 const STUCK_SETTLING_EXHAUSTION_ROOM_NAME = "worker-room-stuck-settling-exhaustion";
+const STUCK_SETTLING_STALE_ROUND_EXHAUSTION_ROOM_NAME =
+  "worker-room-stuck-settling-stale-round-exhaustion";
 const STUCK_SETTLING_NO_DOUBLE_SETTLE_ROOM_NAME = "worker-room-stuck-settling-no-double-settle";
 const STUCK_SETTLING_MID_ALARM_EXPIRY_ROOM_NAME = "worker-room-stuck-settling-mid-alarm-expiry";
 const RETRY_SUCCESS_ROOM_NAME = "worker-room-retry-success";
@@ -1589,6 +1591,13 @@ describe("Cloudflare worker scaffold", () => {
       attempts: 0
     });
 
+    // Registered before the alarm runs (see the identical comment on the
+    // F-05 forfeit-broadcast test above) so the listener is armed before
+    // runDueSettleEffect's own broadcastRoomSnapshot call fires.
+    const autoResumeBroadcast = nextSocketMessage<RoomSnapshotSocketMessage>(
+      guestConnection.socket
+    );
+
     // The alarm fires on its own here - no RETRY_ITEM_GENERATION, no other
     // client command touches this room between forceStuckSettling and the
     // assertions below.
@@ -1611,6 +1620,15 @@ describe("Cloudflare worker scaffold", () => {
 
     await expect(readPendingRoomEffect(stub)).resolves.toBeNull();
     await expect(privateGeneratedItemKeys(stub)).resolves.toEqual(noPrivateItemKeys());
+
+    // This auto-resume is not a response to any request a client is
+    // waiting on either - without runDueSettleEffect's own broadcast, a
+    // connected client would never hear that F-02's own recovery path
+    // just settled the round out from under it.
+    const broadcast = await autoResumeBroadcast;
+
+    expect(broadcast.room.game.phase).toBe("settlement");
+    expect(broadcast.room.revision).toBe(resumed.room.revision);
 
     guestConnection.socket.close();
   });
@@ -1792,6 +1810,15 @@ describe("Cloudflare worker scaffold", () => {
 
     const { marketMaker, trader } = forced.game.roles;
 
+    // Registered before the alarm runs, mirroring how openRoomSocket itself
+    // registers its own "initial" listener before accept() - the alarm's
+    // broadcast (see runDueTurnExpiry's own broadcastRoomSnapshot call)
+    // happens synchronously inside runRoomCleanupAlarm below, so listening
+    // for it must start first or the message could already have been sent.
+    const forfeitBroadcast = nextSocketMessage<RoomSnapshotSocketMessage>(
+      guestConnection.socket
+    );
+
     await runRoomCleanupAlarm(stub);
 
     const resumed = await accessRoom(stub, created.hostToken);
@@ -1809,6 +1836,16 @@ describe("Cloudflare worker scaffold", () => {
     });
     expect(resumed.room.revision).toBe(forced.revision + 1);
 
+    // The alarm-driven forfeit is not a response to any request the client
+    // is waiting on, so a connected client only ever learns about it
+    // through an explicit broadcast - closing a gap where the round
+    // genuinely forfeited and persisted correctly but a connected client's
+    // own socket never heard about it until some unrelated later command.
+    const broadcast = await forfeitBroadcast;
+
+    expect(broadcast.room.game.phase).toBe("roundForfeited");
+    expect(broadcast.room.revision).toBe(resumed.room.revision);
+
     guestConnection.socket.close();
   });
 
@@ -1825,13 +1862,29 @@ describe("Cloudflare worker scaffold", () => {
     const stub = roomStub(CHOOSING_SIDE_TIMEOUT_BUY_WORSE_ROOM_NAME);
     // trueValue 3600, quote 3600/3800: buyPnL = 3600-3800 = -200,
     // sellPnL = 3600-3600 = 0. BUY is worse.
-    const { hostToken, quoted } = await readyChoosingSide(stub, { bid: 3600, ask: 3800 });
+    const { hostToken, guestToken, quoted } = await readyChoosingSide(stub, { bid: 3600, ask: 3800 });
+    // Opened after the room reaches choosingSide (a socket does not need to
+    // have been present since room creation to receive a later broadcast),
+    // so runDueTurnExpiry's own broadcastRoomSnapshot call - not just the
+    // committed storage - can be asserted on below.
+    const guestConnection = await openRoomSocket(stub, guestToken);
 
     const forced = await forcePastTurnDeadline(stub);
 
     if (forced.game.phase !== "choosingSide") {
       throw new Error("Expected choosingSide after forcing the deadline.");
     }
+
+    // Registered before the alarm runs (see the identical comment on the
+    // F-05 forfeit-broadcast test above): F-06's choosingSide timeout
+    // synchronously broadcasts twice within the one alarm invocation - once
+    // for runDueTurnExpiry's own settling transition, and again once
+    // receiveStoredSettlement resolves it - so both listeners must already
+    // be attached before the alarm runs (see nextSocketMessages).
+    const broadcasts = nextSocketMessages<RoomSnapshotSocketMessage>(
+      guestConnection.socket,
+      2
+    );
 
     await runRoomCleanupAlarm(stub);
 
@@ -1848,6 +1901,19 @@ describe("Cloudflare worker scaffold", () => {
     expect(resumed.room.game.item.true_value).toBe(3600);
     expect(resumed.room.revision).toBe(quoted.room.revision + 2);
     await expect(privateGeneratedItemKeys(stub)).resolves.toEqual(noPrivateItemKeys());
+
+    // F-06's settling -> settlement transition runs off the alarm just
+    // like a plain forfeit does - without runDueTurnExpiry's broadcast
+    // after entering settling, and receiveStoredSettlement's own broadcast
+    // once it resolves, a connected trader would never learn their clock
+    // ran out and which side it settled against.
+    const [settlingBroadcast, settlementBroadcast] = await broadcasts;
+
+    expect(settlingBroadcast.room.game.phase).toBe("settling");
+    expect(settlementBroadcast.room.game.phase).toBe("settlement");
+    expect(settlementBroadcast.room.revision).toBe(resumed.room.revision);
+
+    guestConnection.socket.close();
   });
 
   it("settles a choosingSide timeout against SELL when SELL is the worse side for the trader (F-06)", async () => {
@@ -2292,6 +2358,13 @@ describe("Cloudflare worker scaffold", () => {
       notBeforeMs: Date.now() - 1
     });
 
+    // Registered before the alarm runs (see the identical comment on the
+    // F-05 forfeit-broadcast test above) so the listener is armed before
+    // forceFailStuckSettlement's own broadcastRoomSnapshot call fires.
+    const exhaustionBroadcast = nextSocketMessage<RoomSnapshotSocketMessage>(
+      guestConnection.socket
+    );
+
     await runRoomCleanupAlarm(stub);
 
     const afterExhaustion = await accessRoom(stub, created.hostToken);
@@ -2308,6 +2381,15 @@ describe("Cloudflare worker scaffold", () => {
     expect(afterExhaustion.room.revision).toBe(stuck.revision + 1);
     await expect(readPendingRoomEffect(stub)).resolves.toBeNull();
 
+    // The exhaustion fallback runs off the alarm too - without
+    // forceFailStuckSettlement's own broadcast, a connected client would
+    // be stuck watching a "settling" spinner that silently resolved to
+    // choosingSide with a "retries exhausted" error it never received.
+    const broadcast = await exhaustionBroadcast;
+
+    expect(broadcast.room.game.phase).toBe("choosingSide");
+    expect(broadcast.room.revision).toBe(afterExhaustion.room.revision);
+
     // The alarm slot must not spin: the pending settle-effect marker is
     // gone after exhaustion, so the only deadlines left are the room's TTL
     // and the fresh F-05 turn clock SETTLEMENT_FAILED just armed on
@@ -2323,6 +2405,124 @@ describe("Cloudflare worker scaffold", () => {
     const afterSecondTick = await accessRoom(stub, created.hostToken);
 
     expect(afterSecondTick.room.revision).toBe(afterExhaustion.room.revision);
+
+    guestConnection.socket.close();
+  });
+
+  it("does not force-fail a settling round whose round_id no longer matches the exhausted pending effect (self-heals instead)", async () => {
+    // forceFailStuckSettlement's own round_id re-check (see the guard right
+    // after its fresh transactional read) defends the identical TOCTOU
+    // window as receiveStoredSettlement's round_id clause, proven reachable
+    // above by "ignores a settlement effect whose round no longer matches
+    // the stored room": forceFailStuckSettlement is invoked (from
+    // runDueSettleEffect, once pendingEffect.attempts >= the cap) using a
+    // pendingEffect/room snapshot that may already be stale by the time its
+    // own fresh transaction actually runs - the room could since have
+    // settled this exact round through another path and moved on to a
+    // later round that is *also* stuck in settling, which is phase
+    // "settling" again but for a different round_id. The exhaustion test
+    // above ("exhausts retries after the attempt cap...") only ever
+    // exercises the matching-round_id branch, since it hands
+    // forceFailStuckSettlement the round_id of the very room it just got
+    // stuck on - so the mismatch branch itself was unreached. Reproduced
+    // here the same way the earlier stale-round test reproduces its TOCTOU
+    // window: call the method directly with a round_id that does not match
+    // what is actually persisted.
+    const stub = roomStub(STUCK_SETTLING_STALE_ROUND_EXHAUSTION_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created stale-round exhaustion room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected generated item to be ready.");
+    }
+
+    const marketMakerToken = tokenForPlayer(
+      started.room.game.roles.marketMaker,
+      created.hostToken,
+      joined.guestToken
+    );
+    const traderToken = tokenForPlayer(
+      started.room.game.roles.trader,
+      created.hostToken,
+      joined.guestToken
+    );
+
+    await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_INITIAL_WIDTH",
+      credential: marketMakerToken,
+      width: 100
+    });
+    await applyRoomCommandWithoutTrueValue(stub, {
+      type: "TRADE_ON_WIDTH",
+      credential: traderToken
+    });
+    await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_MARKET_QUOTE",
+      credential: marketMakerToken,
+      quote: { bid: 3400, ask: 3500 }
+    });
+
+    const stuck = await forceStuckSettling(stub, traderToken, "BUY");
+
+    if (stuck.game.phase !== "settling") {
+      throw new Error("Expected forceStuckSettling to land in settling.");
+    }
+
+    const revisionBefore = stuck.revision;
+    const stuckRoundId = stuck.game.item.round_id;
+
+    // Invoke the exhaustion fallback with a round_id that does not match
+    // the genuinely stuck round persisted above - simulating exactly the
+    // TOCTOU window the guard exists for, without needing to actually race
+    // a manual retry against a real alarm tick.
+    await runInDurableObject(stub, async (instance) => {
+      await (
+        instance as unknown as {
+          forceFailStuckSettlement(roundId: string, nowMs: number): Promise<void>;
+        }
+      ).forceFailStuckSettlement("round-from-a-previous-round", Date.now());
+    });
+
+    const afterMismatch = await accessRoom(stub, created.hostToken);
+
+    // The stale-round_id call must not touch a round it does not belong to.
+    expect(afterMismatch.room.game.phase).toBe("settling");
+    expect(afterMismatch.room.revision).toBe(revisionBefore);
+
+    // And the guard must not be a blanket no-op: the genuine, matching
+    // round_id still forces the fallback, proving the branch above rejects
+    // specifically the mismatch rather than forceFailStuckSettlement being
+    // broken outright.
+    await runInDurableObject(stub, async (instance) => {
+      await (
+        instance as unknown as {
+          forceFailStuckSettlement(roundId: string, nowMs: number): Promise<void>;
+        }
+      ).forceFailStuckSettlement(stuckRoundId, Date.now());
+    });
+
+    const afterGenuine = await accessRoom(stub, created.hostToken);
+
+    expect(afterGenuine.room.game.phase).toBe("choosingSide");
+
+    if (afterGenuine.room.game.phase !== "choosingSide") {
+      throw new Error("Expected the matching round_id to fall back to choosingSide.");
+    }
+
+    expect(afterGenuine.room.game.lastError).toBe(
+      "Automatic settlement retries were exhausted. A host can retry settlement manually."
+    );
+    expect(afterGenuine.room.revision).toBe(revisionBefore + 1);
 
     guestConnection.socket.close();
   });
@@ -4644,6 +4844,59 @@ function nextSocketMessage<T>(socket: WebSocket): Promise<T> {
     const timeout = setTimeout(() => {
       socket.removeEventListener("message", onMessage as EventListener);
       reject(new Error("Timed out waiting for room socket message."));
+    }, SOCKET_MESSAGE_TIMEOUT_MS);
+
+    socket.addEventListener("message", onMessage as EventListener);
+  });
+}
+
+/**
+ * Collects the next `count` JSON socket messages in order, for a single
+ * alarm invocation that can synchronously broadcast more than once (e.g.
+ * F-06's choosingSide timeout: one broadcast for the settling transition,
+ * a second once receiveStoredSettlement resolves it). A single listener is
+ * registered up front and kept attached across all `count` messages -
+ * unlike chaining separate nextSocketMessage() calls, which would only
+ * attach the second listener *after* awaiting the first, by which point a
+ * synchronous second send has already happened with nothing attached to
+ * receive it.
+ */
+function nextSocketMessages<T>(socket: WebSocket, count: number): Promise<T[]> {
+  return new Promise<T[]>((resolve, reject) => {
+    const collected: T[] = [];
+    const onMessage = (event: MessageEvent): void => {
+      if (typeof event.data !== "string") {
+        clearTimeout(timeout);
+        socket.removeEventListener("message", onMessage as EventListener);
+        reject(new Error("Expected room socket message data to be a string."));
+
+        return;
+      }
+
+      try {
+        collected.push(JSON.parse(event.data) as T);
+      } catch (error) {
+        clearTimeout(timeout);
+        socket.removeEventListener("message", onMessage as EventListener);
+        reject(error);
+
+        return;
+      }
+
+      if (collected.length >= count) {
+        clearTimeout(timeout);
+        socket.removeEventListener("message", onMessage as EventListener);
+        resolve(collected);
+      }
+    };
+
+    const timeout = setTimeout(() => {
+      socket.removeEventListener("message", onMessage as EventListener);
+      reject(
+        new Error(
+          `Timed out waiting for ${count} room socket messages (got ${collected.length}).`
+        )
+      );
     }, SOCKET_MESSAGE_TIMEOUT_MS);
 
     socket.addEventListener("message", onMessage as EventListener);

@@ -69,8 +69,25 @@ const ROOM_JOIN_ENDPOINT = "/room/join";
 const ROOM_COMMAND_ENDPOINT = "/room/command";
 const ROOM_CUSTOM_AMAZON_ITEM_ENDPOINT = "/room/custom-amazon-item";
 const ROOM_SOCKET_ENDPOINT = "/room/socket";
+const ROOM_TEST_EXPIRE_TURN_ENDPOINT = "/room/test-expire-turn";
 const PUBLIC_ROOMS_ENDPOINT = "/api/rooms";
 const PUBLIC_CUSTOM_AMAZON_ITEM_ROUTE = "custom-amazon-item";
+const PUBLIC_TEST_EXPIRE_TURN_ROUTE = "test-expire-turn";
+/**
+ * Test-only affordance for e2e coverage of the F-05 shot clock (PR #18,
+ * "Add e2e coverage of the shot clock"). Real turn durations are 30-60s
+ * (see *_TURN_DURATION_MS in src/lib/game/types.ts) - too slow for
+ * Playwright to honestly sleep out. Rather than mocking the countdown or
+ * the expiry logic, testExpireTurnSoon (below) fast-forwards a room's
+ * already-armed, server-authoritative turnDeadlineMs to this many ms from
+ * now and re-arms the *real* Durable Object alarm against it, so the
+ * production alarm handler, reducer transition, persistence, and
+ * WebSocket broadcast all still run for real - only the wait is
+ * shortened. It is only reachable when this.env.WORKER_ITEM_PROVIDER is
+ * set (see isTestEnv elsewhere in this file for the identical signal),
+ * which is never the case in a real deploy.
+ */
+const E2E_FAST_FORWARD_TURN_OFFSET_MS = 3_000;
 const LEGACY_NEXT_GAME_API_PATHS = new Set([
   "/api/commit-market",
   "/api/generate-custom-amazon-item",
@@ -240,6 +257,18 @@ type PendingRoomEffect = Readonly<{
   notBeforeMs: UnixTimeMs;
 }>;
 
+/**
+ * runDueTurnExpiry's own transaction result: distinguishes "nothing about
+ * the room actually changed" (a stale wake, a rejected event, or the room
+ * having already expired) from "TURN_EXPIRED genuinely committed", since
+ * only the latter needs a broadcast afterward. `enteredSettling` tells the
+ * caller whether an F-06 settle-effect follow-up is also needed - a plain
+ * roundForfeited commit has nothing further to do once broadcast.
+ */
+type TurnExpiryOutcome =
+  | Readonly<{ kind: "unchanged" }>
+  | Readonly<{ kind: "committed"; room: RoomState; enteredSettling: boolean }>;
+
 type RoomSocketAttachment = Readonly<{
   kind: "trader-titan.room-socket.v1";
   roomId: RoomId;
@@ -323,13 +352,18 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       return this.applyCustomAmazonItem(request);
     }
 
+    if (pathname === ROOM_TEST_EXPIRE_TURN_ENDPOINT && request.method === "POST") {
+      return this.testExpireTurnSoon(request);
+    }
+
     if (
       pathname === ROOM_ENDPOINT ||
       pathname === ROOM_ACCESS_ENDPOINT ||
       pathname === ROOM_JOIN_ENDPOINT ||
       pathname === ROOM_COMMAND_ENDPOINT ||
       pathname === ROOM_CUSTOM_AMAZON_ITEM_ENDPOINT ||
-      pathname === ROOM_SOCKET_ENDPOINT
+      pathname === ROOM_SOCKET_ENDPOINT ||
+      pathname === ROOM_TEST_EXPIRE_TURN_ENDPOINT
     ) {
       return errorResponse(
         { code: "method_not_allowed", message: "HTTP method is not supported for this room endpoint." },
@@ -590,6 +624,110 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
     });
   }
 
+  /**
+   * Test-only (see E2E_FAST_FORWARD_TURN_OFFSET_MS above): fast-forwards
+   * the room's currently-armed F-05 turn deadline to a few seconds from
+   * now and re-arms the real Durable Object alarm against it, instead of
+   * requiring a Playwright test to sleep out the genuine 30-60s duration.
+   * Everything downstream of the deadline - the alarm firing, TURN_EXPIRED
+   * dispatch, the settling/roundForfeited transition, persistence, and the
+   * WebSocket broadcast - still runs through the exact same production
+   * code path a real deadline would trigger; only the wait is shortened.
+   *
+   * Gated on this.env.WORKER_ITEM_PROVIDER being set, the same "are we in
+   * a test/dev environment" signal item generation already relies on (see
+   * isTestEnv in applyAutomaticRoomEffects) - never set in a real deploy,
+   * so this 404s exactly like an unknown route there.
+   */
+  private async testExpireTurnSoon(request: Request): Promise<Response> {
+    if (this.env.WORKER_ITEM_PROVIDER === undefined) {
+      return errorResponse(
+        { code: "not_found", message: "Room endpoint was not found." },
+        404
+      );
+    }
+
+    const decoded = await decodeAccessRoomBody(request);
+
+    if (!decoded.ok) {
+      return decoded.response;
+    }
+
+    const verifyToken = await buildTokenVerifier(decoded.value.credential);
+    const nowMs = currentUnixTimeMs();
+
+    const result = await this.ctx.storage.transaction(async (transaction) => {
+      const loaded = loadStoredRoomEnvelope(
+        await transaction.get<unknown>(ROOM_STORAGE_KEY),
+        nowMs
+      );
+
+      if (!loaded.ok) {
+        return {
+          ok: false,
+          status: statusForStoredRoomLoadFailure(loaded),
+          error: loaded.error
+        } as const;
+      }
+
+      const authorized = authorizeRoomAction(
+        loaded.room,
+        decoded.value.credential,
+        { type: "access" },
+        verifyToken
+      );
+
+      if (!authorized.ok) {
+        return {
+          ok: false,
+          status: statusForDomainError(authorized.error),
+          error: authorized.error
+        } as const;
+      }
+
+      if (
+        loaded.room.game.phase !== "proposingWidth" &&
+        loaded.room.game.phase !== "negotiatingWidth" &&
+        loaded.room.game.phase !== "configuringMarket" &&
+        loaded.room.game.phase !== "choosingSide"
+      ) {
+        return {
+          ok: false,
+          status: 409,
+          error: {
+            code: "invalid_game_phase",
+            message: "Room has no active turn clock to fast-forward."
+          }
+        } as const;
+      }
+
+      // A turn deadline never coexists with a pending settle effect (see
+      // the class-level alarm() comment), so having just confirmed this
+      // room IS on a turn clock, there is no pending effect to preserve
+      // here - passing null also self-heals any stale marker.
+      const patchedRoom: RoomState = {
+        ...loaded.room,
+        game: { ...loaded.room.game, turnDeadlineMs: nowMs + E2E_FAST_FORWARD_TURN_OFFSET_MS },
+        revision: loaded.room.revision + 1
+      };
+
+      await persistRoomEnvelope(transaction, patchedRoom, null, nowMs);
+
+      return { ok: true, room: patchedRoom } as const;
+    });
+
+    if (!result.ok) {
+      return errorResponse(result.error, result.status);
+    }
+
+    this.broadcastRoomSnapshot(result.room);
+
+    return jsonResponse<CommandRoomResponse>({
+      ok: true,
+      room: this.publicRoomSnapshot(result.room)
+    });
+  }
+
   private async acceptRoomSocket(request: Request): Promise<Response> {
     if (request.method !== "GET") {
       return errorResponse(
@@ -818,7 +956,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
    * afterward rather than waiting for the alarm's own next tick.
    */
   private async runDueTurnExpiry(room: RoomState, nowMs: UnixTimeMs): Promise<void> {
-    const committed = await this.ctx.storage.transaction(async (transaction) => {
+    const outcome: TurnExpiryOutcome = await this.ctx.storage.transaction(async (transaction) => {
       const loaded = loadStoredRoomEnvelope(
         await transaction.get<unknown>(ROOM_STORAGE_KEY),
         nowMs
@@ -829,7 +967,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         // and this one. Purge fully rather than leaving an expired envelope
         // and its private items behind with no alarm armed to clean them up.
         await purgeExpiredRoomState(transaction);
-        return null;
+        return { kind: "unchanged" };
       }
 
       const pendingEffect = loadPendingRoomEffect(
@@ -844,7 +982,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         // Reschedule against the freshly-loaded room instead of forfeiting
         // a round that has already moved on.
         await scheduleNextAlarm(transaction, loaded.room, pendingEffect);
-        return null;
+        return { kind: "unchanged" };
       }
 
       const eventResult = dispatchSystemRoomEvent(loaded.room, {
@@ -858,23 +996,36 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         // reducer's own phase guard exactly). Reschedule rather than
         // looping on an alarm that cannot make progress.
         await scheduleNextAlarm(transaction, loaded.room, pendingEffect);
-        return null;
+        return { kind: "unchanged" };
       }
 
       // Only an F-06 choosingSide timeout lands in "settling" here; a
       // forfeit into "roundForfeited" carries no pending effect, same as
       // before this case existed.
-      const nextPendingEffect =
-        eventResult.room.lifecycle === "active" && eventResult.room.game.phase === "settling"
-          ? freshSettlePendingEffect(eventResult.room.game.item.round_id, nowMs)
-          : null;
+      const enteredSettling =
+        eventResult.room.lifecycle === "active" && eventResult.room.game.phase === "settling";
+      const nextPendingEffect = enteredSettling
+        ? freshSettlePendingEffect(eventResult.room.game.item.round_id, nowMs)
+        : null;
 
       await persistRoomEnvelope(transaction, eventResult.room, nextPendingEffect, nowMs);
 
-      return nextPendingEffect === null ? null : eventResult.room;
+      return { kind: "committed", room: eventResult.room, enteredSettling };
     });
 
-    if (committed === null) {
+    if (outcome.kind === "unchanged") {
+      return;
+    }
+
+    // Connected clients only ever hear about a room mutation through an
+    // explicit broadcast - unlike every HTTP command handler, nothing here
+    // is a request/response the caller is waiting on, so without this call
+    // a genuinely expired clock would commit and persist correctly but
+    // never reach a client sitting on an open WebSocket watching it happen,
+    // which is exactly what the shot clock exists to do in real time.
+    this.broadcastRoomSnapshot(outcome.room);
+
+    if (!outcome.enteredSettling) {
       return;
     }
 
@@ -882,7 +1033,11 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
     // settle effect immediately instead of waiting for the alarm's own next
     // tick. If this isolate is evicted mid-effect, the pending-effect marker
     // just persisted above is the same F-02 trapdoor that resumes it later.
-    await this.receiveStoredSettlement(committed, nowMs);
+    const settled = await this.receiveStoredSettlement(outcome.room, nowMs);
+
+    if (settled.ok) {
+      this.broadcastRoomSnapshot(settled.room);
+    }
   }
 
   private async runDuePendingRoomEffect(
@@ -992,7 +1147,15 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
     const refreshed = await this.loadStoredRoom(nowMs);
 
     if (refreshed.ok) {
-      await this.receiveStoredSettlement(refreshed.room, nowMs);
+      const settled = await this.receiveStoredSettlement(refreshed.room, nowMs);
+
+      // See the identical comment on runDueTurnExpiry's own broadcast: this
+      // retry runs off the alarm, not a request a client is waiting on, so
+      // without this a successful auto-resumed settlement would persist but
+      // never reach a connected client until its next unrelated command.
+      if (settled.ok) {
+        this.broadcastRoomSnapshot(settled.room);
+      }
     }
   }
 
@@ -1006,7 +1169,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
     roundId: string,
     nowMs: UnixTimeMs
   ): Promise<void> {
-    await this.ctx.storage.transaction(async (transaction) => {
+    const committed = await this.ctx.storage.transaction(async (transaction) => {
       const loaded = loadStoredRoomEnvelope(
         await transaction.get<unknown>(ROOM_STORAGE_KEY),
         nowMs
@@ -1017,7 +1180,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         // fully rather than leaving an expired envelope and its private
         // items behind with no alarm armed to clean them up later.
         await purgeExpiredRoomState(transaction);
-        return;
+        return null;
       }
 
       if (
@@ -1027,7 +1190,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       ) {
         await writePendingRoomEffect(transaction, null);
         await scheduleNextAlarm(transaction, loaded.room, null);
-        return;
+        return null;
       }
 
       const eventResult = dispatchSystemRoomEvent(
@@ -1047,11 +1210,20 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         // dropped - the marker itself is no longer trustworthy either way.
         await writePendingRoomEffect(transaction, null);
         await scheduleNextAlarm(transaction, loaded.room, null);
-        return;
+        return null;
       }
 
       await persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
+
+      return eventResult.room;
     });
+
+    if (committed !== null) {
+      // Same reasoning as runDueTurnExpiry / runDueSettleEffect's own
+      // broadcasts: this fallback runs off the alarm's exhaustion path, not
+      // a request a client is waiting on.
+      this.broadcastRoomSnapshot(committed);
+    }
   }
 
   /**
@@ -1933,6 +2105,16 @@ function routePublicRoomRequest(
     }
 
     return forwardRoomRequest(request, env, parsedRoomId.roomId, ROOM_COMMAND_ENDPOINT);
+  }
+
+  if (routeParts.length === 2 && routeParts[1] === PUBLIC_TEST_EXPIRE_TURN_ROUTE && request.method === "POST") {
+    const originRejection = publicRoomOriginRejection(request);
+
+    if (originRejection !== null) {
+      return originRejection;
+    }
+
+    return forwardRoomRequest(request, env, parsedRoomId.roomId, ROOM_TEST_EXPIRE_TURN_ENDPOINT);
   }
 
   if (routeParts.length === 2 && routeParts[1] === PUBLIC_CUSTOM_AMAZON_ITEM_ROUTE && request.method === "POST") {
