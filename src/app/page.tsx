@@ -33,6 +33,7 @@ import {
 import {
   GAME_MODES,
   MAX_ROUNDS,
+  formatGamePhase,
   formatSignedNumber,
   formatTradeSide,
   parseNumericInput,
@@ -714,7 +715,7 @@ function HomeContent() {
   const status = (
     <div className="status-strip">
       <span className={`phase-chip phase-chip--${game?.phase ?? "setup"}`}>
-        {phaseLabel(game?.phase ?? "setup")}
+        {formatGamePhase(game?.phase ?? "setup")}
       </span>
       <span>{roomStatusLabel(room, preview, connectionStatus)}</span>
     </div>
@@ -2086,27 +2087,6 @@ function connectionStatusLabel(status: ConnectionStatus): string {
       return "Disconnected";
     default:
       return "Offline";
-  }
-}
-
-function phaseLabel(phase: string): string {
-  switch (phase) {
-    case "generatingItem":
-      return "Generating";
-    case "proposingWidth":
-      return "Proposing width";
-    case "negotiatingWidth":
-      return "Negotiating width";
-    case "configuringMarket":
-      return "Setting market";
-    case "choosingSide":
-      return "Choosing side";
-    case "roundForfeited":
-      return "Round forfeited";
-    case "gameOver":
-      return "Game over";
-    default:
-      return phase.charAt(0).toUpperCase() + phase.slice(1);
   }
 }
 

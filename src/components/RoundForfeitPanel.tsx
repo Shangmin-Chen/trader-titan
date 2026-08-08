@@ -1,5 +1,6 @@
 import { useId } from "react";
 import {
+  formatGamePhase,
   formatNumber,
   type Player,
   type PlayerId,
@@ -70,7 +71,7 @@ export function RoundForfeitPanel({
         </div>
         <div className="settlement-panel__detail">
           <dt>Timed out during</dt>
-          <dd>{forfeit.phase}</dd>
+          <dd>{formatGamePhase(forfeit.phase)}</dd>
         </div>
         <div className="settlement-panel__detail">
           <dt>Penalty</dt>

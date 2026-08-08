@@ -33,3 +33,33 @@ export function formatQuote(quote: Quote): string {
 export function formatTradeSide(side: TradeSide): string {
   return side === "BUY" ? "Buy" : "Sell";
 }
+
+/**
+ * Human-readable label for a GamePhase. Shared by the always-visible status
+ * chip (src/app/page.tsx) and RoundForfeitPanel's "Timed out during" row so
+ * the two cannot drift apart - RoundForfeitPanel previously rendered the
+ * bare enum string (e.g. "configuringMarket") straight into the UI instead
+ * of going through this. The default case only matters for single-word
+ * phases not called out below (currently "setup", "settling", "settlement",
+ * "error"); every multi-word phase must have its own case.
+ */
+export function formatGamePhase(phase: string): string {
+  switch (phase) {
+    case "generatingItem":
+      return "Generating";
+    case "proposingWidth":
+      return "Proposing width";
+    case "negotiatingWidth":
+      return "Negotiating width";
+    case "configuringMarket":
+      return "Setting market";
+    case "choosingSide":
+      return "Choosing side";
+    case "roundForfeited":
+      return "Round forfeited";
+    case "gameOver":
+      return "Game over";
+    default:
+      return phase.charAt(0).toUpperCase() + phase.slice(1);
+  }
+}

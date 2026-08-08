@@ -36,6 +36,19 @@ describe("RoundForfeitPanel", () => {
     expect(screen.getByText("200 awarded to Alice")).toBeInTheDocument();
   });
 
+  it("renders the timed-out phase through the shared label helper, not the raw enum", () => {
+    render(
+      <RoundForfeitPanel
+        forfeit={makeForfeit({ phase: "configuringMarket" })}
+        onContinue={vi.fn()}
+        players={players}
+      />,
+    );
+
+    expect(screen.getByText("Setting market")).toBeInTheDocument();
+    expect(screen.queryByText("configuringMarket")).not.toBeInTheDocument();
+  });
+
   it("shows a loss outcome on the result card", () => {
     render(
       <RoundForfeitPanel
