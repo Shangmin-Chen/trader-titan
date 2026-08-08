@@ -55,6 +55,14 @@ test.describe("F-05 turn shot clock", () => {
     const countdown = host.getByTestId("turn-countdown");
 
     await expect(countdown).toBeVisible();
+    // Ties this test to the .turn-countdown rule in globals.css actually
+    // existing, not just the element being present in the DOM - a plain
+    // unstyled <div> defaults to display:block, so this only holds if the
+    // "display: flex" declaration in that rule is really being applied.
+    // This is precisely the class of regression that shipped through a
+    // full review before this file existed: the countdown rendered in the
+    // DOM the whole time, just with no stylesheet backing it.
+    await expect(countdown).toHaveCSS("display", "flex");
     // A fresh 60s proposingWidth deadline is nowhere near the 10s urgent
     // threshold yet.
     await expect(countdown).toHaveAttribute("data-urgent", "false");
