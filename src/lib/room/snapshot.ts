@@ -9,6 +9,8 @@ import type {
   NegotiatingWidthGameState,
   Player,
   PlayerId,
+  RoundForfeit,
+  RoundForfeitedGameState,
   RoundLogEntry,
   RoundSettlement,
   Scores,
@@ -68,6 +70,7 @@ export type PublicSettledGeneratedItem = PublicGeneratedItem &
   }>;
 export type PublicSettlementGameState = Omit<SettlementGameState, "item"> &
   Readonly<{ item: PublicSettledGeneratedItem }>;
+export type PublicRoundForfeitedGameState = RoundForfeitedGameState;
 export type PublicGameOverState = GameOverState;
 export type PublicErrorGameState = ErrorGameState;
 
@@ -80,6 +83,7 @@ export type PublicRoomGameState =
   | PublicChoosingSideGameState
   | PublicSettlingGameState
   | PublicSettlementGameState
+  | PublicRoundForfeitedGameState
   | PublicGameOverState
   | PublicErrorGameState;
 
@@ -218,6 +222,7 @@ export function toPublicGameState(game: GameState): PublicRoomGameState {
         ...publicGameBase(game),
         phase: "proposingWidth",
         item: toPublicItem(game.item),
+        turnDeadlineMs: game.turnDeadlineMs,
       };
     case "negotiatingWidth":
       return {
@@ -225,6 +230,7 @@ export function toPublicGameState(game: GameState): PublicRoomGameState {
         phase: "negotiatingWidth",
         item: toPublicItem(game.item),
         spreadWidth: game.spreadWidth,
+        turnDeadlineMs: game.turnDeadlineMs,
       };
     case "configuringMarket":
       return {
@@ -232,6 +238,7 @@ export function toPublicGameState(game: GameState): PublicRoomGameState {
         phase: "configuringMarket",
         item: toPublicItem(game.item),
         spreadWidth: game.spreadWidth,
+        turnDeadlineMs: game.turnDeadlineMs,
       };
     case "choosingSide":
       return {
@@ -243,6 +250,13 @@ export function toPublicGameState(game: GameState): PublicRoomGameState {
           bid: game.quote.bid,
           ask: game.quote.ask,
         },
+        turnDeadlineMs: game.turnDeadlineMs,
+      };
+    case "roundForfeited":
+      return {
+        ...publicGameBase(game),
+        phase: "roundForfeited",
+        forfeit: toPublicForfeit(game.forfeit),
       };
     case "settling":
       return {
@@ -354,5 +368,16 @@ function toPublicSettlement(settlement: RoundSettlement): RoundSettlement {
     marketMaker: settlement.marketMaker,
     traderPnL: settlement.traderPnL,
     marketMakerPnL: settlement.marketMakerPnL,
+  };
+}
+
+function toPublicForfeit(forfeit: RoundForfeit): RoundForfeit {
+  return {
+    roundNumber: forfeit.roundNumber,
+    itemTitle: forfeit.itemTitle,
+    phase: forfeit.phase,
+    forfeitedBy: forfeit.forfeitedBy,
+    awardedTo: forfeit.awardedTo,
+    penalty: forfeit.penalty,
   };
 }

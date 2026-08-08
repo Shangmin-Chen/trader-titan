@@ -21,7 +21,6 @@ import {
   type RoomCapabilityToken,
   type RoomCommandResult,
   type RoomId,
-  type RoomPresence,
   type RoomState,
   type TokenHash,
 } from "./index";
@@ -30,12 +29,6 @@ const NOW_MS = 40_000;
 const ROOM_ID_VALUE = "room_persist_0001";
 const HOST_SECRET = "host_secret_300000000001";
 const GUEST_SECRET = "guest_secret_300000000001";
-const LIVE_PRESENCE = {
-  players: {
-    A: true,
-    B: true,
-  },
-} satisfies RoomPresence;
 
 describe("room persistence", () => {
   it("round-trips private persistence envelopes without public snapshot assumptions", () => {
@@ -167,7 +160,6 @@ describe("room persistence", () => {
     const active = expectOk(
       startRoom(room, {
         credential: present(hostToken),
-        presence: LIVE_PRESENCE,
         verifyToken,
         nowMs: NOW_MS + 2,
       }),
@@ -272,7 +264,6 @@ function settledRoomWithAmazonMetadata(): RoomState {
   const started = expectOk(
     startRoom(room, {
       credential: present(hostToken),
-      presence: LIVE_PRESENCE,
       verifyToken,
       nowMs: NOW_MS + 2,
     }),

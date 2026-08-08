@@ -1,4 +1,4 @@
-import type { Quote, Roles, RoundSettlement, Scores, TradeSide } from "./types";
+import type { Quote, Roles, RoundForfeit, RoundSettlement, Scores, TradeSide } from "./types";
 
 type SettlementInput = {
   roundNumber: number;
@@ -52,5 +52,20 @@ export function applySettlementToScores(
     B:
       scores.B +
       (settlement.trader === "B" ? settlement.traderPnL : settlement.marketMakerPnL),
+  };
+}
+
+/**
+ * Zero-sum like applySettlementToScores: the idle player's forfeit penalty
+ * is deducted from them and credited to the opponent, never created or
+ * destroyed.
+ */
+export function applyForfeitToScores(
+  scores: Scores,
+  forfeit: RoundForfeit,
+): Scores {
+  return {
+    A: scores.A + (forfeit.forfeitedBy === "A" ? -forfeit.penalty : forfeit.penalty),
+    B: scores.B + (forfeit.forfeitedBy === "B" ? -forfeit.penalty : forfeit.penalty),
   };
 }

@@ -69,7 +69,11 @@ test.describe("Cloudflare room invite flow", () => {
     expect(inviteUrl).not.toContain("secret=");
   });
 
-  test("blocks non-final settlement advance while player B is offline and recovers on reconnect", async ({
+  // F-04: presence gating was dropped entirely (the turn shot clock now
+  // handles an absent opponent instead), so a disconnected Player B no
+  // longer blocks a non-final round advance. The connection badge is now
+  // purely a cosmetic indicator.
+  test("allows non-final settlement advance while player B is offline (F-04) and the badge still reflects reconnect", async ({
     baseURL,
     browser,
   }) => {
@@ -89,8 +93,10 @@ test.describe("Cloudflare room invite flow", () => {
       "Player B: Disconnected",
       { timeout: ROOM_PHASE_TIMEOUT_MS },
     );
-    await expect(host.getByRole("button", { name: "Next round" })).toBeDisabled();
-    await expect(host.getByTestId("settlement-panel")).toContainText(
+    // The turn shot clock (not presence) now handles an absent opponent,
+    // so a non-final "Next round" stays enabled while Player B is offline.
+    await expect(host.getByRole("button", { name: "Next round" })).toBeEnabled();
+    await expect(host.getByTestId("settlement-panel")).not.toContainText(
       "Player B is disconnected",
     );
 
@@ -127,7 +133,7 @@ test.describe("Cloudflare room invite flow", () => {
     await expect(guest.getByRole("button", { name: "Propose width" })).toBeDisabled();
   });
 
-  test("keeps lobby start blocked while player B is disconnected and enables it on reconnect", async ({
+  test("allows lobby start while player B is disconnected (F-04); the badge still reflects reconnect", async ({
     baseURL,
     browser,
   }) => {
@@ -143,8 +149,9 @@ test.describe("Cloudflare room invite flow", () => {
       "Player B: Disconnected",
       { timeout: ROOM_PHASE_TIMEOUT_MS },
     );
-    await expect(host.getByRole("button", { name: "Start game" })).toBeDisabled();
-    await expect(host.getByText("Player B is disconnected")).toBeVisible();
+    // The shot clock (not presence) now handles an absent opponent, so
+    // Start stays enabled once a guest has joined the seat at all.
+    await expect(host.getByRole("button", { name: "Start game" })).toBeEnabled();
 
     await guest.goto(inviteUrl);
     await expect(guest.getByTestId("room-controls")).toBeVisible({
@@ -243,8 +250,10 @@ test.describe("Cloudflare room invite flow", () => {
       "Player B: Disconnected",
       { timeout: HEARTBEAT_RECOVERY_TIMEOUT_MS },
     );
-    await expect(host.getByRole("button", { name: "Next round" })).toBeDisabled();
-    await expect(host.getByTestId("settlement-panel")).toContainText(
+    // F-04: presence gating was dropped entirely, so "Next round" stays
+    // enabled through the drop - only the reconnect badge itself changes.
+    await expect(host.getByRole("button", { name: "Next round" })).toBeEnabled();
+    await expect(host.getByTestId("settlement-panel")).not.toContainText(
       "Player B is disconnected",
     );
 

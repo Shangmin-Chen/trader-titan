@@ -14,16 +14,15 @@ The room protocol is the boundary between client transports and the pure room do
 - Public room snapshots include live presence booleans and never include capability secrets, token hashes, persistence envelopes, or pre-settlement private values.
 - Pre-settlement public item snapshots expose only `round_id`, `item_title`, `category`, and `context_clue`; they must redact `true_value`, `scraped_items`, and `amazon_url` even if those fields are present on an internal object.
 - Post-settlement public item snapshots expose `true_value` and may expose Amazon `scraped_items` and `amazon_url` when those fields are present on the settled generated item.
+- Public room snapshots expose `turnDeadlineMs` on the `proposingWidth`, `negotiatingWidth`, `configuringMarket`, and `choosingSide` game phases: an absolute, server-stamped Unix millisecond deadline for the F-05 turn shot clock, never a client-computed or remaining-seconds value.
 
 ## Presence
 
-- Runtime transports supply `RoomPresence` to command dispatch. Clients do not send or prove presence in command payloads.
-- Occupied seats are not live presence. A joined guest with no accepted current WebSocket is offline for liveness-gated commands.
+- Runtime transports supply `RoomPresence` to public room snapshots. Clients do not send or prove presence in command payloads.
+- Occupied seats are not live presence. A joined guest with no accepted current WebSocket is offline.
 - Presence is public, non-secret, ephemeral, and Durable Object-authoritative in the Cloudflare runtime. It is computed from accepted WebSockets whose attached role and token hash still match the current room seats, and it is not persisted.
-- HTTP and WebSocket command handling use the same runtime presence source before dispatching room commands.
-- `START_ROOM` is rejected with `player_offline` while Player B is disconnected.
-- Non-final `ADVANCE_ROUND` is rejected with `player_offline` while Player B is disconnected.
-- Final-round `ADVANCE_ROUND` that moves the game to `gameOver` remains allowed while Player B is disconnected.
+- HTTP and WebSocket command handling use the same runtime presence source when building the public snapshot broadcast after a command.
+- Presence does not gate any room command (F-04). `START_ROOM` and `ADVANCE_ROUND` (final and non-final) all succeed regardless of Player B's live presence; an idle or absent opponent is instead handled by the F-05 turn shot clock forfeiting the round they are on the clock for. Presence is a purely cosmetic connection indicator in the public snapshot, not an authorization input to any room command.
 
 ## Client Commands
 
@@ -55,6 +54,7 @@ The room protocol is the boundary between client transports and the pure room do
 - `ITEM_FAILED`: safe error message.
 - `SETTLEMENT_RECEIVED`: settled private item. No caller-provided settlement is accepted.
 - `SETTLEMENT_FAILED`: safe error message.
+- `TURN_EXPIRED`: F-05 turn shot-clock expiry. Carries no caller-supplied data beyond the server's own timestamp; the room command layer derives who forfeits, who is awarded, and the penalty entirely from the room's own current state (active role for the phase, and the spread width in play, or a named fallback constant in `proposingWidth` where no width has been proposed yet). Valid only while the room is in `proposingWidth`, `negotiatingWidth`, `configuringMarket`, or `choosingSide`; rejected with `invalid_game_phase` everywhere else. Dispatched only by the Worker's Durable Object alarm when a stamped `turnDeadlineMs` elapses - never accepted from a client.
 
 ## Transport Notes
 

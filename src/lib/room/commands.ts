@@ -4,14 +4,19 @@ import {
   startGame as startGameReducer,
 } from "../game/reducer";
 import { calculateSettlement } from "../game/settlement";
-import type {
-  GameAction,
-  GameState,
-  GeneratedItem,
-  PlayerId,
-  Quote,
-  SettledGeneratedItem,
-  TradeSide,
+import {
+  CHOOSING_SIDE_TURN_DURATION_MS,
+  CONFIGURING_MARKET_TURN_DURATION_MS,
+  NEGOTIATING_WIDTH_TURN_DURATION_MS,
+  PROPOSING_WIDTH_TURN_DURATION_MS,
+  type GameAction,
+  type GamePhase,
+  type GameState,
+  type GeneratedItem,
+  type PlayerId,
+  type Quote,
+  type SettledGeneratedItem,
+  type TradeSide,
 } from "../game/types";
 import { validateStartGame } from "../game/validation";
 import { authorizeRoomAction } from "./authorization";
@@ -32,7 +37,6 @@ import {
   type RoomCommandResult,
   type RoomDomainErrorCode,
   type RoomGameConfig,
-  type RoomPresence,
   type RoomState,
   type UnixTimeMs,
 } from "./types";
@@ -56,11 +60,6 @@ export type AuthorizedCommandInput = Readonly<{
   verifyToken: TokenVerifier;
   nowMs: UnixTimeMs;
 }>;
-
-export type PresenceAwareCommandInput = AuthorizedCommandInput &
-  Readonly<{
-    presence: RoomPresence;
-  }>;
 
 export type ConfigureRoomInput = AuthorizedCommandInput &
   Readonly<{
@@ -177,7 +176,7 @@ export function configureRoom(
 
 export function startRoom(
   room: RoomState,
-  input: PresenceAwareCommandInput,
+  input: AuthorizedCommandInput,
 ): RoomCommandResult {
   const authorized = authorizeRoomAction(
     room,
@@ -196,10 +195,6 @@ export function startRoom(
 
   if (room.guest === null) {
     return commandFailure(room, "guest_required", "A guest must join before the room can start.");
-  }
-
-  if (!isPlayerLive(input.presence, GUEST_PLAYER_ID)) {
-    return playerOfflineFailure(room);
   }
 
   const payload = startPayloadForRoom(room);
@@ -297,7 +292,11 @@ export function receiveRoomItem(
     return commandFailure(room, "invalid_game_phase", "Items can only be received while the room is generating an item.");
   }
 
-  return applySystemGameAction(room, { type: "ITEM_RECEIVED", item }, nowMs);
+  return applySystemGameAction(
+    room,
+    { type: "ITEM_RECEIVED", item, turnDeadlineMs: nowMs + PROPOSING_WIDTH_TURN_DURATION_MS },
+    nowMs,
+  );
 }
 
 export function failRoomItem(
@@ -380,7 +379,11 @@ export function submitInitialWidth(
     room,
     input,
     expectedPlayer(room.game, "SUBMIT_INITIAL_WIDTH"),
-    { type: "SUBMIT_INITIAL_WIDTH", width },
+    {
+      type: "SUBMIT_INITIAL_WIDTH",
+      width,
+      turnDeadlineMs: input.nowMs + NEGOTIATING_WIDTH_TURN_DURATION_MS,
+    },
   );
 }
 
@@ -393,7 +396,11 @@ export function tightenWidth(
     room,
     input,
     expectedPlayer(room.game, "TIGHTEN_WIDTH"),
-    { type: "TIGHTEN_WIDTH", width },
+    {
+      type: "TIGHTEN_WIDTH",
+      width,
+      turnDeadlineMs: input.nowMs + NEGOTIATING_WIDTH_TURN_DURATION_MS,
+    },
   );
 }
 
@@ -405,7 +412,10 @@ export function tradeOnWidth(
     room,
     input,
     expectedPlayer(room.game, "TRADE_ON_WIDTH"),
-    { type: "TRADE_ON_WIDTH" },
+    {
+      type: "TRADE_ON_WIDTH",
+      turnDeadlineMs: input.nowMs + CONFIGURING_MARKET_TURN_DURATION_MS,
+    },
   );
 }
 
@@ -418,7 +428,11 @@ export function submitMarketQuote(
     room,
     input,
     expectedPlayer(room.game, "SUBMIT_MARKET_QUOTE"),
-    { type: "SUBMIT_MARKET_QUOTE", quote },
+    {
+      type: "SUBMIT_MARKET_QUOTE",
+      quote,
+      turnDeadlineMs: input.nowMs + CHOOSING_SIDE_TURN_DURATION_MS,
+    },
   );
 }
 
@@ -477,12 +491,48 @@ export function failRoomSettlement(
     return commandFailure(room, "invalid_game_phase", "Settlement failures can only be received while the room is settling.");
   }
 
-  return applySystemGameAction(room, { type: "SETTLEMENT_FAILED", error }, nowMs);
+  return applySystemGameAction(
+    room,
+    {
+      type: "SETTLEMENT_FAILED",
+      error,
+      turnDeadlineMs: nowMs + CHOOSING_SIDE_TURN_DURATION_MS,
+    },
+    nowMs,
+  );
+}
+
+/**
+ * F-05: the Worker alarm dispatches this when a phase's turnDeadlineMs
+ * elapses (see scheduleNextAlarm / alarm() in src/worker/index.ts). Routed
+ * through the reducer exactly like receiveRoomSettlement routes
+ * SETTLEMENT_RECEIVED, so the FSM stays the single source of truth: a
+ * late-arriving player command against a room already moved to
+ * roundForfeited is a harmless no-op via the same phase guard every other
+ * command already relies on.
+ */
+export function expireRoomTurn(
+  room: RoomState,
+  nowMs: UnixTimeMs,
+): RoomCommandResult {
+  if (room.lifecycle !== "active") {
+    return commandFailure(room, "room_not_active", "Turn expiry can only apply to active rooms.");
+  }
+
+  if (!isTurnClockedPhase(room.game.phase)) {
+    return commandFailure(
+      room,
+      "invalid_game_phase",
+      "Turn expiry can only apply while a player is on the clock.",
+    );
+  }
+
+  return applySystemGameAction(room, { type: "TURN_EXPIRED" }, nowMs);
 }
 
 export function advanceRoomRound(
   room: RoomState,
-  input: PresenceAwareCommandInput,
+  input: AuthorizedCommandInput,
 ): RoomCommandResult {
   const authorized = authorizeRoomAction(
     room,
@@ -499,15 +549,12 @@ export function advanceRoomRound(
     return commandFailure(room, "room_not_active", "Only active rooms can advance rounds.");
   }
 
-  if (room.game.phase !== "settlement") {
-    return commandFailure(room, "invalid_game_phase", "Rounds can only advance after settlement.");
-  }
-
-  if (
-    !isFinalRoundSettlement(room.game) &&
-    !isPlayerLive(input.presence, GUEST_PLAYER_ID)
-  ) {
-    return playerOfflineFailure(room);
+  if (room.game.phase !== "settlement" && room.game.phase !== "roundForfeited") {
+    return commandFailure(
+      room,
+      "invalid_game_phase",
+      "Rounds can only advance after settlement or a round forfeit.",
+    );
   }
 
   return applySystemGameAction(room, { type: "NEXT_ROUND" }, input.nowMs);
@@ -593,12 +640,13 @@ function lifecycleForGame(game: GameState): RoomState["lifecycle"] {
   return game.phase === "gameOver" ? "finished" : "active";
 }
 
-function isFinalRoundSettlement(game: GameState): boolean {
-  return game.phase === "settlement" && game.roundNumber >= game.totalRounds;
-}
-
-function isPlayerLive(presence: RoomPresence, playerId: PlayerId): boolean {
-  return presence.players[playerId] === true;
+function isTurnClockedPhase(phase: GamePhase): boolean {
+  return (
+    phase === "proposingWidth" ||
+    phase === "negotiatingWidth" ||
+    phase === "configuringMarket" ||
+    phase === "choosingSide"
+  );
 }
 
 function buildLobbyGame(
@@ -682,12 +730,4 @@ function commandFailure(
     room,
     error: roomDomainError(code, message),
   };
-}
-
-function playerOfflineFailure(room: RoomState): RoomCommandFailure {
-  return commandFailure(
-    room,
-    "player_offline",
-    "Player B must be connected before the room can continue.",
-  );
 }
