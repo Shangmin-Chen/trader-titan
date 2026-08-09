@@ -1,13 +1,19 @@
 import { expect, test, type Page } from "@playwright/test";
 import { createAndJoinRoom, ROOM_PHASE_TIMEOUT_MS } from "./helpers";
 
-// The reconnect supervisor's heartbeat watchdog needs up to ~40s to notice a
-// socket that went silent without a clean close (20s ping interval, 10s pong
-// deadline, 2 missed pongs) before it force-closes the socket and the
-// backoff loop reopens it. Give assertions that depend on that full detour
-// through the watchdog (rather than an immediate transport-level close)
-// enough headroom.
-const HEARTBEAT_RECOVERY_TIMEOUT_MS = 75_000;
+// The reconnect supervisor's heartbeat watchdog needs up to
+// HEARTBEAT_WORST_CASE_DETECTION_MS (src/lib/room-socket-supervisor.ts) —
+// currently 9s (5s ping interval, 2s pong deadline, 2 missed pongs) — to
+// notice a socket that went silent without a clean close, before it
+// force-closes the socket and the backoff loop reopens it. This was tuned
+// down from a much slower 20s/10s config specifically so a disconnected
+// player can self-heal well inside even the shortest turn clock (see
+// DEAD_SOCKET_RECOVERY_BUDGET_MS and turn-clock-recovery-budget.test.ts).
+// Give assertions that depend on that full detour through the watchdog
+// (rather than an immediate transport-level close) generous headroom for
+// CI/browser overhead on top of the ~9-10s theoretical worst case, without
+// resurrecting the old 75s allowance a slow watchdog no longer needs.
+const HEARTBEAT_RECOVERY_TIMEOUT_MS = 25_000;
 
 test.describe("Cloudflare room invite flow", () => {
   test("creates an invite room, plays one round, and frees the guest slot", async ({
@@ -239,7 +245,8 @@ test.describe("Cloudflare room invite flow", () => {
     // a close frame until the client's own watchdog eventually sends one
     // (see the PR description's "Discovered, not fixed" section) — so this
     // assertion can only pass once two ping/pong cycles have gone
-    // unanswered (~40-60s) and the watchdog force-closes the socket.
+    // unanswered (~9s, HEARTBEAT_WORST_CASE_DETECTION_MS) and the watchdog
+    // force-closes the socket.
     await expect(host.getByTestId("room-controls")).toContainText(
       "Player B: Disconnected",
       { timeout: HEARTBEAT_RECOVERY_TIMEOUT_MS },
