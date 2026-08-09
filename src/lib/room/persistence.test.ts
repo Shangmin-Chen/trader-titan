@@ -1,6 +1,13 @@
 import {
+  CHOOSING_SIDE_TURN_DURATION_MS,
+  CONFIGURING_MARKET_TURN_DURATION_MS,
+  NEGOTIATING_WIDTH_TURN_DURATION_MS,
+  PROPOSING_WIDTH_TURN_DURATION_MS,
+} from "../game/types";
+import {
   ABANDONED_ROOM_TTL_MS,
   FINISHED_ROOM_TTL_MS,
+  ROOM_PERSISTENCE_VERSION,
   createLobbyRoom,
   executeTrade,
   expireRoomTurn,
@@ -118,7 +125,10 @@ describe("room persistence", () => {
     const { room } = joinedRoom();
     const envelope = toPersistenceEnvelope(room, NOW_MS + 2);
 
-    expect(loadPersistenceEnvelope({ ...envelope, version: 2 }, envelope.expiresAtMs - 1)).toEqual({
+    // Neither the current version (2) nor the one known-migratable legacy
+    // version (1, see ROOM_PERSISTENCE_LEGACY_VERSION) - a future version
+    // this build predates.
+    expect(loadPersistenceEnvelope({ ...envelope, version: 3 }, envelope.expiresAtMs - 1)).toEqual({
       ok: false,
       error: {
         code: "persistence_version_unsupported",
@@ -389,6 +399,238 @@ describe("room persistence", () => {
 });
 
 /**
+ * B1: production storage is full of version-1 envelopes (predating F-05's
+ * turnDeadlineMs and F-06's pendingTrade/forcedByTimeout) that the strict
+ * v2 allowlists above would otherwise reject outright the moment
+ * ROOM_PERSISTENCE_VERSION became 2. These tests build exactly the
+ * old-shaped records a pre-this-branch build actually wrote (by stripping
+ * the new fields back off a real command-produced RoomState) and assert
+ * loadPersistenceEnvelope still decodes them - migrating each one forward -
+ * rather than trusting the migration logic by reading it.
+ */
+describe("legacy (version-1) envelope migration", () => {
+  it("migrates a version-1 proposingWidth envelope by stamping a fresh turnDeadlineMs (F-05)", () => {
+    const fixtures = legacyMigrationFixtures();
+    const readAtMs = NOW_MS + 500;
+
+    const loaded = loadPersistenceEnvelope(
+      legacyEnvelopeWithoutTurnDeadline(fixtures.proposingWidth, NOW_MS + 100),
+      readAtMs,
+    );
+
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) {
+      throw new Error("Expected legacy proposingWidth envelope to decode.");
+    }
+    if (loaded.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected proposingWidth phase.");
+    }
+
+    expect(loaded.room.game.turnDeadlineMs).toBe(readAtMs + PROPOSING_WIDTH_TURN_DURATION_MS);
+    expect(loaded.room.game).toEqual({
+      ...fixtures.proposingWidth.game,
+      turnDeadlineMs: readAtMs + PROPOSING_WIDTH_TURN_DURATION_MS,
+    });
+  });
+
+  it("migrates a version-1 negotiatingWidth envelope by stamping a fresh turnDeadlineMs (F-05)", () => {
+    const fixtures = legacyMigrationFixtures();
+    const readAtMs = NOW_MS + 500;
+
+    const loaded = loadPersistenceEnvelope(
+      legacyEnvelopeWithoutTurnDeadline(fixtures.negotiatingWidth, NOW_MS + 100),
+      readAtMs,
+    );
+
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) {
+      throw new Error("Expected legacy negotiatingWidth envelope to decode.");
+    }
+    if (loaded.room.game.phase !== "negotiatingWidth") {
+      throw new Error("Expected negotiatingWidth phase.");
+    }
+
+    expect(loaded.room.game.turnDeadlineMs).toBe(readAtMs + NEGOTIATING_WIDTH_TURN_DURATION_MS);
+    expect(loaded.room.game).toEqual({
+      ...fixtures.negotiatingWidth.game,
+      turnDeadlineMs: readAtMs + NEGOTIATING_WIDTH_TURN_DURATION_MS,
+    });
+  });
+
+  it("migrates a version-1 configuringMarket envelope by stamping a fresh turnDeadlineMs (F-05)", () => {
+    const fixtures = legacyMigrationFixtures();
+    const readAtMs = NOW_MS + 500;
+
+    const loaded = loadPersistenceEnvelope(
+      legacyEnvelopeWithoutTurnDeadline(fixtures.configuringMarket, NOW_MS + 100),
+      readAtMs,
+    );
+
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) {
+      throw new Error("Expected legacy configuringMarket envelope to decode.");
+    }
+    if (loaded.room.game.phase !== "configuringMarket") {
+      throw new Error("Expected configuringMarket phase.");
+    }
+
+    expect(loaded.room.game.turnDeadlineMs).toBe(readAtMs + CONFIGURING_MARKET_TURN_DURATION_MS);
+    expect(loaded.room.game).toEqual({
+      ...fixtures.configuringMarket.game,
+      turnDeadlineMs: readAtMs + CONFIGURING_MARKET_TURN_DURATION_MS,
+    });
+  });
+
+  it("migrates a version-1 choosingSide envelope by stamping a fresh turnDeadlineMs (F-05)", () => {
+    const fixtures = legacyMigrationFixtures();
+    const readAtMs = NOW_MS + 500;
+
+    const loaded = loadPersistenceEnvelope(
+      legacyEnvelopeWithoutTurnDeadline(fixtures.choosingSide, NOW_MS + 100),
+      readAtMs,
+    );
+
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) {
+      throw new Error("Expected legacy choosingSide envelope to decode.");
+    }
+    if (loaded.room.game.phase !== "choosingSide") {
+      throw new Error("Expected choosingSide phase.");
+    }
+
+    expect(loaded.room.game.turnDeadlineMs).toBe(readAtMs + CHOOSING_SIDE_TURN_DURATION_MS);
+    expect(loaded.room.game).toEqual({
+      ...fixtures.choosingSide.game,
+      turnDeadlineMs: readAtMs + CHOOSING_SIDE_TURN_DURATION_MS,
+    });
+  });
+
+  it("migrates a version-1 settling envelope's pendingSide into a chosen pendingTrade (F-06)", () => {
+    const { room, hostToken, guestToken } = joinedRoom();
+    const settling = settlingRoomChosen(room, hostToken, guestToken);
+
+    if (settling.game.phase !== "settling") {
+      throw new Error("Expected settling phase.");
+    }
+    expect(settling.game.pendingTrade).toEqual({ kind: "chosen", side: "BUY" });
+
+    const readAtMs = NOW_MS + 500;
+    const loaded = loadPersistenceEnvelope(
+      legacyEnvelopeWithPendingSide(settling, NOW_MS + 100),
+      readAtMs,
+    );
+
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) {
+      throw new Error("Expected legacy settling envelope to decode.");
+    }
+    if (loaded.room.game.phase !== "settling") {
+      throw new Error("Expected settling phase.");
+    }
+
+    expect(loaded.room.game.pendingTrade).toEqual({ kind: "chosen", side: "BUY" });
+    expect(loaded.room.game).toEqual(settling.game);
+  });
+
+  it("migrates a version-1 settlement's missing forcedByTimeout to false (F-06)", () => {
+    const { room, hostToken, guestToken } = joinedRoom();
+    const settling = settlingRoomChosen(room, hostToken, guestToken);
+
+    if (settling.game.phase !== "settling") {
+      throw new Error("Expected settling phase.");
+    }
+
+    const settled = normalizeForPersistence(
+      expectOk(
+        receiveRoomSettlement(
+          settling,
+          { ...settling.game.item, true_value: 3600 },
+          NOW_MS + 9,
+        ),
+      ),
+    );
+
+    if (settled.game.phase !== "settlement") {
+      throw new Error("Expected settlement phase.");
+    }
+    // Confirms the fixture itself is the F-06-aware, not-forced case this
+    // migration is specifically about - a version-1 settlement can never
+    // have forcedByTimeout: true (F-06 did not exist yet), so defaulting to
+    // false is only ever reproducing what pre-F-06 code already computed.
+    expect(settled.game.settlement.forcedByTimeout).toBe(false);
+
+    const readAtMs = NOW_MS + 500;
+    const loaded = loadPersistenceEnvelope(
+      legacyEnvelopeWithoutForcedByTimeout(settled, NOW_MS + 100),
+      readAtMs,
+    );
+
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) {
+      throw new Error("Expected legacy settlement envelope to decode.");
+    }
+    if (loaded.room.game.phase !== "settlement") {
+      throw new Error("Expected settlement phase.");
+    }
+
+    expect(loaded.room.game.settlement.forcedByTimeout).toBe(false);
+    expect(loaded.room.game).toEqual(settled.game);
+  });
+
+  it("re-persists a migrated legacy envelope as version 2 and round-trips it through the strict allowlist", () => {
+    const { room, hostToken, guestToken } = joinedRoom();
+    const settling = settlingRoomChosen(room, hostToken, guestToken);
+
+    if (settling.game.phase !== "settling") {
+      throw new Error("Expected settling phase.");
+    }
+
+    const readAtMs = NOW_MS + 500;
+    const loaded = loadPersistenceEnvelope(
+      legacyEnvelopeWithPendingSide(settling, NOW_MS + 100),
+      readAtMs,
+    );
+
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) {
+      throw new Error("Expected legacy settling envelope to decode.");
+    }
+
+    const rePersisted = toPersistenceEnvelope(loaded.room, readAtMs + 1);
+
+    // The next persist must write the current version, not silently keep
+    // carrying the room forward as a version-1 envelope forever.
+    expect(rePersisted.version).toBe(ROOM_PERSISTENCE_VERSION);
+    expect(rePersisted.version).toBe(2);
+
+    // And that rewritten envelope must satisfy the strict, non-legacy path -
+    // no lingering leniency once a room has been through one write.
+    expect(loadPersistenceEnvelope(rePersisted, readAtMs + 2)).toEqual({
+      ok: true,
+      room: loaded.room,
+    });
+  });
+
+  it("still rejects a version-1 envelope that is genuinely corrupt, not just old-shaped", () => {
+    const fixtures = legacyMigrationFixtures();
+    const legacy = legacyEnvelopeWithoutTurnDeadline(fixtures.proposingWidth, NOW_MS + 100) as {
+      room: { game: Record<string, unknown> };
+    };
+    // Corrupt in a way migration has no branch for: drop the item entirely
+    // rather than merely lacking the new turnDeadlineMs field.
+    delete legacy.room.game.item;
+
+    expect(loadPersistenceEnvelope(legacy, NOW_MS + 500)).toEqual({
+      ok: false,
+      error: {
+        code: "persistence_invalid",
+        message: "Room persistence envelope is invalid.",
+      },
+    });
+  });
+});
+
+/**
  * The reducer explicitly sets `lastError: undefined` on most transitions
  * (an own key with an undefined value), which real Durable Object storage
  * silently drops on write (structured-clone semantics, like JSON) but which
@@ -478,6 +720,136 @@ function settlingRoomForcedByTimeout(
   }
 
   return settling as RoomState & { game: Extract<RoomState["game"], { phase: "settling" }> };
+}
+
+/**
+ * One joined-and-started room walked through all four F-05 turn-clocked
+ * phases, so each B1 migration test below can build its own legacy
+ * (turnDeadlineMs-free) envelope from a real command-produced RoomState
+ * rather than a hand-authored fixture that might drift from what the
+ * command layer actually produces.
+ */
+function legacyMigrationFixtures(): {
+  proposingWidth: RoomState;
+  negotiatingWidth: RoomState;
+  configuringMarket: RoomState;
+  choosingSide: RoomState;
+} {
+  const { room, hostToken, guestToken } = joinedRoom();
+  const started = expectOk(
+    startRoom(room, { credential: present(hostToken), verifyToken, nowMs: NOW_MS + 2 }),
+  );
+  const item = {
+    round_id: "round-legacy-migration",
+    item_title: "Widget",
+    category: "Chaos Quant",
+    context_clue: "A test item.",
+  };
+  const proposingWidth = normalizeForPersistence(
+    expectOk(receiveRoomItem(started, item, NOW_MS + 3)),
+  );
+  const negotiatingWidth = normalizeForPersistence(
+    expectOk(
+      submitInitialWidth(proposingWidth, 200, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 4,
+      }),
+    ),
+  );
+  const configuringMarket = normalizeForPersistence(
+    expectOk(
+      tradeOnWidth(negotiatingWidth, {
+        credential: present(guestToken),
+        verifyToken,
+        nowMs: NOW_MS + 5,
+      }),
+    ),
+  );
+  const choosingSide = normalizeForPersistence(
+    expectOk(
+      submitMarketQuote(configuringMarket, { bid: 3500, ask: 3700 }, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 6,
+      }),
+    ),
+  );
+
+  return { proposingWidth, negotiatingWidth, configuringMarket, choosingSide };
+}
+
+/**
+ * Builds a raw (non-typed) envelope matching exactly what a pre-this-branch
+ * build would have persisted for `room`: the same room, tagged version 1,
+ * with turnDeadlineMs stripped back off its game state. `persistedAtMs` only
+ * needs to predate the test's read time; it plays no role in the migration
+ * itself (see withFreshTurnDeadline in persistence.ts, which stamps off the
+ * *reader's* current time, not this).
+ */
+function legacyEnvelopeWithoutTurnDeadline(room: RoomState, persistedAtMs: number): unknown {
+  const envelope = toPersistenceEnvelope(room, persistedAtMs);
+  const legacyGame: Record<string, unknown> = { ...envelope.room.game };
+  delete legacyGame.turnDeadlineMs;
+
+  return {
+    ...envelope,
+    version: 1,
+    room: { ...envelope.room, game: legacyGame },
+  };
+}
+
+/**
+ * Builds a raw version-1 "settling" envelope the way pre-F-06 code actually
+ * wrote one: `pendingSide: TradeSide` instead of today's
+ * `pendingTrade: PendingTradeDecision`. Only meaningful for a `settlingRoom*`
+ * fixture whose pendingTrade is `{ kind: "chosen", ... }` - F-06's
+ * `timeoutForcedWorstSide` has no legacy representation at all (see
+ * withMigratedPendingTrade in persistence.ts), so this throws rather than
+ * silently producing a nonsensical fixture if ever called on one.
+ */
+function legacyEnvelopeWithPendingSide(room: RoomState, persistedAtMs: number): unknown {
+  const envelope = toPersistenceEnvelope(room, persistedAtMs);
+  const legacyGame: Record<string, unknown> = { ...envelope.room.game };
+  const pendingTrade = legacyGame.pendingTrade;
+
+  if (
+    !pendingTrade ||
+    typeof pendingTrade !== "object" ||
+    (pendingTrade as { kind?: unknown }).kind !== "chosen"
+  ) {
+    throw new Error("legacyEnvelopeWithPendingSide requires a chosen pendingTrade fixture.");
+  }
+
+  delete legacyGame.pendingTrade;
+  legacyGame.pendingSide = (pendingTrade as { side: unknown }).side;
+
+  return {
+    ...envelope,
+    version: 1,
+    room: { ...envelope.room, game: legacyGame },
+  };
+}
+
+/**
+ * Builds a raw version-1 "settlement" envelope the way pre-F-06 code
+ * actually wrote one: RoundSettlement without a `forcedByTimeout` key at
+ * all, rather than today's always-present boolean.
+ */
+function legacyEnvelopeWithoutForcedByTimeout(room: RoomState, persistedAtMs: number): unknown {
+  const envelope = toPersistenceEnvelope(room, persistedAtMs);
+  const legacyGame: Record<string, unknown> = { ...envelope.room.game };
+  const legacySettlement: Record<string, unknown> = {
+    ...(legacyGame.settlement as Record<string, unknown>),
+  };
+  delete legacySettlement.forcedByTimeout;
+  legacyGame.settlement = legacySettlement;
+
+  return {
+    ...envelope,
+    version: 1,
+    room: { ...envelope.room, game: legacyGame },
+  };
 }
 
 function joinedRoom(): {

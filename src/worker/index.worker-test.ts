@@ -62,6 +62,8 @@ const RESET_PRIVATE_ITEM_ROOM_NAME = "worker-room-reset-private-item";
 const KICK_PRIVATE_ITEM_ROOM_NAME = "worker-room-kick-private-item";
 const REPLACE_PRIVATE_ITEM_ROOM_NAME = "worker-room-replace-private-item";
 const ALARM_PRIVATE_ITEM_ROOM_NAME = "worker-room-alarm-private-item";
+const COMMAND_PURGE_ON_INVALID_ROOM_NAME = "worker-room-command-purge-on-invalid";
+const JOIN_PURGE_ON_INVALID_ROOM_NAME = "worker-room-join-purge-on-invalid";
 const ALARM_MISSING_PRIVATE_ITEM_ROOM_NAME = "worker-room-alarm-missing-private-item";
 const ALARM_EXPIRED_PRIVATE_ITEM_ROOM_NAME = "worker-room-alarm-expired-private-item";
 const ALARM_VALID_PRIVATE_ITEM_ROOM_NAME = "worker-room-alarm-valid-private-item";
@@ -116,6 +118,7 @@ const HTTP_SWITCHING_PROTOCOLS_STATUS = 101;
 const HTTP_CONFLICT_STATUS = 409;
 const HTTP_GONE_STATUS = 410;
 const HTTP_TOO_MANY_REQUESTS_STATUS = 429;
+const HTTP_INTERNAL_SERVER_ERROR_STATUS = 500;
 const SOCKET_MESSAGE_TIMEOUT_MS = 1_000;
 const WORKER_SMOKE_PATH = "/worker-smoke";
 const WORKER_SMOKE_URL = `https://trader-titan.worker.test${WORKER_SMOKE_PATH}`;
@@ -3002,6 +3005,103 @@ describe("Cloudflare worker scaffold", () => {
     await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
 
     guestConnection.socket.close();
+  });
+
+  // B1 (production readiness): a room whose stored envelope cannot be
+  // decoded used to return persistence_invalid (500) forever - purging it
+  // was previously only wired up on the create-room and cleanup-alarm
+  // paths, not the two paths that actually mutate an in-progress game
+  // (POST /room/command and POST /room/join). A room could then sit mid-
+  // round returning 500 to both players on every single command until
+  // whatever deadline its now-orphaned alarm was scheduled against
+  // eventually fired, which for a room with no sooner turn-clock or
+  // pending-settlement deadline armed could be up to ABANDONED_ROOM_TTL_MS
+  // (2 hours) later. These two tests pin that a command (and a join)
+  // against an undecodable envelope both purge storage in the same
+  // transaction as the 500 they return, so the *next* request against that
+  // room object sees "missing" (404, and a fresh POST /room can recreate
+  // it) instead of repeating the same 500.
+  it("purges an undecodable room envelope when a command is dispatched against it, so the next request sees a fresh room instead of another 500", async () => {
+    const stub = roomStub(COMMAND_PURGE_ON_INVALID_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created command-purge room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected generated item to be ready.");
+    }
+
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
+      privateGeneratedItemStorageKey(started.room.game.item.round_id)
+    ]);
+
+    await corruptRoomEnvelope(stub);
+
+    const firstResponse = await postRoomCommand(stub, {
+      type: "SUBMIT_INITIAL_WIDTH",
+      credential: created.hostToken,
+      width: 10
+    });
+    const firstRejected = await expectPublicJson<RoomErrorResponse>(firstResponse);
+
+    expect(firstResponse.status).toBe(HTTP_INTERNAL_SERVER_ERROR_STATUS);
+    expect(firstRejected.error.code).toBe("persistence_invalid");
+    await expect(storedRoomEnvelopeExists(stub)).resolves.toBe(false);
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
+
+    // The bad envelope is gone now, so this is no longer "invalid" - it is
+    // simply a room that does not exist, exactly like never having created
+    // one at all.
+    const secondResponse = await postRoomCommand(stub, {
+      type: "SUBMIT_INITIAL_WIDTH",
+      credential: created.hostToken,
+      width: 10
+    });
+    const secondRejected = await expectPublicJson<RoomErrorResponse>(secondResponse);
+
+    expect(secondResponse.status).toBe(HTTP_NOT_FOUND_STATUS);
+    expect(secondRejected.error.code).toBe("room_not_found");
+
+    guestConnection.socket.close();
+  });
+
+  it("purges an undecodable room envelope when a join is attempted against it, so the next request sees a fresh room instead of another 500", async () => {
+    const stub = roomStub(JOIN_PURGE_ON_INVALID_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created join-purge room.");
+    }
+
+    await corruptRoomEnvelope(stub);
+
+    const firstResponse = await stub.fetch(ROOM_JOIN_URL, {
+      body: JSON.stringify({ guestName: "Guest" }),
+      method: "POST"
+    });
+    const firstRejected = await expectPublicJson<RoomErrorResponse>(firstResponse);
+
+    expect(firstResponse.status).toBe(HTTP_INTERNAL_SERVER_ERROR_STATUS);
+    expect(firstRejected.error.code).toBe("persistence_invalid");
+    await expect(storedRoomEnvelopeExists(stub)).resolves.toBe(false);
+
+    const secondResponse = await stub.fetch(ROOM_JOIN_URL, {
+      body: JSON.stringify({ guestName: "Guest" }),
+      method: "POST"
+    });
+    const secondRejected = await expectPublicJson<RoomErrorResponse>(secondResponse);
+
+    expect(secondResponse.status).toBe(HTTP_NOT_FOUND_STATUS);
+    expect(secondRejected.error.code).toBe("room_not_found");
   });
 
   it("deletes stale private generated items when the cleanup alarm sees no room envelope", async () => {

@@ -495,6 +495,13 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       );
 
       if (!loaded.ok) {
+        // B1: purge here too (not just on the alarm path - see alarm() and
+        // purgeExpiredRoomState) so a room whose envelope cannot be loaded
+        // self-heals into "missing" (404) after being observed once,
+        // instead of returning the same status on every join attempt until
+        // whatever deadline this room's now-orphaned alarm was scheduled
+        // against eventually fires - up to ABANDONED_ROOM_TTL_MS later.
+        await purgeExpiredRoomState(transaction);
         return {
           ok: false,
           status: statusForStoredRoomLoadFailure(loaded),
@@ -1271,6 +1278,13 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       );
 
       if (!loaded.ok) {
+        // B1: same self-heal as joinRoom above - see the comment there and
+        // on purgeExpiredRoomState. This is the hot path: every player
+        // command (SUBMIT_INITIAL_WIDTH, EXECUTE_TRADE, ...) routes through
+        // here, so without this a genuinely undecodable envelope would
+        // otherwise 500 on every single command from both players until
+        // this room's alarm happens to fire.
+        await purgeExpiredRoomState(transaction);
         return {
           ok: false,
           status: statusForStoredRoomLoadFailure(loaded),
