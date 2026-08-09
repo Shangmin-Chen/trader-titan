@@ -729,9 +729,23 @@ function playerOfflineFailure(room: RoomState): RoomCommandFailure {
  * SETTLEMENT_FAILED. Either way the room leaves `settling` on its own -
  * via that command or the Worker's own alarm-driven retry - after which
  * RESET_TO_LOBBY/KICK_GUEST are available again.
+ *
+ * The gate below checks `game.phase` only, not `room.lifecycle`. That is
+ * deliberate, not an oversight: `lifecycle` is derived from `phase` by
+ * `lifecycleForGame`, which only ever produces a non-"active" lifecycle once
+ * `phase === "gameOver"` - and `gameOver` can never be `settling`. Every
+ * `RoomState` reachable through the exported command API therefore already
+ * satisfies `phase === "settling" implies lifecycle === "active"`, so a
+ * `lifecycle !== "active"` check here can never be false when the phase
+ * check is true. Adding it back would just re-check the same fact through a
+ * second, derived representation - untestable through this module's public
+ * surface, and a trap for a future reader who might assume it is
+ * load-bearing. If a future phase/lifecycle change ever breaks that
+ * invariant, fix it at the source (`lifecycleForGame`), not by resurrecting
+ * a redundant check here.
  */
 function settlingRoundFailure(room: RoomState): RoomCommandFailure | null {
-  if (room.lifecycle !== "active" || room.game.phase !== "settling") {
+  if (room.game.phase !== "settling") {
     return null;
   }
 
