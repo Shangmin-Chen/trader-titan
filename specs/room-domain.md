@@ -26,6 +26,8 @@ The room domain models a private two-player game room. A room has exactly one ho
 
 Reset returns the room to `lobby`, clears the guest seat, and frees the guest slot for a new invite join. Kick removes the guest, returns the room to `lobby`, and also frees the guest slot.
 
+Reset and kick are otherwise unrestricted host-control commands, but both are rejected with `round_settling` while the active game is in the `settling` phase, and the room state is preserved. A trade's outcome is already fixed the instant `EXECUTE_TRADE` commits (the private true value was fixed when the item was generated; only the reveal and score update are still pending), so allowing either command mid-settle would let a host who is also this round's trader duck an unfavorable outcome by discarding the room before it resolves - and since reset/kick also delete the round's private item, the guest would never even learn what the outcome would have been. Every other active phase, including before a trade is executed and after settlement has resolved, leaves reset and kick fully available, so a genuinely abandoned guest or a stuck room is never unrecoverable. See Settlement below for how a room stuck in `settling` leaves that phase without reset or kick.
+
 Starting a room requires a guest seat and live Player B presence. If Player B has joined but is disconnected, `START_ROOM` is rejected with `player_offline` and the room state is preserved.
 
 Round advancement after settlement is host-controlled. Non-final `ADVANCE_ROUND` is rejected with `player_offline` while Player B is disconnected. Final-round `ADVANCE_ROUND` that transitions to `gameOver` remains allowed even if Player B is disconnected.
