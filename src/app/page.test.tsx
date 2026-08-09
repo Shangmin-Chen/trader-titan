@@ -18,6 +18,7 @@ import {
 } from "../lib/room-client";
 import Home, {
   applyPublicRoomSnapshotMonotonically,
+  canAbortRound,
   canRetryItemGeneration,
   parseRoomSocketMessage,
   resolveExistingRoomCreateState,
@@ -407,6 +408,28 @@ describe("item generation retry affordance", () => {
 
     expect(canRetryItemGeneration(settling, true)).toBe(true);
     expect(canRetryItemGeneration(settling, false)).toBe(false);
+  });
+});
+
+describe("reset/kick abort-round affordance", () => {
+  it("disables reset and kick only while a trade is settling", () => {
+    const settling = {
+      ...BASE_SNAPSHOT.game,
+      phase: "settling",
+      item: { round_id: "round-1", item_title: "Item", category: "Cat", context_clue: "Clue" },
+      spreadWidth: 100,
+      quote: { bid: 900, ask: 1000 },
+      pendingSide: "BUY",
+    } satisfies PublicRoomSnapshot["game"];
+
+    // Server-side, settlingRoundFailure in src/lib/room/commands.ts rejects
+    // RESET_TO_LOBBY/KICK_GUEST only in this exact phase - the outcome is
+    // fixed but not yet revealed or scored. This predicate must match that
+    // guard: allowed everywhere else (including no room at all), blocked
+    // only here.
+    expect(canAbortRound(settling)).toBe(false);
+    expect(canAbortRound(BASE_SNAPSHOT.game)).toBe(true);
+    expect(canAbortRound(null)).toBe(true);
   });
 });
 
