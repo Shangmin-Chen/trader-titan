@@ -83,9 +83,10 @@ const PUBLIC_TEST_EXPIRE_TURN_ROUTE = "test-expire-turn";
  * now and re-arms the *real* Durable Object alarm against it, so the
  * production alarm handler, reducer transition, persistence, and
  * WebSocket broadcast all still run for real - only the wait is
- * shortened. It is only reachable when this.env.WORKER_ITEM_PROVIDER is
- * set (see isTestEnv elsewhere in this file for the identical signal),
- * which is never the case in a real deploy.
+ * shortened. It is only reachable when this.env.WORKER_TEST_MODE is set
+ * (see testExpireTurnSoon's own comment for why that - and specifically
+ * not this.env.WORKER_ITEM_PROVIDER - is the gate), which is never the
+ * case in a real deploy.
  */
 const E2E_FAST_FORWARD_TURN_OFFSET_MS = 3_000;
 const LEGACY_NEXT_GAME_API_PATHS = new Set([
@@ -634,13 +635,34 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
    * WebSocket broadcast - still runs through the exact same production
    * code path a real deadline would trigger; only the wait is shortened.
    *
-   * Gated on this.env.WORKER_ITEM_PROVIDER being set, the same "are we in
-   * a test/dev environment" signal item generation already relies on (see
-   * isTestEnv in applyAutomaticRoomEffects) - never set in a real deploy,
-   * so this 404s exactly like an unknown route there.
+   * Gated on this.env.WORKER_TEST_MODE being set - a dedicated var with no
+   * meaning anywhere else in this codebase and no legitimate reason to be
+   * set on a real deploy, unlike this.env.WORKER_ITEM_PROVIDER (which this
+   * gate deliberately does NOT key off). WORKER_ITEM_PROVIDER is a real
+   * provider-selection override (see its use in
+   * applyAutomaticRoomEffects/isTestEnv and the "deterministic" | "gemini"
+   * type in worker-configuration.d.ts) that an operator could legitimately
+   * set on a genuine deploy - e.g. to force the deterministic provider
+   * during an incident - which would have silently un-404d a route able to
+   * force any player's clock to expire in ~3s. wrangler.toml currently sets
+   * no vars at all, so that was not reachable in the shipped config, but it
+   * was one plausible config change away from open. WORKER_TEST_MODE has no
+   * such double duty: nothing else in this file reads it, so setting it can
+   * only ever be a deliberate, test-specific choice (see
+   * playwright.config.ts and vitest.worker.config.ts).
+   *
+   * Authorization below is intentionally `{ type: "access" }` rather than
+   * `{ type: "activePlayer" }`: this lets *either* seated player expire the
+   * *other* player's active turn, not just their own. That is load-bearing
+   * for the e2e helper (e2e/helpers.ts's fastForwardTurnClock), which forces
+   * the guest's turn from the host's page. This is safe specifically
+   * because it is unreachable outside test/dev once the gate above holds -
+   * it does not, and must not, ship as a general "either player can expire
+   * either player's clock" affordance in production; do not loosen it
+   * without also reconsidering this gate.
    */
   private async testExpireTurnSoon(request: Request): Promise<Response> {
-    if (this.env.WORKER_ITEM_PROVIDER === undefined) {
+    if (this.env.WORKER_TEST_MODE === undefined) {
       return errorResponse(
         { code: "not_found", message: "Room endpoint was not found." },
         404

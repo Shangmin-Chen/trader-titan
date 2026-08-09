@@ -91,11 +91,15 @@ const STALE_TURN_EXPIRY_ROOM_NAME = "worker-room-stale-turn-expiry";
 const CHOOSING_SIDE_TIMEOUT_BUY_WORSE_ROOM_NAME = "worker-room-choosing-side-timeout-buy-worse";
 const CHOOSING_SIDE_TIMEOUT_SELL_WORSE_ROOM_NAME = "worker-room-choosing-side-timeout-sell-worse";
 const CHOOSING_SIDE_TIMEOUT_TIE_ROOM_NAME = "worker-room-choosing-side-timeout-tie";
+const TEST_EXPIRE_TURN_GATE_ROOM_NAME = "worker-room-test-expire-turn-gate";
+const TEST_EXPIRE_TURN_CREDENTIALS_ROOM_NAME = "worker-room-test-expire-turn-credentials";
+const TEST_EXPIRE_TURN_OTHER_ROOM_NAME = "worker-room-test-expire-turn-other-room";
 const GAME_ROOM_SMOKE_URL = "https://trader-titan.worker.test/room";
 const ROOM_COMMAND_URL = `${GAME_ROOM_SMOKE_URL}/command`;
 const ROOM_JOIN_URL = `${GAME_ROOM_SMOKE_URL}/join`;
 const ROOM_CUSTOM_AMAZON_ITEM_URL = `${GAME_ROOM_SMOKE_URL}/custom-amazon-item`;
 const ROOM_SOCKET_URL = `${GAME_ROOM_SMOKE_URL}/socket`;
+const ROOM_TEST_EXPIRE_TURN_URL = `${GAME_ROOM_SMOKE_URL}/test-expire-turn`;
 const PUBLIC_ROOMS_URL = "https://trader-titan.worker.test/api/rooms";
 const TEST_ROOM_STORAGE_KEY = "room:persistence:v1";
 const TEST_PENDING_EFFECT_STORAGE_KEY = "room:pending-effect:v1";
@@ -105,6 +109,7 @@ const TEST_COMMAND_DEDUPE_STORAGE_KEY = "room:command-dedupe:v1";
 const TEST_PENDING_SETTLE_EFFECT_MAX_ATTEMPTS = 5;
 const HTTP_BAD_REQUEST_STATUS = 400;
 const HTTP_FORBIDDEN_STATUS = 403;
+const HTTP_NOT_FOUND_STATUS = 404;
 const HTTP_CREATED_STATUS = 201;
 const HTTP_OK_STATUS = 200;
 const HTTP_SWITCHING_PROTOCOLS_STATUS = 101;
@@ -1967,6 +1972,157 @@ describe("Cloudflare worker scaffold", () => {
     expect(resumed.room.game.settlement.side).toBe("BUY");
     expect(resumed.room.game.settlement.forcedByTimeout).toBe(true);
     expect(resumed.room.game.settlement.traderPnL).toBe(-100);
+  });
+
+  // testExpireTurnSoon's own gate: WORKER_TEST_MODE is the *only* thing
+  // standing between this route and production, since wrangler.toml sets no
+  // vars at all (so the var is unset in every real deploy) and the route's
+  // own authorization is deliberately access-level, not activePlayer-level
+  // (see testExpireTurnSoon's doc comment) - either seated player can force
+  // the *other* player's clock. That is safe only because the gate makes the
+  // route unreachable outside test/dev; these tests pin both halves of that
+  // safety property directly, since nothing previously asserted either one.
+  it("404s POST /room/test-expire-turn, and its public /api/rooms alias, when WORKER_TEST_MODE is unset - even for an otherwise-valid, well-authenticated request", async () => {
+    const stub = roomStub(TEST_EXPIRE_TURN_GATE_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created test-expire-turn gate room.");
+    }
+
+    await joinRoom(stub, "Guest");
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected generated item to be ready.");
+    }
+
+    // A perfectly well-formed, correctly-authenticated request from the
+    // room's own host, while the room genuinely has a turn clock running -
+    // every other precondition the route checks is satisfied. Only the
+    // env-var gate stands between this and a successful fast-forward.
+    const directResponse = await stub.fetch(ROOM_TEST_EXPIRE_TURN_URL, {
+      body: JSON.stringify({ credential: created.hostToken }),
+      method: "POST"
+    });
+    const directRejected = await expectPublicJson<RoomErrorResponse>(directResponse);
+
+    expect(directResponse.status).toBe(HTTP_NOT_FOUND_STATUS);
+    expect(directRejected.error.code).toBe("not_found");
+
+    const publicResponse = await fetchPublicWorker(new Request(
+      `${PUBLIC_ROOMS_URL}/${created.room.id}/test-expire-turn`,
+      {
+        body: JSON.stringify({ credential: created.hostToken }),
+        headers: { "content-type": "application/json" },
+        method: "POST"
+      }
+    ));
+    const publicRejected = await expectPublicJson<RoomErrorResponse>(publicResponse);
+
+    expect(publicResponse.status).toBe(HTTP_NOT_FOUND_STATUS);
+    expect(publicRejected.error.code).toBe("not_found");
+
+    // Neither rejected request mutated the room: the turn clock the request
+    // would have fast-forwarded is untouched.
+    const persisted = await accessRoom(stub, created.hostToken);
+
+    expect(persisted.room.revision).toBe(started.room.revision);
+    expect(persisted.room.game).toEqual(started.room.game);
+  });
+
+  it("rejects missing, malformed, and wrong-room credentials for POST /room/test-expire-turn once WORKER_TEST_MODE is enabled, but fast-forwards the clock for a valid one", async () => {
+    const stub = roomStub(TEST_EXPIRE_TURN_CREDENTIALS_ROOM_NAME);
+    const otherStub = roomStub(TEST_EXPIRE_TURN_OTHER_ROOM_NAME);
+
+    await withWorkerTestModeEnabled(stub, async () => {
+      const created = await createRoom(stub, "Host");
+
+      if (!created.created) {
+        throw new Error("Expected a newly created test-expire-turn credentials room.");
+      }
+
+      const joined = await joinRoom(stub, "Guest");
+      const started = await applyRoomCommandWithoutTrueValue(stub, {
+        type: "START_ROOM",
+        credential: created.hostToken
+      });
+
+      if (started.room.game.phase !== "proposingWidth") {
+        throw new Error("Expected generated item to be ready.");
+      }
+
+      // Missing credential: rejected the same way every other room POST
+      // endpoint rejects an absent `credential` field, before authorization
+      // is ever reached (see decodeAccessRoomBody).
+      const missingResponse = await stub.fetch(ROOM_TEST_EXPIRE_TURN_URL, {
+        body: JSON.stringify({}),
+        method: "POST"
+      });
+      const missingRejected = await expectPublicJson<RoomErrorResponse>(missingResponse);
+
+      expect(missingResponse.status).toBe(HTTP_BAD_REQUEST_STATUS);
+      expect(missingRejected.error.code).toBe("invalid_request");
+
+      // Malformed credential: a string is not a capability token object.
+      const malformedResponse = await stub.fetch(ROOM_TEST_EXPIRE_TURN_URL, {
+        body: JSON.stringify({ credential: "not-a-token" }),
+        method: "POST"
+      });
+      const malformedRejected = await expectPublicJson<RoomErrorResponse>(malformedResponse);
+
+      expect(malformedResponse.status).toBe(HTTP_BAD_REQUEST_STATUS);
+      expect(malformedRejected.error.code).toBe("invalid_request");
+
+      // Wrong-room credential: structurally a valid token, correctly signed,
+      // but minted for a different room entirely.
+      const otherCreated = await createRoom(otherStub, "Someone Else");
+
+      if (!otherCreated.created) {
+        throw new Error("Expected a newly created unrelated room.");
+      }
+
+      const wrongRoomResponse = await stub.fetch(ROOM_TEST_EXPIRE_TURN_URL, {
+        body: JSON.stringify({ credential: otherCreated.hostToken }),
+        method: "POST"
+      });
+      const wrongRoomRejected = await expectPublicJson<RoomErrorResponse>(wrongRoomResponse);
+
+      expect(wrongRoomResponse.status).toBe(HTTP_FORBIDDEN_STATUS);
+      expect(wrongRoomRejected.error.code).toBe("wrong_room");
+
+      // None of the three rejections above touched the room.
+      const afterRejections = await accessRoom(stub, created.hostToken);
+
+      expect(afterRejections.room.revision).toBe(started.room.revision);
+      expect(afterRejections.room.game).toEqual(started.room.game);
+
+      // A valid credential from the room's own guest (proving this is not
+      // merely "the host's own request succeeds" but genuinely
+      // access-level, per testExpireTurnSoon's own comment - either seated
+      // player, not just the active one, can fast-forward the clock) still
+      // works once the gate is enabled.
+      const validResponse = await stub.fetch(ROOM_TEST_EXPIRE_TURN_URL, {
+        body: JSON.stringify({ credential: joined.guestToken }),
+        method: "POST"
+      });
+      const validAccepted = await expectPublicJson<CommandRoomResponse>(validResponse);
+
+      expect(validResponse.status).toBe(HTTP_OK_STATUS);
+
+      if (validAccepted.room.game.phase !== "proposingWidth") {
+        throw new Error("Expected the room to remain in proposingWidth after fast-forwarding.");
+      }
+
+      expect(validAccepted.room.game.turnDeadlineMs).toBeLessThan(
+        started.room.game.turnDeadlineMs
+      );
+      expect(validAccepted.room.game.turnDeadlineMs).toBeGreaterThan(Date.now());
+      expect(validAccepted.room.revision).toBe(started.room.revision + 1);
+    });
   });
 
   it("schedules the nearest of all three deadlines: the F-05 turn clock outranks the TTL when no settle effect is pending", async () => {
@@ -3845,6 +4001,42 @@ describe("Cloudflare worker scaffold", () => {
 
 function roomStub(roomName: string) {
   return env.GAME_ROOM.get(env.GAME_ROOM.idFromName(roomName));
+}
+
+/**
+ * Enables the WORKER_TEST_MODE gate (see testExpireTurnSoon in
+ * src/worker/index.ts) for exactly the duration of `run`, then restores it -
+ * mirroring withMissingGeminiItemProvider's own scoped-env pattern below.
+ * vitest.worker.config.ts deliberately does NOT set this var globally: the
+ * suite's default posture should mirror production (unset), so a test that
+ * wants the gate open has to say so explicitly, and "unset" stays the
+ * meaningful default for the 404 test above.
+ */
+async function withWorkerTestModeEnabled<T>(
+  stub: GameRoomStub,
+  run: () => Promise<T>
+): Promise<T> {
+  const previous = await setDurableObjectTestModeEnv(stub, "1");
+
+  try {
+    return await run();
+  } finally {
+    await setDurableObjectTestModeEnv(stub, previous);
+  }
+}
+
+async function setDurableObjectTestModeEnv(
+  stub: GameRoomStub,
+  next: string | undefined
+): Promise<string | undefined> {
+  return runInDurableObject(stub, (instance) => {
+    const mutableEnv = (instance as unknown as { env: { WORKER_TEST_MODE?: string } }).env;
+    const previous = mutableEnv.WORKER_TEST_MODE;
+
+    mutableEnv.WORKER_TEST_MODE = next;
+
+    return previous;
+  });
 }
 
 type MutableWorkerItemProviderEnv = {
