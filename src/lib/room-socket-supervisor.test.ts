@@ -319,7 +319,7 @@ describe("RoomSocketSupervisor heartbeat watchdog", () => {
     supervisor.start();
     sockets[0].triggerOpen();
 
-    vi.advanceTimersByTime(20_000);
+    vi.advanceTimersByTime(5_000);
     expect(sockets[0].sent).toEqual(["tt-ping"]);
   });
 
@@ -328,7 +328,7 @@ describe("RoomSocketSupervisor heartbeat watchdog", () => {
 
     supervisor.start();
     sockets[0].triggerOpen();
-    vi.advanceTimersByTime(20_000); // first ping sent
+    vi.advanceTimersByTime(5_000); // first ping sent
 
     sockets[0].triggerMessage("tt-pong");
 
@@ -354,22 +354,40 @@ describe("RoomSocketSupervisor heartbeat watchdog", () => {
     supervisor.start();
     sockets[0].triggerOpen();
 
-    vi.advanceTimersByTime(20_000); // ping #1 sent
-    vi.advanceTimersByTime(10_000); // pong deadline #1 elapses, unanswered
+    vi.advanceTimersByTime(5_000); // ping #1 sent
+    vi.advanceTimersByTime(2_000); // pong deadline #1 elapses, unanswered
 
     expect(sockets[0].closeCalls).toHaveLength(0);
   });
 
-  it("two consecutive missed pongs close the socket with the heartbeat timeout code, and the supervisor (not the watchdog) reconnects", () => {
+  it("retries the ping immediately after a miss, not after another full interval (regression: this cadence is what keeps worst-case detection at intervalMs + missedPongThreshold * pongTimeoutMs instead of silently doubling it)", () => {
+    const { supervisor, sockets } = createHarness();
+
+    supervisor.start();
+    sockets[0].triggerOpen();
+
+    vi.advanceTimersByTime(5_000); // ping #1
+    expect(sockets[0].sent).toEqual(["tt-ping"]);
+
+    vi.advanceTimersByTime(2_000); // missed #1 -> retry ping #2 immediately
+    expect(sockets[0].sent).toEqual(["tt-ping", "tt-ping"]);
+
+    // Confirm it really was immediate: no additional wait was needed beyond
+    // the pong deadline above for the second ping to have gone out.
+    expect(sockets[0].closeCalls).toHaveLength(0);
+  });
+
+  it("two consecutive missed pongs close the socket with the heartbeat timeout code within intervalMs + 2*pongTimeoutMs, and the supervisor (not the watchdog) reconnects", () => {
     const { supervisor, sockets, statuses } = createHarness();
 
     supervisor.start();
     sockets[0].triggerOpen();
 
-    vi.advanceTimersByTime(20_000); // ping #1
-    vi.advanceTimersByTime(10_000); // missed #1
-    vi.advanceTimersByTime(20_000); // ping #2
-    vi.advanceTimersByTime(10_000); // missed #2 -> close
+    vi.advanceTimersByTime(5_000); // ping #1
+    vi.advanceTimersByTime(2_000); // missed #1 -> ping #2 retried immediately
+    expect(sockets[0].closeCalls).toHaveLength(0); // not dead yet after 7s
+
+    vi.advanceTimersByTime(2_000); // missed #2 -> close (9s total, matches HEARTBEAT_WORST_CASE_DETECTION_MS)
 
     expect(sockets[0].closeCalls).toEqual([{ code: HEARTBEAT_TIMEOUT_CLOSE_CODE, reason: "heartbeat timeout" }]);
 
@@ -385,12 +403,12 @@ describe("RoomSocketSupervisor heartbeat watchdog", () => {
     supervisor.start();
     sockets[0].triggerOpen();
 
-    vi.advanceTimersByTime(20_000); // ping #1
-    vi.advanceTimersByTime(5_000);
+    vi.advanceTimersByTime(5_000); // ping #1
+    vi.advanceTimersByTime(1_000);
     sockets[0].triggerMessage("tt-pong"); // answered in time
 
-    vi.advanceTimersByTime(20_000); // ping #2
-    vi.advanceTimersByTime(10_000); // missed #1 of this cycle only
+    vi.advanceTimersByTime(5_000); // ping #2
+    vi.advanceTimersByTime(2_000); // missed #1 of this cycle only
 
     expect(sockets[0].closeCalls).toHaveLength(0);
   });

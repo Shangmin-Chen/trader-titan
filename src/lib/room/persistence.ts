@@ -1,7 +1,11 @@
 import { calculateSettlement } from "../game/settlement";
 import {
+  CHOOSING_SIDE_TURN_DURATION_MS,
+  CONFIGURING_MARKET_TURN_DURATION_MS,
   GAME_MODES,
   MAX_ROUNDS,
+  NEGOTIATING_WIDTH_TURN_DURATION_MS,
+  PROPOSING_WIDTH_TURN_DURATION_MS,
   SETTLEMENT_FAILURE_EPISODE_CAP,
   type GameMode,
   type GamePhase,
@@ -55,7 +59,23 @@ export const FINISHED_ROOM_TTL_MS =
   FINISHED_ROOM_MINUTES * SECONDS_PER_MINUTE * MILLISECONDS_PER_SECOND;
 
 export const ROOM_PERSISTENCE_KIND = "trader-titan.room";
-export const ROOM_PERSISTENCE_VERSION = 1;
+export const ROOM_PERSISTENCE_VERSION = 2;
+
+/**
+ * The one prior envelope shape this decoder still accepts and migrates
+ * forward on read (see decodeRoomState/migrateLegacyGameStateRecord below).
+ * Version 1 predates F-05's turnDeadlineMs and F-06's pendingTrade
+ * (previously pendingSide) / RoundSettlement.forcedByTimeout - fields the
+ * strict per-phase allowlists below now require. Bumping
+ * ROOM_PERSISTENCE_VERSION without this made every version-1 envelope
+ * already sitting in production storage fail to decode (persistence_invalid)
+ * the moment this shipped, since nothing had rewritten them yet. Every
+ * future shape change to a phase's persisted keys needs the same treatment:
+ * bump ROOM_PERSISTENCE_VERSION, add the old value here (or extend this to a
+ * set if more than one legacy version must ever be supported at once), and
+ * add a migration branch below.
+ */
+const ROOM_PERSISTENCE_LEGACY_VERSION = 1;
 
 export type PersistedRoomEnvelope = Readonly<{
   kind: typeof ROOM_PERSISTENCE_KIND;
@@ -94,7 +114,16 @@ export function loadPersistenceEnvelope(
     return persistenceInvalid();
   }
 
-  if (envelope.version !== ROOM_PERSISTENCE_VERSION) {
+  // A legacy (version-1) envelope is decoded through the same strict
+  // per-phase allowlists as the current version, just after normalizing its
+  // game-state record forward to the version-2 shape first - see
+  // migrateLegacyGameStateRecord. Anything that is neither the current
+  // version nor this one known-migratable prior version is genuinely
+  // unsupported (a future version this build predates, or a bogus value),
+  // not something to guess at.
+  const legacy = envelope.version === ROOM_PERSISTENCE_LEGACY_VERSION;
+
+  if (!legacy && envelope.version !== ROOM_PERSISTENCE_VERSION) {
     return {
       ok: false,
       error: roomDomainError(
@@ -108,7 +137,7 @@ export function loadPersistenceEnvelope(
     return persistenceInvalid();
   }
 
-  const room = decodeRoomState(envelope.room);
+  const room = decodeRoomState(envelope.room, { legacy, nowMs });
 
   if (room === null) {
     return persistenceInvalid();
@@ -140,7 +169,16 @@ export function isRoomExpired(room: RoomState, nowMs: UnixTimeMs): boolean {
   return nowMs >= roomExpiresAtMs(room);
 }
 
-function decodeRoomState(value: unknown): RoomState | null {
+/**
+ * Carries what a legacy-envelope migration needs through the decode
+ * pipeline: whether the input is a version-1 game-state record that must be
+ * forward-migrated before the (unmodified) strict v2 checks run, and the
+ * reader's current time - needed only for stamping a fresh turnDeadlineMs
+ * (see withFreshTurnDeadline) since a v1 record never had one to recover.
+ */
+type DecodeContext = Readonly<{ legacy: boolean; nowMs: UnixTimeMs }>;
+
+function decodeRoomState(value: unknown, ctx: DecodeContext): RoomState | null {
   if (!isRecord(value)) {
     return null;
   }
@@ -150,7 +188,7 @@ function decodeRoomState(value: unknown): RoomState | null {
   const config = decodeRoomGameConfig(value.config);
   const host = decodeSeat(value.host, "host");
   const guest = value.guest === null ? null : decodeSeat(value.guest, "guest");
-  const game = decodeGameState(value.game);
+  const game = decodeGameState(value.game, ctx);
   const guestSeatInvalid = value.guest !== null && guest === null;
 
   if (
@@ -241,107 +279,200 @@ function decodeSeat(value: unknown, role: RoomSeat["role"]): RoomSeat | null {
   } as RoomSeat;
 }
 
-function decodeGameState(value: unknown): GameState | null {
+function decodeGameState(value: unknown, ctx: DecodeContext): GameState | null {
   if (!isRecord(value) || !isGameStateBase(value)) {
     return null;
   }
 
-  switch (value.phase) {
+  // Normalize a legacy record to the version-2 shape first, then run it
+  // through exactly the same strict checks below as a native v2 record -
+  // see migrateLegacyGameStateRecord. A legacy record that does not actually
+  // match the expected v1 shape (e.g. a stray turnDeadlineMs already
+  // present, or genuine corruption) is left as-is here and then correctly
+  // rejected by the unmodified v2 allowlist checks that follow.
+  const migrated = ctx.legacy
+    ? migrateLegacyGameStateRecord(value, ctx.nowMs)
+    : value;
+
+  switch (migrated.phase) {
     case "setup":
     case "generatingItem":
-      return hasOnlyKeys(value, baseGameKeysFor(value)) ? value as GameState : null;
+      return hasOnlyKeys(migrated, baseGameKeysFor(migrated)) ? migrated as GameState : null;
     case "proposingWidth":
-      return hasOnlyKeys(value, [...baseGameKeysFor(value), "item", "turnDeadlineMs"]) &&
-        isGeneratedItem(value.item) &&
-        isUnixTimeMs(value.turnDeadlineMs) &&
-        isActiveRoundNumber(value)
-        ? value as GameState
+      return hasOnlyKeys(migrated, [...baseGameKeysFor(migrated), "item", "turnDeadlineMs"]) &&
+        isGeneratedItem(migrated.item) &&
+        isUnixTimeMs(migrated.turnDeadlineMs) &&
+        isActiveRoundNumber(migrated)
+        ? migrated as GameState
         : null;
     case "negotiatingWidth":
     case "configuringMarket":
-      return hasOnlyKeys(value, [...baseGameKeysFor(value), "item", "spreadWidth", "turnDeadlineMs"]) &&
-        isGeneratedItem(value.item) &&
-        isValidSpreadWidth(value.spreadWidth) &&
-        isUnixTimeMs(value.turnDeadlineMs) &&
-        isActiveRoundNumber(value)
-        ? value as GameState
+      return hasOnlyKeys(migrated, [...baseGameKeysFor(migrated), "item", "spreadWidth", "turnDeadlineMs"]) &&
+        isGeneratedItem(migrated.item) &&
+        isValidSpreadWidth(migrated.spreadWidth) &&
+        isUnixTimeMs(migrated.turnDeadlineMs) &&
+        isActiveRoundNumber(migrated)
+        ? migrated as GameState
         : null;
     case "choosingSide":
-      return hasOnlyKeys(value, [
-        ...baseGameKeysFor(value),
+      return hasOnlyKeys(migrated, [
+        ...baseGameKeysFor(migrated),
         "item",
         "spreadWidth",
         "quote",
         "turnDeadlineMs",
-        ...(value.lockedPendingTrade === undefined ? [] : ["lockedPendingTrade"]),
-        ...(value.settlementFailureCount === undefined ? [] : ["settlementFailureCount"]),
+        ...(migrated.lockedPendingTrade === undefined ? [] : ["lockedPendingTrade"]),
+        ...(migrated.settlementFailureCount === undefined ? [] : ["settlementFailureCount"]),
       ]) &&
-        isGeneratedItem(value.item) &&
-        isValidSpreadWidth(value.spreadWidth) &&
-        isQuoteForWidth(value.quote, value.spreadWidth) &&
-        isUnixTimeMs(value.turnDeadlineMs) &&
-        (value.lockedPendingTrade === undefined ||
-          isPendingTradeDecision(value.lockedPendingTrade)) &&
+        isGeneratedItem(migrated.item) &&
+        isValidSpreadWidth(migrated.spreadWidth) &&
+        isQuoteForWidth(migrated.quote, migrated.spreadWidth) &&
+        isUnixTimeMs(migrated.turnDeadlineMs) &&
+        (migrated.lockedPendingTrade === undefined ||
+          isPendingTradeDecision(migrated.lockedPendingTrade)) &&
         // F-07: lockedPendingTrade and settlementFailureCount are only ever
         // set together, both by SETTLEMENT_FAILED (see
         // ChoosingSideGameState's doc comment on settlementFailureCount) -
         // reject a persisted state that has drifted to carrying only one of
         // the pair rather than silently accepting an illegal blend.
-        (value.lockedPendingTrade === undefined) ===
-          (value.settlementFailureCount === undefined) &&
-        (value.settlementFailureCount === undefined ||
-          isSettlementFailureCount(value.settlementFailureCount)) &&
-        isActiveRoundNumber(value)
-        ? value as GameState
+        (migrated.lockedPendingTrade === undefined) ===
+          (migrated.settlementFailureCount === undefined) &&
+        (migrated.settlementFailureCount === undefined ||
+          isSettlementFailureCount(migrated.settlementFailureCount)) &&
+        isActiveRoundNumber(migrated)
+        ? migrated as GameState
         : null;
     case "settling":
-      return hasOnlyKeys(value, [
-        ...baseGameKeysFor(value),
+      return hasOnlyKeys(migrated, [
+        ...baseGameKeysFor(migrated),
         "item",
         "spreadWidth",
         "quote",
         "pendingTrade",
         "settlementFailureCount",
       ]) &&
-        isGeneratedItem(value.item) &&
-        isValidSpreadWidth(value.spreadWidth) &&
-        isQuoteForWidth(value.quote, value.spreadWidth) &&
-        isPendingTradeDecision(value.pendingTrade) &&
-        isSettlementFailureCount(value.settlementFailureCount) &&
-        isActiveRoundNumber(value)
-        ? value as GameState
+        isGeneratedItem(migrated.item) &&
+        isValidSpreadWidth(migrated.spreadWidth) &&
+        isQuoteForWidth(migrated.quote, migrated.spreadWidth) &&
+        isPendingTradeDecision(migrated.pendingTrade) &&
+        isSettlementFailureCount(migrated.settlementFailureCount) &&
+        isActiveRoundNumber(migrated)
+        ? migrated as GameState
         : null;
     case "settlement":
-      return hasOnlyKeys(value, [...baseGameKeysFor(value), "item", "spreadWidth", "quote", "settlement"]) &&
-        isSettledGeneratedItem(value.item) &&
-        isValidSpreadWidth(value.spreadWidth) &&
-        isQuoteForWidth(value.quote, value.spreadWidth) &&
-        isRoundSettlement(value.settlement) &&
-        isActiveRoundNumber(value) &&
-        isSettlementConsistent(value)
-        ? value as GameState
+      return hasOnlyKeys(migrated, [...baseGameKeysFor(migrated), "item", "spreadWidth", "quote", "settlement"]) &&
+        isSettledGeneratedItem(migrated.item) &&
+        isValidSpreadWidth(migrated.spreadWidth) &&
+        isQuoteForWidth(migrated.quote, migrated.spreadWidth) &&
+        isRoundSettlement(migrated.settlement) &&
+        isActiveRoundNumber(migrated) &&
+        isSettlementConsistent(migrated)
+        ? migrated as GameState
         : null;
     case "roundForfeited":
-      return hasOnlyKeys(value, [...baseGameKeysFor(value), "forfeit"]) &&
-        isRoundForfeit(value.forfeit) &&
-        isActiveRoundNumber(value)
-        ? value as GameState
+      return hasOnlyKeys(migrated, [...baseGameKeysFor(migrated), "forfeit"]) &&
+        isRoundForfeit(migrated.forfeit) &&
+        isActiveRoundNumber(migrated)
+        ? migrated as GameState
         : null;
     case "gameOver":
-      return hasOnlyKeys(value, [...baseGameKeysFor(value), "winner"]) &&
-        (value.winner === "A" || value.winner === "B" || value.winner === "Tie") &&
-        isActiveRoundNumber(value)
-        ? value as GameState
+      return hasOnlyKeys(migrated, [...baseGameKeysFor(migrated), "winner"]) &&
+        (migrated.winner === "A" || migrated.winner === "B" || migrated.winner === "Tie") &&
+        isActiveRoundNumber(migrated)
+        ? migrated as GameState
         : null;
     case "error":
-      return hasOnlyKeys(value, [...baseGameKeysFor(value), "error", "previousPhase"]) &&
-        typeof value.error === "string" &&
-        isGamePhase(value.previousPhase)
-        ? value as GameState
+      return hasOnlyKeys(migrated, [...baseGameKeysFor(migrated), "error", "previousPhase"]) &&
+        typeof migrated.error === "string" &&
+        isGamePhase(migrated.previousPhase)
+        ? migrated as GameState
         : null;
     default:
       return null;
   }
+}
+
+/**
+ * Forward-migrates a version-1 game-state record to the version-2 shape
+ * (see ROOM_PERSISTENCE_LEGACY_VERSION). Only touches the specific fields
+ * each shape gained; everything else - including phases with no shape
+ * change at all, like `setup` or `gameOver` - passes through untouched, so
+ * a legacy record that is *actually* corrupt still falls through to fail
+ * the unmodified v2 checks in decodeGameState above rather than being
+ * silently coerced into something valid.
+ */
+function migrateLegacyGameStateRecord(
+  value: Record<string, unknown>,
+  nowMs: UnixTimeMs,
+): Record<string, unknown> {
+  switch (value.phase) {
+    case "proposingWidth":
+      return withFreshTurnDeadline(value, nowMs, PROPOSING_WIDTH_TURN_DURATION_MS);
+    case "negotiatingWidth":
+      return withFreshTurnDeadline(value, nowMs, NEGOTIATING_WIDTH_TURN_DURATION_MS);
+    case "configuringMarket":
+      return withFreshTurnDeadline(value, nowMs, CONFIGURING_MARKET_TURN_DURATION_MS);
+    case "choosingSide":
+      return withFreshTurnDeadline(value, nowMs, CHOOSING_SIDE_TURN_DURATION_MS);
+    case "settling":
+      return withMigratedPendingTrade(value);
+    case "settlement":
+      return withDefaultedForcedByTimeout(value);
+    default:
+      return value;
+  }
+}
+
+function withFreshTurnDeadline(
+  value: Record<string, unknown>,
+  nowMs: UnixTimeMs,
+  turnDurationMs: number,
+): Record<string, unknown> {
+  if (value.turnDeadlineMs !== undefined) {
+    return value;
+  }
+
+  // F-05's shot clock did not exist when a version-1 envelope was written,
+  // so there is no real prior deadline to recover - only a choice about how
+  // much time to grant now. Stamping nowMs (the reader's current time) plus
+  // a full fresh turn - rather than, say, an already-elapsed deadline - is
+  // the deliberate gameplay call here: a player who was mid-turn across this
+  // deploy gets a full turn to act, the same as if the deploy had simply
+  // landed a moment later and the normal ITEM_RECEIVED / SUBMIT_INITIAL_WIDTH
+  // / TIGHTEN_WIDTH / TRADE_ON_WIDTH / SUBMIT_MARKET_QUOTE transition had
+  // stamped this turnDeadlineMs a moment after. The alternative - treating a
+  // migrated room as already on the clock from whenever it was last
+  // persisted - would let an ordinary deploy instantly forfeit rounds for
+  // players who did nothing wrong.
+  return { ...value, turnDeadlineMs: nowMs + turnDurationMs };
+}
+
+function withMigratedPendingTrade(value: Record<string, unknown>): Record<string, unknown> {
+  if (value.pendingTrade !== undefined || value.pendingSide === undefined) {
+    return value;
+  }
+
+  // F-06's timeoutForcedWorstSide path did not exist when a version-1
+  // "settling" envelope was written, so a stored pendingSide can only ever
+  // represent a trader's own EXECUTE_TRADE choice - never a clock-forced
+  // one - and migrates 1:1 into PendingTradeDecision's "chosen" variant.
+  const { pendingSide, ...rest } = value;
+  return { ...rest, pendingTrade: { kind: "chosen", side: pendingSide } };
+}
+
+function withDefaultedForcedByTimeout(value: Record<string, unknown>): Record<string, unknown> {
+  if (!isRecord(value.settlement) || value.settlement.forcedByTimeout !== undefined) {
+    return value;
+  }
+
+  // Same reasoning as withMigratedPendingTrade: F-06 did not exist yet, so a
+  // version-1 RoundSettlement can never have been timeout-forced.
+  // forcedByTimeout only ever accompanies calculateSettlement's other
+  // outputs and does not itself affect transactionPrice/PnL (see
+  // settlement.ts), so defaulting it to false here reproduces exactly what
+  // the pre-F-06 settlement math already computed - isSettlementConsistent
+  // below still re-derives and checks it, not just trusts this default.
+  return { ...value, settlement: { ...value.settlement, forcedByTimeout: false } };
 }
 
 function isGameStateBase(value: Record<string, unknown>): boolean {
