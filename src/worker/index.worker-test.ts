@@ -52,6 +52,7 @@ const STUCK_SETTLING_BOTH_DEADLINES_ROOM_NAME = "worker-room-stuck-settling-both
 const STUCK_SETTLING_EXHAUSTION_ROOM_NAME = "worker-room-stuck-settling-exhaustion";
 const STUCK_SETTLING_NO_DOUBLE_SETTLE_ROOM_NAME = "worker-room-stuck-settling-no-double-settle";
 const STUCK_SETTLING_MID_ALARM_EXPIRY_ROOM_NAME = "worker-room-stuck-settling-mid-alarm-expiry";
+const SETTLING_ABORT_ROOM_NAME = "worker-room-settling-abort";
 const RETRY_SUCCESS_ROOM_NAME = "worker-room-retry-success";
 const RETRY_FAILURE_ROOM_NAME = "worker-room-retry-failure";
 const RETRY_UNAUTHORIZED_ROOM_NAME = "worker-room-retry-unauthorized";
@@ -1441,6 +1442,139 @@ describe("Cloudflare worker scaffold", () => {
     }
 
     expect(finished.room.game.scores).toEqual(recovered.room.game.scores);
+
+    guestConnection.socket.close();
+  });
+
+  it("blocks the host from resetting or kicking while a trade is settling, and both work again once retry resolves it", async () => {
+    // The competitive-integrity gap: a host who is the trader this round has
+    // already locked in an outcome the instant EXECUTE_TRADE lands (the
+    // private true_value was fixed back at item generation), but the
+    // reveal/score update is still pending in `settling`. RESET_TO_LOBBY and
+    // KICK_GUEST are host-control commands with no other phase restriction,
+    // so without this guard the host could always duck a trade going
+    // against them by nuking the room before settlement resolves - and the
+    // private item would be deleted with it, so the outcome would never
+    // even be computed.
+    const stub = roomStub(SETTLING_ABORT_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created settling-abort room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected generated item to be ready.");
+    }
+
+    const marketMakerToken = tokenForPlayer(
+      started.room.game.roles.marketMaker,
+      created.hostToken,
+      joined.guestToken
+    );
+    const traderToken = tokenForPlayer(
+      started.room.game.roles.trader,
+      created.hostToken,
+      joined.guestToken
+    );
+
+    const width = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_INITIAL_WIDTH",
+      credential: marketMakerToken,
+      width: 100
+    });
+
+    expect(width.room.game.phase).toBe("negotiatingWidth");
+
+    const configuring = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "TRADE_ON_WIDTH",
+      credential: traderToken
+    });
+
+    expect(configuring.room.game.phase).toBe("configuringMarket");
+
+    const quoted = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_MARKET_QUOTE",
+      credential: marketMakerToken,
+      quote: {
+        bid: 3400,
+        ask: 3500
+      }
+    });
+
+    expect(quoted.room.game.phase).toBe("choosingSide");
+
+    // Force the round into `settling` and leave it there, exactly like the
+    // F-02 fixture above - this is the window RESET_TO_LOBBY/KICK_GUEST must
+    // not be able to short-circuit.
+    const stuck = await forceStuckSettling(stub, traderToken, "BUY");
+
+    if (stuck.game.phase !== "settling") {
+      throw new Error("Expected forceStuckSettling to land in settling.");
+    }
+
+    const roundId = stuck.game.item.round_id;
+
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
+      privateGeneratedItemStorageKey(roundId)
+    ]);
+
+    const blockedReset = await postRoomCommand(stub, {
+      type: "RESET_TO_LOBBY",
+      credential: created.hostToken
+    });
+    const blockedResetResult = await expectPublicJson<RoomErrorResponse>(blockedReset);
+
+    expect(blockedReset.status).toBe(HTTP_CONFLICT_STATUS);
+    expect(blockedResetResult.error.code).toBe("round_settling");
+
+    const blockedKick = await postRoomCommand(stub, {
+      type: "KICK_GUEST",
+      credential: created.hostToken
+    });
+    const blockedKickResult = await expectPublicJson<RoomErrorResponse>(blockedKick);
+
+    expect(blockedKick.status).toBe(HTTP_CONFLICT_STATUS);
+    expect(blockedKickResult.error.code).toBe("round_settling");
+
+    // Neither rejected command may have mutated the room or torn down the
+    // private true_value the eventual settlement still needs.
+    const reloadedWhileBlocked = await accessRoom(stub, created.hostToken);
+
+    expect(reloadedWhileBlocked.room.game.phase).toBe("settling");
+    expect(reloadedWhileBlocked.room.revision).toBe(stuck.revision);
+    expect(reloadedWhileBlocked.room.seats.guest.occupied).toBe(true);
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
+      privateGeneratedItemStorageKey(roundId)
+    ]);
+
+    // Recovery path: the host is not stranded. RETRY_ITEM_GENERATION is
+    // already authorized for hostControl and already resolves a room stuck
+    // in `settling` (F-02); it is untouched by this guard.
+    const recovered = await applyRoomCommand(stub, {
+      type: "RETRY_ITEM_GENERATION",
+      credential: created.hostToken
+    });
+
+    expect(recovered.room.game.phase).toBe("settlement");
+
+    // Now that the round has left `settling`, both host-control commands
+    // work normally again.
+    const reset = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "RESET_TO_LOBBY",
+      credential: created.hostToken
+    });
+
+    expect(reset.room.lifecycle).toBe("lobby");
+    expect(reset.room.game.phase).toBe("setup");
+    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
 
     guestConnection.socket.close();
   });

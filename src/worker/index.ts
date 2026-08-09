@@ -2828,6 +2828,7 @@ function statusForDomainError(error: RoomDomainError): number {
     case "guest_required":
     case "player_offline":
     case "invalid_game_phase":
+    case "round_settling":
       return 409;
     default:
       return assertNever(error.code);
