@@ -87,6 +87,10 @@ const LIVENESS_SWEEP_ALARM_MULTIPLEX_ROOM_NAME = "worker-room-liveness-sweep-ala
 const LIVENESS_SWEEP_WITH_PENDING_EFFECT_ROOM_NAME = "worker-room-liveness-sweep-with-pending-effect";
 const LIVENESS_LEGACY_ATTACHMENT_ROOM_NAME = "worker-room-liveness-legacy-attachment";
 const LIVENESS_LEGACY_ATTACHMENT_SWEEP_ROOM_NAME = "worker-room-liveness-legacy-attachment-sweep";
+const LIVENESS_LEGACY_ATTACHMENT_LONG_RUN_ROOM_NAME =
+  "worker-room-liveness-legacy-attachment-long-run";
+const LIVENESS_LEGACY_ATTACHMENT_REAL_PING_ROOM_NAME =
+  "worker-room-liveness-legacy-attachment-real-ping";
 const TIGHTEN_REPLAY_SAME_ID_ROOM_NAME = "worker-room-tighten-replay-same-id";
 const TIGHTEN_REPLAY_DIFFERENT_ID_ROOM_NAME = "worker-room-tighten-replay-different-id";
 const KICKED_GUEST_REPLAY_ROOM_NAME = "worker-room-kicked-guest-replay";
@@ -3586,6 +3590,129 @@ describe("Cloudflare worker scaffold", () => {
     expect(connection.socket.readyState).toBe(WebSocket.OPEN);
 
     connection.socket.close();
+  });
+
+  it("eventually sweep-closes a pre-deploy socket lacking acceptedAtMs once its memoized first-seen time ages out, surviving many sweeps before then", async () => {
+    const stub = roomStub(LIVENESS_LEGACY_ATTACHMENT_LONG_RUN_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created legacy-attachment long-run room.");
+    }
+
+    const connection = await openRoomSocket(stub, created.hostToken);
+
+    await stripAcceptedAtMsFromLiveAttachment(stub, "host");
+
+    const closed = nextSocketCloseCode(connection.socket);
+    let sweepClosed = false;
+
+    closed.then(() => {
+      sweepClosed = true;
+    }).catch(() => {});
+
+    const t0 = Date.now();
+
+    // First sweep hits the memoization branch (no auto-response yet, no
+    // acceptedAtMs) and must not close the socket - it grants the same one
+    // full fresh threshold window a legacy socket always got. Asserted
+    // separately from the loop below so a mutation that over-corrects FIX 1
+    // by closing legacy sockets immediately fails here, distinctly from a
+    // mutation that never closes them at all.
+    await runSweepStaleSocketsDirect(stub, t0);
+    await delay(50);
+
+    expect(sweepClosed).toBe(false);
+    expect(connection.socket.readyState).toBe(WebSocket.OPEN);
+
+    // The bug this reproduces: socketLastSeenMs's third fallback used to be
+    // a bare `?? nowMs`, recomputed fresh on every call rather than
+    // memoized anywhere. For a socket that never completes a single
+    // ping-pong, that made `nowMs - lastSeenMs` evaluate to exactly `0` on
+    // every single sweep, forever - the socket was permanently immune, not
+    // merely long-lived. A mutation that deletes the serializeAttachment
+    // write-back in socketLastSeenMs reproduces exactly that: this loop
+    // would run to completion with the socket still OPEN.
+    //
+    // This mirrors the reproduction that caught it: repeated
+    // sweepStaleSockets calls with nowMs advancing by a large multiple of
+    // the staleness threshold each time, spanning several simulated hours.
+    // With the fix, `acceptedAtMs` was memoized as `t0` above, so the
+    // socket ages out normally once that fixed point falls more than one
+    // threshold window behind - it must not survive all 19 remaining
+    // iterations here.
+    for (let i = 1; i < 20; i += 1) {
+      await runSweepStaleSocketsDirect(stub, t0 + i * ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS * 10);
+      await delay(5);
+
+      if (sweepClosed) {
+        break;
+      }
+    }
+
+    expect(sweepClosed).toBe(true);
+    expect(connection.socket.readyState).toBe(WebSocket.CLOSED);
+  });
+
+  it("lets a legacy socket lacking acceptedAtMs transition off the memoized fallback once it receives one real auto-response, becoming sweepable relative to that instead", async () => {
+    const stub = roomStub(LIVENESS_LEGACY_ATTACHMENT_REAL_PING_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created legacy-attachment real-ping room.");
+    }
+
+    const connection = await openRoomSocket(stub, created.hostToken);
+
+    await stripAcceptedAtMsFromLiveAttachment(stub, "host");
+
+    const t0 = Date.now();
+
+    // First sweep hits the memoization branch (no auto-response yet, no
+    // acceptedAtMs): acceptedAtMs is written back as t0.
+    await runSweepStaleSocketsDirect(stub, t0);
+    expect(connection.socket.readyState).toBe(WebSocket.OPEN);
+
+    // Now the socket receives one real "tt-ping" auto-response, well after
+    // t0 - simulated the same way the pre-existing sweep tests simulate a
+    // real edge auto-response, since getWebSocketAutoResponseTimestamp
+    // cannot be produced from test code any other way.
+    const t1 = t0 + ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS - 1_000;
+
+    await withPatchedAutoResponseTimestamp(
+      (ws) => (socketAttachmentRole(ws) === "host" ? new Date(t1) : null),
+      async () => {
+        const closed = nextSocketCloseCode(connection.socket);
+        let sweepClosed = false;
+
+        closed.then(() => {
+          sweepClosed = true;
+        }).catch(() => {});
+
+        // Sweeping just past the *old* (memoized-acceptedAtMs) boundary
+        // must not close the socket now that a real auto-response exists:
+        // socketLastSeenMs prefers the auto-response timestamp over the
+        // memoized fallback, so the effective deadline moved out to
+        // t1 + threshold. A mutation that kept using the memoized
+        // acceptedAtMs even after a real auto-response arrived would close
+        // the socket here.
+        await runSweepStaleSocketsDirect(stub, t0 + ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS + 500);
+        await delay(50);
+
+        expect(sweepClosed).toBe(false);
+        expect(connection.socket.readyState).toBe(WebSocket.OPEN);
+
+        // Sweeping past the *new* boundary (relative to t1, the real
+        // auto-response) does close it - proving the socket is now
+        // ordinarily sweepable off the auto-response signal, not stuck
+        // re-memoizing forever.
+        await runSweepStaleSocketsDirect(stub, t1 + ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS + 1_000);
+
+        const closeInfo = await closed;
+
+        expect(closeInfo.code).toBe(ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE);
+      }
+    );
   });
 
   it("folds a connected socket's liveness deadline into the alarm ahead of a much later TTL, then reverts to the TTL once the socket disconnects", async () => {
