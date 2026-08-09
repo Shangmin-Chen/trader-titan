@@ -12,8 +12,9 @@
  * Do not add another named export here. If a constant or helper needs to be
  * shared with a test file, put it in a non-entrypoint module (e.g.
  * ../lib/room-socket-supervisor.ts, alongside what gives it meaning) and
- * import it into both sides instead. `npm run guard:worker-entrypoint-exports`
- * enforces this - see that script before disabling or working around it.
+ * import it into both sides instead. entrypoint-exports.worker-test.ts
+ * (`npm run worker-test`) asserts this module's export surface directly -
+ * see that file before disabling or working around it.
  */
 import { DurableObject } from "cloudflare:workers";
 import openNextWorker from "../../.open-next/worker.js";
