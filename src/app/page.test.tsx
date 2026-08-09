@@ -682,6 +682,24 @@ describe("per-command pending state (F-06)", () => {
 
     render(<Home />);
     const errorPanel = await screen.findByTestId("error-panel");
+
+    // F-07 regression coverage: previousPhase "generatingItem" is an
+    // ordinary, retryable item-generation error, not a permanently failed
+    // settlement (previousPhase "settling") - isPermanentSettlementFailure
+    // in page.tsx must read false here. If it were hardcoded to true, every
+    // retryable item-generation error would be framed to the host as
+    // unrecoverable, which is exactly the confusion this PR's new copy was
+    // added to prevent for the *real* terminal case.
+    expect(
+      within(errorPanel).getByText("Game error"),
+    ).toBeInTheDocument();
+    expect(
+      within(errorPanel).getByText("Round stopped"),
+    ).toBeInTheDocument();
+    expect(
+      within(errorPanel).queryByTestId("settlement-permanently-failed-note"),
+    ).not.toBeInTheDocument();
+
     const retryButton = within(errorPanel).getByRole("button", {
       name: /retry generation/i,
     });

@@ -462,6 +462,17 @@ describe("game reducer", () => {
       // the generic "timeoutForcedWorstSide" sentinel a plain (unlocked)
       // choosingSide expiry would produce.
       expect(reExpired.pendingTrade).toEqual({ kind: "chosen", side: "BUY" });
+
+      // F-07: the clock-expiry path into settling must carry
+      // settlementFailureCount forward exactly like EXECUTE_TRADE's retry
+      // path does (see settlingStateFromChoosingSideTimeout). `failed` already
+      // recorded one SETTLEMENT_FAILED, so a fresh clock expiry re-entering
+      // settling without going through EXECUTE_TRADE must still show that 1,
+      // not silently reset it to 0 - otherwise a distracted or disconnected
+      // trader who always times out instead of manually retrying would never
+      // count toward SETTLEMENT_FAILURE_EPISODE_CAP and the bounce this PR
+      // caps could cycle indefinitely through this door instead.
+      expect(reExpired.settlementFailureCount).toBe(1);
     });
 
     it("a plain (unlocked) choosingSide has no lockedPendingTrade field at all", () => {

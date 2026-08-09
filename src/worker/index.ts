@@ -1847,9 +1847,11 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         } as const;
       }
 
-      // dispatchSystemRoomEvent always moves settling -> settlement or
-      // settling -> choosingSide here (both branches above), so the room is
-      // guaranteed to have left settling: no pending settle effect remains.
+      // dispatchSystemRoomEvent always moves settling -> settlement,
+      // settling -> choosingSide, or (once SETTLEMENT_FAILED has failed
+      // SETTLEMENT_FAILURE_EPISODE_CAP times in a row for this round, F-07)
+      // settling -> error, so the room is guaranteed to have left settling:
+      // no pending settle effect remains.
       await persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
 
       if (
