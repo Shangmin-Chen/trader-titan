@@ -24,6 +24,7 @@ The room protocol is the boundary between client transports and the pure room do
 - `START_ROOM` is rejected with `player_offline` while Player B is disconnected.
 - Non-final `ADVANCE_ROUND` is rejected with `player_offline` while Player B is disconnected.
 - Final-round `ADVANCE_ROUND` that moves the game to `gameOver` remains allowed while Player B is disconnected.
+- A room socket whose TCP connection has died without a close frame (killed tab, sleeping laptop, blackholed network path) is not distinguishable from a healthy idle socket by the accepted-WebSockets list alone, since the Durable Object never wakes on a client ping (see Transport Notes). The server periodically sweeps for this: a socket with no observed liveness signal for longer than a threshold derived from the client's own ping cadence is closed with a retryable close code, which both removes it from presence and lets the client's reconnect supervisor re-establish a fresh socket. This sweep never persists anything - it is driven entirely by currently-accepted WebSocket state, so it self-quiesces once no sockets remain connected.
 
 ## Client Commands
 
@@ -61,6 +62,8 @@ The room protocol is the boundary between client transports and the pure room do
 The Durable Object slice should implement one runtime decoder for these messages and one dispatcher that calls the pure room command functions. WebSocket broadcasts should contain public room snapshots, never persistence envelopes.
 
 WebSocket connect, close, and error presence changes rebroadcast updated public snapshots to remaining authorized sockets. These snapshots may reuse the current room revision when only presence changed, and they must not expose secrets, token hashes, persistence metadata, or private generated values.
+
+The Durable Object registers a hibernation auto-response pair so a client's own heartbeat ping is answered at the edge without waking the object. A server-side liveness sweep, driven by the Durable Object's single alarm slot, independently detects a room socket that has gone silent for too long (no observed auto-response, and no recent accept) and closes it with a close code the client's reconnect supervisor treats as retryable - never one of the terminal eviction/teardown codes. This sweep is folded into the same alarm slot used for room TTL housekeeping and pending-effect resumption; it only contributes a deadline while at least one socket is connected, so a room with no connected sockets is not woken for this purpose.
 
 ## Client Snapshot Application
 

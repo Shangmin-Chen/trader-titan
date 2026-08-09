@@ -61,6 +61,7 @@ import {
   buildGeminiBatchPrompt
 } from "../api/item-generation/config";
 import { createFetchAmazonLookup } from "../api/item-generation/amazon-provider";
+import { DEFAULT_ROOM_SOCKET_HEARTBEAT } from "../lib/room-socket-supervisor";
 
 const JSON_CONTENT_TYPE = "application/json; charset=utf-8";
 const ROOM_ENDPOINT = "/room";
@@ -100,6 +101,34 @@ const ROOM_SOCKET_ROLE_PROTOCOL_PREFIX = "tt-role-";
 const ROOM_SOCKET_SECRET_PROTOCOL_PREFIX = "tt-secret-";
 const ROOM_SOCKET_PING_MESSAGE = "tt-ping";
 const ROOM_SOCKET_PONG_MESSAGE = "tt-pong";
+/**
+ * F-08: a socket is declared stale once this long has passed with no fresh
+ * edge auto-response observed for it (see sweepStaleSockets). Derived from
+ * the client's own ping cadence (DEFAULT_ROOM_SOCKET_HEARTBEAT.intervalMs,
+ * room-socket-supervisor.ts) rather than an independent number, so the two
+ * sides cannot silently drift apart: a healthy socket refreshes its
+ * auto-response timestamp roughly every intervalMs (20s today). Sizing the
+ * threshold at 3x that interval means a socket survives two consecutive
+ * missed ping cycles - jitter, a backgrounded tab throttling timers, a
+ * brief edge hiccup - and is only closed once a third full cycle has
+ * passed with no signal at all, which a live, hibernation-auto-responding
+ * TCP connection should never do.
+ */
+const ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS = DEFAULT_ROOM_SOCKET_HEARTBEAT.intervalMs * 3;
+/**
+ * Close code the server's own liveness sweep uses when it, rather than the
+ * client, decides a socket is dead. Deliberately not 1000 or 1008 - both
+ * are terminal per isRetryableRoomSocketCloseCode (room-socket-
+ * supervisor.ts) and would stop the client from ever reconnecting, which is
+ * exactly wrong here: the client behind a stale socket is not being evicted
+ * for a policy reason, it is presumed still alive and expected to
+ * reconnect. Distinct from the client watchdog's own
+ * HEARTBEAT_TIMEOUT_CLOSE_CODE (4000) purely so a close code in logs/
+ * telemetry unambiguously identifies which side (client watchdog vs. server
+ * sweep) decided the connection was dead; both land on the same retryable
+ * side of isRetryableRoomSocketCloseCode.
+ */
+const ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE = 4001;
 const HTTP_SWITCHING_PROTOCOLS_STATUS = 101;
 const ROOM_ID_GENERATION_ATTEMPTS = 3;
 const TOKEN_SECRET_BYTE_LENGTH = 32;
@@ -243,6 +272,14 @@ type RoomSocketAttachment = Readonly<{
   roomId: RoomId;
   role: CapabilityRole;
   tokenHash: TokenHash;
+  /**
+   * Acceptance time, used only as the liveness sweep's fallback "last seen"
+   * signal (see socketLastSeenMs) for a socket that has not yet had its
+   * first edge auto-response recorded - getWebSocketAutoResponseTimestamp
+   * returns null until then. Not presence: presence stays derived solely
+   * from ctx.getWebSockets() membership and is never persisted.
+   */
+  acceptedAtMs: UnixTimeMs;
 }>;
 
 type RoomSocketError = RoomHttpError | RoomDomainError | RoomProtocolDecodeError;
@@ -487,7 +524,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         } as const;
       }
 
-      await persistRoomEnvelope(transaction, joined.room, null, nowMs);
+      await this.persistRoomEnvelope(transaction, joined.room, null, nowMs);
 
       return {
         ok: true,
@@ -609,7 +646,8 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       return credential.response;
     }
 
-    const loaded = await this.loadStoredRoom(currentUnixTimeMs());
+    const nowMs = currentUnixTimeMs();
+    const loaded = await this.loadStoredRoom(nowMs);
 
     if (!loaded.ok) {
       return errorResponse(loaded.error, statusForStoredRoomLoadFailure(loaded));
@@ -645,7 +683,8 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       kind: "trader-titan.room-socket.v1",
       roomId: roomId.roomId,
       role: credentialToken.token.role,
-      tokenHash
+      tokenHash,
+      acceptedAtMs: nowMs
     } satisfies RoomSocketAttachment);
 
     // One seat, one socket: evict any prior live socket for this exact
@@ -675,6 +714,15 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       excludeRecipient: server,
       presence
     });
+
+    // F-08: fold this new socket's liveness deadline into the single alarm
+    // slot now, rather than waiting for some unrelated future room mutation
+    // to reschedule it. Without this, a room that sits open with a live
+    // socket but no further commands (e.g. a lobby waiting on a second
+    // player) would keep whatever far-future TTL-only deadline was already
+    // armed, and this socket would never be checked for staleness until the
+    // room itself expired.
+    await this.rearmAlarmForLiveSockets(nowMs);
 
     return new Response(null, {
       headers: {
@@ -723,6 +771,15 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
     this.broadcastRoomSnapshot(result.room);
   }
 
+  /**
+   * A close the liveness sweep (alarm()) itself initiated also reaches this
+   * handler once the close handshake completes - closing a hibernatable
+   * WebSocket always fires webSocketClose(), regardless of who or what
+   * requested the close - so a server-evicted stale socket rebroadcasts
+   * presence through exactly this same path as an ordinary client-driven
+   * disconnect. No separate presence-update wiring is needed in the sweep
+   * itself.
+   */
   async webSocketClose(ws: WebSocket): Promise<void> {
     await this.broadcastPresenceChangeForSocket(ws);
   }
@@ -732,16 +789,29 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
-   * Multiplexes the Durable Object's single alarm slot between two concerns:
-   * room TTL housekeeping (unchanged from before F-02) and resuming a
-   * pending room effect that was durably committed but never ran (the F-02
-   * trapdoor - see receiveStoredSettlement). Each alarm invocation figures
-   * out which deadline actually fired and handles only that one; every
-   * write path that follows reschedules via scheduleNextAlarm() so the slot
-   * never falls out of sync with whichever deadline is now soonest.
+   * Multiplexes the Durable Object's single alarm slot between three
+   * concerns: room TTL housekeeping (unchanged from before F-02), resuming
+   * a pending room effect that was durably committed but never ran (the
+   * F-02 trapdoor - see receiveStoredSettlement), and the F-08 liveness
+   * sweep (closing room sockets the client-side heartbeat cannot itself
+   * detect as dead - see sweepStaleSockets). Each alarm invocation runs the
+   * sweep unconditionally (it is cheap - a scan of this room's live sockets
+   * plus timestamp comparisons, no storage I/O) and then figures out which
+   * *stored* deadline (TTL or pending effect) actually fired, handling only
+   * that one; every write path that follows reschedules via
+   * scheduleNextAlarm() so the slot never falls out of sync with whichever
+   * deadline - TTL, pending effect, or next liveness check - is now
+   * soonest. scheduleNextAlarm() recomputes the liveness deadline from
+   * live sockets on every call, so once the sweep above has closed every
+   * stale socket (or there were none to begin with), a room with no
+   * remaining sockets naturally drops the liveness term and this alarm
+   * settles back to firing only for TTL/pending-effect purposes - it does
+   * not re-arm itself forever.
    */
   async alarm(): Promise<void> {
     const nowMs = currentUnixTimeMs();
+
+    this.sweepStaleSockets(nowMs);
 
     const due = await this.ctx.storage.transaction(async (transaction) => {
       const loaded = loadStoredRoomEnvelope(
@@ -763,7 +833,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         // would have reported that above), and no pending effect is due
         // yet, so this tick is a no-op besides keeping the single alarm
         // slot pointed at whichever deadline is now soonest.
-        await scheduleNextAlarm(transaction, loaded.room, pendingEffect);
+        await this.scheduleNextAlarm(transaction, loaded.room, pendingEffect);
         return null;
       }
 
@@ -833,7 +903,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         }
 
         await writePendingRoomEffect(transaction, null);
-        await scheduleNextAlarm(transaction, loaded.room, null);
+        await this.scheduleNextAlarm(transaction, loaded.room, null);
       });
       return;
     }
@@ -864,7 +934,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         loaded.room.game.item.round_id !== pendingEffect.roundId
       ) {
         await writePendingRoomEffect(transaction, null);
-        await scheduleNextAlarm(transaction, loaded.room, null);
+        await this.scheduleNextAlarm(transaction, loaded.room, null);
         return false;
       }
 
@@ -873,7 +943,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       // alarm wake rather than retrying forever.
       const bumped = nextSettlePendingEffectAttempt(pendingEffect, nowMs);
       await writePendingRoomEffect(transaction, bumped);
-      await scheduleNextAlarm(transaction, loaded.room, bumped);
+      await this.scheduleNextAlarm(transaction, loaded.room, bumped);
       return true;
     });
 
@@ -918,7 +988,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         loaded.room.game.item.round_id !== roundId
       ) {
         await writePendingRoomEffect(transaction, null);
-        await scheduleNextAlarm(transaction, loaded.room, null);
+        await this.scheduleNextAlarm(transaction, loaded.room, null);
         return;
       }
 
@@ -938,11 +1008,11 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         // alarm against the room's TTL deadline so it isn't silently
         // dropped - the marker itself is no longer trustworthy either way.
         await writePendingRoomEffect(transaction, null);
-        await scheduleNextAlarm(transaction, loaded.room, null);
+        await this.scheduleNextAlarm(transaction, loaded.room, null);
         return;
       }
 
-      await persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
+      await this.persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
     });
   }
 
@@ -1046,7 +1116,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         );
       }
 
-      await persistRoomEnvelope(transaction, commandResult.room, pendingEffect, nowMs);
+      await this.persistRoomEnvelope(transaction, commandResult.room, pendingEffect, nowMs);
       await transaction.put(
         ROOM_COMMAND_DEDUPE_STORAGE_KEY,
         withCommandDedupeEntry(dedupeEntries, command, commandResult.room.revision)
@@ -1416,7 +1486,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         } as const;
       }
 
-      await persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
+      await this.persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
 
       return {
         ok: true,
@@ -1468,7 +1538,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         } as const;
       }
 
-      await persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
+      await this.persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
 
       return {
         ok: true,
@@ -1549,7 +1619,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       // dispatchSystemRoomEvent always moves settling -> settlement or
       // settling -> choosingSide here (both branches above), so the room is
       // guaranteed to have left settling: no pending settle effect remains.
-      await persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
+      await this.persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
 
       if (
         stored.ok &&
@@ -1604,6 +1674,178 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       excludeRecipient: socket,
       presence: this.currentRoomPresence(loaded.room, socket)
     });
+  }
+
+  /**
+   * F-08 mitigation: closes any room socket that has gone at least
+   * ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS without a fresh edge
+   * auto-response. This is the one gap the existing client-side heartbeat
+   * (room-socket-supervisor.ts) cannot cover: a dead TCP connection with no
+   * close frame does not make socket.send() throw on the client, it just
+   * queues, and because this DO registers a hibernation auto-response pair
+   * for "tt-ping" in the constructor, a live client's own pings never wake
+   * this object to notice the silence either. getWebSocketAutoResponseTimestamp
+   * is the one signal that updates without waking the DO, so this is only
+   * ever reached from alarm(), which scheduleNextAlarm() already arms for
+   * the earliest such deadline via nextLivenessSweepDeadline().
+   *
+   * Deliberately does not touch presence or persisted state directly:
+   * closing a hibernatable WebSocket always fires webSocketClose() once the
+   * handshake completes, regardless of who initiated the close, so the
+   * normal broadcastPresenceChangeForSocket() path rebroadcasts presence
+   * for a swept socket exactly as it would for an ordinary client-driven
+   * disconnect.
+   */
+  private sweepStaleSockets(nowMs: UnixTimeMs): void {
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = parseRoomSocketAttachment(socket.deserializeAttachment());
+
+      if (attachment === null) {
+        continue;
+      }
+
+      const lastSeenMs = this.socketLastSeenMs(socket, attachment);
+
+      if (nowMs - lastSeenMs >= ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS) {
+        closeStaleRoomSocket(socket);
+      }
+    }
+  }
+
+  /**
+   * Earliest time at which some currently-connected room socket would go
+   * stale if it received no further auto-response before then, or `null`
+   * if there is nothing to watch (no live sockets right now). Recomputed
+   * from live socket state on every call rather than cached/persisted, so
+   * once the last socket disconnects this naturally stops contributing a
+   * deadline at all: scheduleNextAlarm() then arms only the TTL/pending-
+   * effect deadline, and the DO stops waking for liveness purposes until a
+   * new socket connects - this is how an idle (fully vacant) room settles
+   * back to quiescence instead of re-arming a liveness check forever.
+   */
+  private nextLivenessSweepDeadline(): UnixTimeMs | null {
+    let earliest: UnixTimeMs | null = null;
+
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = parseRoomSocketAttachment(socket.deserializeAttachment());
+
+      if (attachment === null) {
+        continue;
+      }
+
+      const deadline = this.socketLastSeenMs(socket, attachment) + ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS;
+
+      if (earliest === null || deadline < earliest) {
+        earliest = deadline;
+      }
+    }
+
+    return earliest;
+  }
+
+  /**
+   * A socket's last observed liveness signal: the edge auto-response
+   * timestamp if it has ever received one, otherwise the socket's
+   * acceptance time (getWebSocketAutoResponseTimestamp returns `null` until
+   * the first "tt-ping" has been auto-answered for this specific socket,
+   * which for a freshly-connected client can legitimately be true for up to
+   * one ping interval).
+   */
+  private socketLastSeenMs(socket: WebSocket, attachment: RoomSocketAttachment): UnixTimeMs {
+    return this.readSocketAutoResponseTimestamp(socket)?.getTime() ?? attachment.acceptedAtMs;
+  }
+
+  /**
+   * Thin indirection around ctx.getWebSocketAutoResponseTimestamp so tests
+   * can substitute a synthetic "last seen" clock for a specific socket
+   * without waiting out ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS in real
+   * time. The timestamp itself is produced entirely inside workerd's edge
+   * auto-responder in response to real "tt-ping" frames and cannot be set
+   * from test code any other way - see index.worker-test.ts.
+   */
+  private readSocketAutoResponseTimestamp(ws: WebSocket): Date | null {
+    return this.ctx.getWebSocketAutoResponseTimestamp(ws);
+  }
+
+  /**
+   * Folds a just-connected socket's liveness deadline into the single alarm
+   * slot immediately (called from acceptRoomSocket right after
+   * ctx.acceptWebSocket()). Connect does not mutate persisted room or
+   * pending-effect state, so this deliberately does not go through
+   * persistRoomEnvelope - it only needs to re-run the same min-of-deadlines
+   * computation scheduleNextAlarm() already owns, now that
+   * ctx.getWebSockets() includes the new socket. No-op if the room can no
+   * longer be loaded (a race with expiry/purge - nothing left to schedule
+   * against).
+   */
+  private async rearmAlarmForLiveSockets(nowMs: UnixTimeMs): Promise<void> {
+    const loaded = await this.loadStoredRoom(nowMs);
+
+    if (!loaded.ok) {
+      return;
+    }
+
+    const pendingEffect = loadPendingRoomEffect(
+      await this.ctx.storage.get<unknown>(PENDING_ROOM_EFFECT_STORAGE_KEY)
+    );
+
+    await this.ctx.storage.transaction(async (transaction) => {
+      await this.scheduleNextAlarm(transaction, loaded.room, pendingEffect);
+    });
+  }
+
+  /**
+   * Persists a room state and its pending-effect marker (if any) together,
+   * then reschedules the single alarm slot to match. `pendingEffect` must be
+   * `null` whenever the caller knows no effect is outstanding for this room
+   * state (which self-heals any stale marker) - only applyDecodedRoomCommand's
+   * settling commit and its alarm-driven successors pass a non-null value.
+   */
+  private async persistRoomEnvelope(
+    transaction: DurableObjectTransaction,
+    room: RoomState,
+    pendingEffect: PendingRoomEffect | null,
+    nowMs: UnixTimeMs
+  ): Promise<void> {
+    await transaction.put(ROOM_STORAGE_KEY, persistenceEnvelopeForStorage(room, nowMs));
+    await writePendingRoomEffect(transaction, pendingEffect);
+    await this.scheduleNextAlarm(transaction, room, pendingEffect);
+  }
+
+  /**
+   * The reusable alarm multiplexer. A Durable Object has exactly one alarm
+   * slot, so every transaction that can change any of the three deadlines
+   * this folds together - room TTL, a pending effect's next-attempt time,
+   * and (F-08) the earliest liveness-sweep deadline among currently
+   * connected room sockets - must call this rather than setAlarm()
+   * directly, or the concerns will race to clobber each other's schedule.
+   * F-05 (turn timers) is expected to reuse this by giving PendingRoomEffect
+   * a second `kind` rather than introducing a second scheduler.
+   *
+   * The liveness term comes from nextLivenessSweepDeadline(), which reads
+   * live socket state (ctx.getWebSockets() /
+   * getWebSocketAutoResponseTimestamp()) rather than anything persisted, so
+   * it costs nothing extra in this already-open transaction and cannot itself
+   * fall out of sync the way a stored marker could.
+   */
+  private async scheduleNextAlarm(
+    transaction: DurableObjectTransaction,
+    room: RoomState,
+    pendingEffect: PendingRoomEffect | null
+  ): Promise<void> {
+    const deadlines: UnixTimeMs[] = [roomExpiresAtMs(room)];
+
+    if (pendingEffect !== null) {
+      deadlines.push(pendingEffect.notBeforeMs);
+    }
+
+    const livenessDeadline = this.nextLivenessSweepDeadline();
+
+    if (livenessDeadline !== null) {
+      deadlines.push(livenessDeadline);
+    }
+
+    await transaction.setAlarm(Math.min(...deadlines));
   }
 
   private publicRoomSnapshot(room: RoomState): PublicRoomSnapshot {
@@ -1675,7 +1917,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       nowMs
     });
 
-    await persistRoomEnvelope(transaction, room, null, nowMs);
+    await this.persistRoomEnvelope(transaction, room, null, nowMs);
     await deletePrivateGeneratedItems(transaction);
     // A prior room in this same Durable Object may have expired without its
     // alarm having fired yet, leaving its command-dedupe record behind.
@@ -2116,7 +2358,8 @@ function parseRoomSocketAttachment(value: unknown): RoomSocketAttachment | null 
   if (
     !roomId.ok ||
     !tokenHash.ok ||
-    (value.role !== "host" && value.role !== "guest")
+    (value.role !== "host" && value.role !== "guest") ||
+    !isFiniteNonNegativeNumber(value.acceptedAtMs)
   ) {
     return null;
   }
@@ -2125,13 +2368,30 @@ function parseRoomSocketAttachment(value: unknown): RoomSocketAttachment | null 
     kind: "trader-titan.room-socket.v1",
     roomId: roomId.roomId,
     role: value.role,
-    tokenHash: tokenHash.tokenHash
+    tokenHash: tokenHash.tokenHash,
+    acceptedAtMs: value.acceptedAtMs
   };
 }
 
 function closeSocketQuietly(socket: WebSocket, reason: string): void {
   try {
     socket.close(1008, reason);
+  } catch {
+    try {
+      socket.close();
+    } catch {}
+  }
+}
+
+/**
+ * F-08 liveness sweep's own close helper, kept separate from
+ * closeSocketQuietly (1008, terminal) because this close must land on the
+ * retryable side of isRetryableRoomSocketCloseCode - see
+ * ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE.
+ */
+function closeStaleRoomSocket(socket: WebSocket): void {
+  try {
+    socket.close(ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE, "No recent client activity.");
   } catch {
     try {
       socket.close();
@@ -2421,46 +2681,6 @@ function loadStoredRoomEnvelope(
 
 function persistenceEnvelopeForStorage(room: RoomState, nowMs: UnixTimeMs): unknown {
   return JSON.parse(JSON.stringify(toPersistenceEnvelope(room, nowMs))) as unknown;
-}
-
-/**
- * Persists a room state and its pending-effect marker (if any) together,
- * then reschedules the single alarm slot to match. `pendingEffect` must be
- * `null` whenever the caller knows no effect is outstanding for this room
- * state (which self-heals any stale marker) - only applyDecodedRoomCommand's
- * settling commit and its alarm-driven successors pass a non-null value.
- */
-async function persistRoomEnvelope(
-  transaction: DurableObjectTransaction,
-  room: RoomState,
-  pendingEffect: PendingRoomEffect | null,
-  nowMs: UnixTimeMs
-): Promise<void> {
-  await transaction.put(ROOM_STORAGE_KEY, persistenceEnvelopeForStorage(room, nowMs));
-  await writePendingRoomEffect(transaction, pendingEffect);
-  await scheduleNextAlarm(transaction, room, pendingEffect);
-}
-
-/**
- * The reusable alarm multiplexer. A Durable Object has exactly one alarm
- * slot, so every transaction that can change either deadline (room TTL or a
- * pending effect's next-attempt time) must call this rather than setAlarm()
- * directly, or the two concerns will race to clobber each other's schedule.
- * F-05 (turn timers) is expected to reuse this by giving PendingRoomEffect a
- * second `kind` rather than introducing a second scheduler.
- */
-async function scheduleNextAlarm(
-  transaction: DurableObjectTransaction,
-  room: RoomState,
-  pendingEffect: PendingRoomEffect | null
-): Promise<void> {
-  const ttlDeadline = roomExpiresAtMs(room);
-  const deadline =
-    pendingEffect === null
-      ? ttlDeadline
-      : Math.min(ttlDeadline, pendingEffect.notBeforeMs);
-
-  await transaction.setAlarm(deadline);
 }
 
 async function writePendingRoomEffect(
