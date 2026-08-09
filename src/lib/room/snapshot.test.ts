@@ -3,6 +3,7 @@ import {
   createLobbyRoom,
   executeTrade,
   expireRoomTurn,
+  failRoomSettlement,
   joinRoom,
   parseCapabilityToken,
   parseRoomId,
@@ -218,6 +219,98 @@ describe("room snapshots", () => {
       forfeitedBy: "A",
       awardedTo: "B",
     });
+  });
+
+  it("exposes settlementFailureCount on a settling snapshot (F-07)", () => {
+    const { room, hostToken, guestToken } = startedRoom();
+    const withItem = expectOk(receiveRoomItem(room, item, NOW_MS + 3));
+    const opened = expectOk(
+      submitInitialWidth(withItem, 200, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 4,
+      }),
+    );
+    const configuring = expectOk(
+      tradeOnWidth(opened, {
+        credential: present(guestToken),
+        verifyToken,
+        nowMs: NOW_MS + 5,
+      }),
+    );
+    const choosing = expectOk(
+      submitMarketQuote(configuring, { bid: 900, ask: 1100 }, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 6,
+      }),
+    );
+    const settling = expectOk(
+      executeTrade(choosing, "BUY", {
+        credential: present(guestToken),
+        verifyToken,
+        nowMs: NOW_MS + 7,
+      }),
+    );
+    const snapshot = toPublicRoomSnapshot(settling, LIVE_PRESENCE);
+
+    expect(snapshot.game.phase).toBe("settling");
+
+    if (snapshot.game.phase !== "settling") {
+      throw new Error("Expected settling snapshot.");
+    }
+
+    expect(snapshot.game.settlementFailureCount).toBe(0);
+  });
+
+  it("exposes lockedPendingTrade paired with settlementFailureCount on a locked choosingSide snapshot, and neither on a plain one (F-07)", () => {
+    const { room, hostToken, guestToken } = startedRoom();
+    const withItem = expectOk(receiveRoomItem(room, item, NOW_MS + 3));
+    const opened = expectOk(
+      submitInitialWidth(withItem, 200, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 4,
+      }),
+    );
+    const configuring = expectOk(
+      tradeOnWidth(opened, {
+        credential: present(guestToken),
+        verifyToken,
+        nowMs: NOW_MS + 5,
+      }),
+    );
+    const choosing = expectOk(
+      submitMarketQuote(configuring, { bid: 900, ask: 1100 }, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 6,
+      }),
+    );
+    const plainSnapshot = toPublicRoomSnapshot(choosing, LIVE_PRESENCE);
+
+    expect(plainSnapshot.game.phase).toBe("choosingSide");
+    expect("lockedPendingTrade" in plainSnapshot.game).toBe(false);
+    expect("settlementFailureCount" in plainSnapshot.game).toBe(false);
+
+    const settling = expectOk(
+      executeTrade(choosing, "BUY", {
+        credential: present(guestToken),
+        verifyToken,
+        nowMs: NOW_MS + 7,
+      }),
+    );
+    const failed = expectOk(failRoomSettlement(settling, "Settlement failed.", NOW_MS + 8));
+    const lockedSnapshot = toPublicRoomSnapshot(failed, LIVE_PRESENCE);
+
+    expect(lockedSnapshot.game.phase).toBe("choosingSide");
+
+    if (lockedSnapshot.game.phase !== "choosingSide") {
+      throw new Error("Expected locked choosingSide snapshot.");
+    }
+
+    expect(lockedSnapshot.game.lockedPendingTrade).toEqual({ kind: "chosen", side: "BUY" });
+    expect(lockedSnapshot.game.settlementFailureCount).toBe(1);
   });
 });
 

@@ -258,6 +258,12 @@ export function toPublicGameState(game: GameState): PublicRoomGameState {
         ...(game.lockedPendingTrade === undefined
           ? {}
           : { lockedPendingTrade: game.lockedPendingTrade }),
+        // F-07: not privacy-sensitive (a small integer, never derived from
+        // private data) - forwarded alongside lockedPendingTrade so the
+        // client can tell how close a retrying round is to the terminal cap.
+        ...(game.settlementFailureCount === undefined
+          ? {}
+          : { settlementFailureCount: game.settlementFailureCount }),
       };
     case "roundForfeited":
       return {
@@ -276,6 +282,7 @@ export function toPublicGameState(game: GameState): PublicRoomGameState {
           ask: game.quote.ask,
         },
         pendingTrade: game.pendingTrade,
+        settlementFailureCount: game.settlementFailureCount,
       };
     default:
       return assertNever(game);
