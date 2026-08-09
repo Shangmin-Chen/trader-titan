@@ -169,7 +169,9 @@ computed from the client's existing heartbeat config
   acceptance time instead, carried in the WebSocket's serialized attachment
   (`acceptedAtMs`). This is transport-layer bookkeeping alongside the attachment's
   existing `roomId`/`role`/`tokenHash` fields, not presence data, and is not part of
-  the persisted room envelope.
+  the persisted room envelope. `acceptedAtMs` is optional on the attachment type and in
+  `parseRoomSocketAttachment` - see "Deploy compatibility" below for why, and for the
+  third fallback (to `nowMs`) that applies when a socket has neither signal.
 
 Close code: `4001` (`ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE`), distinct from both the
 terminal codes (`1000`, `1008`) the client's reconnect supervisor treats as
@@ -177,6 +179,71 @@ non-retryable, and from the client's own `HEARTBEAT_TIMEOUT_CLOSE_CODE` (`4000`)
 close code alone identifies which side decided the connection was dead. Numerically it
 lands on the same side of `isRetryableRoomSocketCloseCode` as every other non-1000/1008
 code: the client reconnects with normal backoff.
+
+## Deploy compatibility: a socket without `acceptedAtMs` must not be evicted
+
+An earlier version of this change made `acceptedAtMs` a required field of
+`RoomSocketAttachment`, enforced by `!isFiniteNonNegativeNumber(value.acceptedAtMs)` in
+`parseRoomSocketAttachment`. A socket accepted by pre-deploy code - already connected
+and hibernating at the moment this change ships - has an attachment with
+`roomId`/`role`/`tokenHash` but no `acceptedAtMs`. Because hibernation does not re-run
+`acceptRoomSocket`, that attachment is what `parseRoomSocketAttachment` keeps parsing
+for the rest of that socket's life. Making the field required meant this function
+returned `null` for such a socket everywhere it is called - including
+`socketCanReceiveRoomSnapshot`, which `broadcastRoomSnapshot` uses to decide whether to
+keep or force-close each socket on every snapshot broadcast (not just liveness-sweep
+ticks). A `null` attachment made that check return `false`, and `broadcastRoomSnapshot`
+responded by calling `closeSocketQuietly(socket, "Room seat changed.")` - close code
+`1008`, which the client's own `isRetryableRoomSocketCloseCode` treats as terminal, on
+par with an actual kick.
+
+A review reproduced this directly: opened host and guest sockets, stripped
+`acceptedAtMs` from the guest's live attachment via `runInDurableObject` +
+`serializeAttachment` to simulate a pre-deploy socket, then had the host reconnect - an
+ordinary, unrelated action with no bearing on the guest's own seat. The guest, who did
+nothing and was never removed from the room, was closed with `{code: 1008, reason:
+"Room seat changed."}`, confirmed non-retryable by the client's own supervisor logic.
+On a real deploy, the first snapshot broadcast touching any room holding a pre-deploy
+socket would force-close it with a code the client reads as "you were kicked," with no
+retry - both players stuck in every in-progress game that had a socket open across the
+deploy, until a manual reload. That is strictly worse than the F-08 bug this branch
+exists to fix, and it shipped past a 55/55 green suite, clean typecheck, and clean lint
+because nothing in the test suite constructed an attachment lacking `acceptedAtMs`.
+
+The fix decouples liveness bookkeeping from attachment validity, rather than trying to
+migrate the attachment shape:
+
+- `RoomSocketAttachment.acceptedAtMs` is now optional (`acceptedAtMs?: UnixTimeMs`), and
+  `parseRoomSocketAttachment` only validates it when present - a missing value no
+  longer fails parsing. Every attachment-consuming path except liveness
+  (`socketCanReceiveRoomSnapshot`, `currentRoomPresence`, the per-seat eviction match in
+  `acceptRoomSocket`) never read this field in the first place, so none of them change
+  behavior; they simply stop being collateral damage of a liveness-only concern.
+- `socketLastSeenMs` becomes a three-way fallback instead of two:
+  `readSocketAutoResponseTimestamp(socket) ?? attachment.acceptedAtMs ?? nowMs`. A
+  socket that has answered at least one real ping uses that. A socket that hasn't but
+  does carry `acceptedAtMs` (every socket accepted after this deploy) uses that,
+  exactly as before. A socket with neither - the pre-deploy case - reads as "last seen
+  right now," the same `nowMs` the caller (`sweepStaleSockets` or
+  `nextLivenessSweepDeadline`, both of which already had `nowMs` in scope) is already
+  working with.
+
+This was chosen over the alternative of keeping the lenient "is this a room-socket
+attachment" check for the presence/broadcast/eviction call sites and adding a second,
+stricter accessor used only by liveness. That shape works too, but duplicates the
+field-by-field parsing logic (`roomId`/`tokenHash`/`role` validation) across two
+functions that must be kept consistent, for a difference that is really about one
+field's meaning to one caller. Making `acceptedAtMs` optional in the single parser and
+handling its absence at the one call site that assigns it meaning
+(`socketLastSeenMs`) keeps the "is this a valid room-socket attachment" question
+answered in exactly one place.
+
+The invariant this establishes: a legacy socket is never force-closed with a terminal
+code because something else in the room merely broadcast a snapshot. It survives until
+its own real staleness is observed (measured from the moment that staleness check
+first ran, not from an assumed-ancient past), or until it naturally reconnects and
+receives a fresh attachment with `acceptedAtMs` set. It is functionally
+indistinguishable from any other connected socket from that point on.
 
 ## Mutation evidence
 
@@ -193,25 +260,30 @@ one. All mutations were applied to and reverted from `src/worker/index.ts` only.
 | 5 | `alarm()`: insert `return;` immediately after `this.sweepStaleSockets(nowMs)`, before the TTL/pending-effect transaction runs | (b) the sweep does not swallow the rest of the alarm tick | `resolves a due pending settlement effect and sweeps a stale socket in the same alarm tick, dropping neither` fails: the room stays in `settling` instead of resolving to `settlement`. |
 | 6 | `acceptRoomSocket`: remove the `await this.rearmAlarmForLiveSockets(nowMs)` call after accepting the new socket | (b)/eager-rearm-on-connect | `folds a connected socket's liveness deadline...` fails identically to mutation 3: without an eager rearm, nothing schedules the new socket's liveness deadline until an unrelated room mutation happens to touch the alarm. |
 | 7 | `socketLastSeenMs`: fall back to `0` instead of `attachment.acceptedAtMs` when no auto-response timestamp exists yet | acceptedAtMs fallback correctness | `folds a connected socket's liveness deadline...` fails: the resulting deadline (epoch 0 + threshold) is so far overdue that workerd fires it opportunistically before the test can read back the intended ~60-second-out value, and the test's tight bound on the armed alarm value catches the discrepancy. |
+| 8 | `parseRoomSocketAttachment`: restore the required-`acceptedAtMs` check (`!isFiniteNonNegativeNumber(value.acceptedAtMs)` unconditionally, instead of only when the field is present) | deploy-compatibility: a legacy attachment must keep parsing | `does not force-close a pre-deploy socket lacking acceptedAtMs when an unrelated broadcast touches the room` fails: the guest's rebroadcast never arrives (it times out waiting for the message) because the guest was force-closed by the host's reconnect broadcast instead. This is the exact terminal-1008-on-unrelated-broadcast bug the review reproduced. |
+| 9 | `socketLastSeenMs`: fall back to `0` instead of `nowMs` as the third term (`readSocketAutoResponseTimestamp(socket)?.getTime() ?? attachment.acceptedAtMs ?? 0`) | deploy-compatibility: a legacy socket with no signal at all reads as "just seen," not "stale since epoch" | `does not sweep-close a pre-deploy socket lacking acceptedAtMs before its first ping has ever been answered` fails: the sweep closes the socket immediately (`nowMs - 0` is always past the threshold) instead of leaving it open. |
+| 10 | `sweepStaleSockets`: change the comparison from `nowMs - lastSeenMs >= THRESHOLD` to `> THRESHOLD` | staleness boundary is inclusive (`>=`), not exclusive (`>`) | `F-08 liveness sweep closes a socket exactly at the staleness boundary, not only strictly past it` fails: a socket whose last-seen time is pinned to exactly `nowMs - THRESHOLD` (via a direct `sweepStaleSockets(nowMs)` call, bypassing `alarm()`'s own wall-clock sampling so the gap is exact rather than padded) is never closed. The pre-existing "well past threshold" test (padded by a full second) does not catch this - it was the missing case the review flagged. |
 
 Full command output for each row is reproducible via `git stash` / targeted `sed`
 edits followed by `npx vitest run --config vitest.worker.config.ts --configLoader
 runner -t "<test name>"`; none of the mutations above are present in the committed
 diff.
 
+`ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS` and `ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE`
+are now exported from `src/worker/index.ts` and imported directly into the worker test
+file, replacing a local `intervalMs * 3` / `4001` that had been independently
+re-derived there. This is a single-source-of-truth fix rather than something a single
+red/green mutation demonstrates cleanly: with the export in place, mutating the
+threshold's formula in `src/worker/index.ts` (confirmed with `intervalMs * 3` changed
+to `intervalMs * 2`, full worker-test suite re-run, then reverted) leaves every test
+passing, because the test's own expectations are computed from the same constant the
+production code uses rather than a hand-copied duplicate. Before this fix, that
+same change could have left a stale, independently-maintained test constant silently
+asserting against the wrong threshold value with no import-time signal that the two had
+diverged.
+
 ## Left alone, deliberately
 
-- **`RoomSocketAttachment` schema compatibility across a live deploy.** `acceptedAtMs`
-  is now a required field on the attachment; `parseRoomSocketAttachment` rejects an
-  attachment missing it, the same way it already rejects one with a missing
-  `roomId`/`tokenHash`/`role`. A socket that was already connected and hibernating at
-  the moment this change deploys would carry an attachment without `acceptedAtMs` and
-  would stop being recognized by every attachment-consuming path (presence,
-  broadcast-eligibility, the sweep itself) until it reconnects. The existing
-  eviction/broadcast code already has no version-migration story for this attachment
-  shape, so this is consistent with what was already there, not a new gap - but it is
-  worth a reviewer's attention if a zero-downtime deploy story for this attachment
-  format is wanted later.
 - **Room-expiry-driven socket teardown.** `purgeExpiredRoomState` (run when the room's
   TTL has actually elapsed) does not close any sockets still pointed at the now-purged
   room; that was true before this change and is unrelated to F-08, so it was left as
@@ -226,7 +298,10 @@ diff.
 
 - `npm run typecheck`: passes, no errors.
 - `npm run lint`: passes, no errors or warnings.
-- `npm run worker-test`: 55 passed (52 pre-existing + 3 new), 0 failed.
+- `npm run worker-test`: 58 passed (52 pre-existing + 3 from the original F-08 slice +
+  3 added while closing the deploy-compatibility gap: the broadcast-compatibility test,
+  the sweep-compatibility test, and the exact-boundary staleness test - see "Deploy
+  compatibility" and the mutation table above), 0 failed.
 - `npm test`: 227 passed, 0 failed (unchanged from before this change - this slice
   does not touch pure `src/lib/game` or `src/lib/room` code).
 
