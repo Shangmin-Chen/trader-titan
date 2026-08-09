@@ -4,6 +4,7 @@ import {
   createLobbyRoom,
   executeTrade,
   expireRoomTurn,
+  failRoomSettlement,
   isRoomExpired,
   joinRoom,
   loadPersistenceEnvelope,
@@ -25,6 +26,7 @@ import {
   type RoomState,
   type TokenHash,
 } from "./index";
+import { SETTLEMENT_FAILURE_EPISODE_CAP } from "../game/types";
 
 const NOW_MS = 40_000;
 const ROOM_ID_VALUE = "room_persist_0001";
@@ -190,6 +192,58 @@ describe("room persistence", () => {
     });
   });
 
+  // F-07: a `generatingItem` phase - which a fresh round always passes
+  // through on its way to a new `choosingSide`/`settling` (see NEXT_ROUND
+  // and START_GAME in reducer.ts) - structurally has no
+  // settlementFailureCount field of its own. This is what makes "a new
+  // round cannot inherit a stale count" true even across a storage
+  // round-trip, not just in memory: a persisted envelope that somehow
+  // carried one forward for this phase must be rejected outright rather
+  // than silently accepted and later read back by a phase that does have
+  // the field.
+  it("rejects a stray settlementFailureCount smuggled onto a generatingItem phase", () => {
+    const { room, hostToken } = joinedRoom();
+    // normalizeForPersistence: without this, `active.game.lastError` is an
+    // own key with value `undefined` (the reducer sets it explicitly - see
+    // that helper's doc comment), which real storage silently drops but a
+    // raw in-memory object does not - and hasOnlyKeys would then reject the
+    // envelope for that unrelated reason regardless of the mutation this
+    // test exists to catch.
+    const active = normalizeForPersistence(
+      expectOk(
+        startRoom(room, {
+          credential: present(hostToken),
+          verifyToken,
+          nowMs: NOW_MS + 2,
+        }),
+      ),
+    );
+
+    expect(active.game.phase).toBe("generatingItem");
+
+    const envelope = toPersistenceEnvelope(active, NOW_MS + 3);
+
+    expect(loadPersistenceEnvelope(
+      {
+        ...envelope,
+        room: {
+          ...active,
+          game: {
+            ...active.game,
+            settlementFailureCount: 1,
+          },
+        },
+      },
+      envelope.expiresAtMs - 1,
+    )).toEqual({
+      ok: false,
+      error: {
+        code: "persistence_invalid",
+        message: "Room persistence envelope is invalid.",
+      },
+    });
+  });
+
   it("rejects malformed settled Amazon metadata in persistence envelopes", () => {
     const settled = settledRoomWithAmazonMetadata();
     const envelope = toPersistenceEnvelope(settled, NOW_MS + 12);
@@ -297,6 +351,137 @@ describe("room persistence", () => {
     }
   });
 
+  describe("F-07 settlement-failure episode counter", () => {
+    it("round-trips a settling room's settlementFailureCount", () => {
+      const { room, hostToken, guestToken } = joinedRoom();
+      const settling = settlingRoomChosen(room, hostToken, guestToken);
+
+      expect(settling.game.settlementFailureCount).toBe(0);
+
+      const envelope = toPersistenceEnvelope(settling, NOW_MS + 12);
+
+      expect(loadPersistenceEnvelope(envelope, envelope.expiresAtMs - 1)).toEqual({
+        ok: true,
+        room: settling,
+      });
+    });
+
+    it("rejects a settling room missing settlementFailureCount", () => {
+      const { room, hostToken, guestToken } = joinedRoom();
+      const settling = settlingRoomChosen(room, hostToken, guestToken);
+      const envelope = toPersistenceEnvelope(settling, NOW_MS + 12);
+
+      expect(loadPersistenceEnvelope(
+        {
+          ...envelope,
+          room: {
+            ...settling,
+            game: omitKey(settling.game, "settlementFailureCount"),
+          },
+        },
+        envelope.expiresAtMs - 1,
+      )).toEqual({
+        ok: false,
+        error: {
+          code: "persistence_invalid",
+          message: "Room persistence envelope is invalid.",
+        },
+      });
+    });
+
+    it("rejects a settling room whose settlementFailureCount is out of the valid [0, cap) range", () => {
+      const { room, hostToken, guestToken } = joinedRoom();
+      const settling = settlingRoomChosen(room, hostToken, guestToken);
+      const envelope = toPersistenceEnvelope(settling, NOW_MS + 12);
+
+      for (const badCount of [
+        -1,
+        1.5,
+        SETTLEMENT_FAILURE_EPISODE_CAP,
+        SETTLEMENT_FAILURE_EPISODE_CAP + 1,
+        "1",
+        null,
+      ]) {
+        expect(loadPersistenceEnvelope(
+          {
+            ...envelope,
+            room: {
+              ...settling,
+              game: { ...settling.game, settlementFailureCount: badCount },
+            },
+          },
+          envelope.expiresAtMs - 1,
+        )).toEqual({
+          ok: false,
+          error: {
+            code: "persistence_invalid",
+            message: "Room persistence envelope is invalid.",
+          },
+        });
+      }
+    });
+
+    it("round-trips a locked choosingSide with its paired lockedPendingTrade and settlementFailureCount", () => {
+      const { room, hostToken, guestToken } = joinedRoom();
+      const settling = settlingRoomChosen(room, hostToken, guestToken);
+      const failed = normalizeForPersistence(
+        expectOk(failRoomSettlement(settling, "Settlement failed.", NOW_MS + 13)),
+      );
+
+      expect(failed.game.phase).toBe("choosingSide");
+
+      if (failed.game.phase !== "choosingSide") {
+        throw new Error("Expected locked choosingSide phase.");
+      }
+
+      expect(failed.game.lockedPendingTrade).toEqual({ kind: "chosen", side: "BUY" });
+      expect(failed.game.settlementFailureCount).toBe(1);
+
+      const envelope = toPersistenceEnvelope(failed, NOW_MS + 14);
+
+      expect(loadPersistenceEnvelope(envelope, envelope.expiresAtMs - 1)).toEqual({
+        ok: true,
+        room: failed,
+      });
+    });
+
+    it("rejects a locked choosingSide carrying only one of lockedPendingTrade/settlementFailureCount", () => {
+      const { room, hostToken, guestToken } = joinedRoom();
+      const settling = settlingRoomChosen(room, hostToken, guestToken);
+      const failed = normalizeForPersistence(
+        expectOk(failRoomSettlement(settling, "Settlement failed.", NOW_MS + 13)),
+      );
+
+      if (failed.game.phase !== "choosingSide") {
+        throw new Error("Expected locked choosingSide phase.");
+      }
+
+      const envelope = toPersistenceEnvelope(failed, NOW_MS + 14);
+
+      for (const badGame of [
+        omitKey(failed.game, "settlementFailureCount"),
+        omitKey(failed.game, "lockedPendingTrade"),
+      ]) {
+        expect(loadPersistenceEnvelope(
+          {
+            ...envelope,
+            room: {
+              ...failed,
+              game: badGame,
+            },
+          },
+          envelope.expiresAtMs - 1,
+        )).toEqual({
+          ok: false,
+          error: {
+            code: "persistence_invalid",
+            message: "Room persistence envelope is invalid.",
+          },
+        });
+      }
+    });
+  });
+
   it("round-trips a forced settlement (F-06) with forcedByTimeout intact", () => {
     const { room, hostToken, guestToken } = joinedRoom();
     const settling = settlingRoomForcedByTimeout(room, hostToken, guestToken);
@@ -400,6 +585,14 @@ describe("room persistence", () => {
  */
 function normalizeForPersistence<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function omitKey<T extends object, K extends keyof T>(value: T, key: K): Omit<T, K> {
+  const clone: Partial<T> = { ...value };
+
+  delete clone[key];
+
+  return clone as Omit<T, K>;
 }
 
 function settlingRoomChosen(

@@ -2,6 +2,7 @@ import { calculateSettlement } from "../game/settlement";
 import {
   GAME_MODES,
   MAX_ROUNDS,
+  SETTLEMENT_FAILURE_EPISODE_CAP,
   type GameMode,
   type GamePhase,
   type GameState,
@@ -273,6 +274,7 @@ function decodeGameState(value: unknown): GameState | null {
         "quote",
         "turnDeadlineMs",
         ...(value.lockedPendingTrade === undefined ? [] : ["lockedPendingTrade"]),
+        ...(value.settlementFailureCount === undefined ? [] : ["settlementFailureCount"]),
       ]) &&
         isGeneratedItem(value.item) &&
         isValidSpreadWidth(value.spreadWidth) &&
@@ -280,15 +282,32 @@ function decodeGameState(value: unknown): GameState | null {
         isUnixTimeMs(value.turnDeadlineMs) &&
         (value.lockedPendingTrade === undefined ||
           isPendingTradeDecision(value.lockedPendingTrade)) &&
+        // F-07: lockedPendingTrade and settlementFailureCount are only ever
+        // set together, both by SETTLEMENT_FAILED (see
+        // ChoosingSideGameState's doc comment on settlementFailureCount) -
+        // reject a persisted state that has drifted to carrying only one of
+        // the pair rather than silently accepting an illegal blend.
+        (value.lockedPendingTrade === undefined) ===
+          (value.settlementFailureCount === undefined) &&
+        (value.settlementFailureCount === undefined ||
+          isSettlementFailureCount(value.settlementFailureCount)) &&
         isActiveRoundNumber(value)
         ? value as GameState
         : null;
     case "settling":
-      return hasOnlyKeys(value, [...baseGameKeysFor(value), "item", "spreadWidth", "quote", "pendingTrade"]) &&
+      return hasOnlyKeys(value, [
+        ...baseGameKeysFor(value),
+        "item",
+        "spreadWidth",
+        "quote",
+        "pendingTrade",
+        "settlementFailureCount",
+      ]) &&
         isGeneratedItem(value.item) &&
         isValidSpreadWidth(value.spreadWidth) &&
         isQuoteForWidth(value.quote, value.spreadWidth) &&
         isPendingTradeDecision(value.pendingTrade) &&
+        isSettlementFailureCount(value.settlementFailureCount) &&
         isActiveRoundNumber(value)
         ? value as GameState
         : null;
@@ -627,6 +646,21 @@ function isPositiveInteger(value: unknown): value is number {
 
 function isNonNegativeInteger(value: unknown): value is number {
   return Number.isInteger(value) && Number(value) >= 0;
+}
+
+/**
+ * F-07: valid range is [0, SETTLEMENT_FAILURE_EPISODE_CAP) - a persisted
+ * `settling` or locked `choosingSide` can only ever have already failed
+ * *fewer* times than the cap, since reaching the cap routes to the
+ * terminal `error` phase instead of persisting another settling/choosingSide
+ * state at all (see the SETTLEMENT_FAILED case in reducer.ts). Rejecting an
+ * out-of-range value here - rather than only trusting the reducer to never
+ * produce one - keeps a corrupted or tampered envelope from smuggling in a
+ * round that looks like it is one bounce further along than any reducer
+ * transition could actually produce.
+ */
+function isSettlementFailureCount(value: unknown): value is number {
+  return isNonNegativeInteger(value) && value < SETTLEMENT_FAILURE_EPISODE_CAP;
 }
 
 function isFiniteNumber(value: unknown): value is number {
