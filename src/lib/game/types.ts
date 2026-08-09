@@ -18,6 +18,26 @@ export const NEGOTIATING_WIDTH_TURN_DURATION_MS = 45_000;
 export const CONFIGURING_MARKET_TURN_DURATION_MS = 60_000;
 export const CHOOSING_SIDE_TURN_DURATION_MS = 30_000;
 
+// The shortest of the four durations above — currently choosingSide, whose
+// F-06 timeout settlement makes it the phase where a player who cannot
+// detect and recover from their own dead socket in time pays the highest
+// (unbounded, not flat-capped) price. See
+// `DEAD_SOCKET_RECOVERY_BUDGET_MS` in room-socket-supervisor.ts, and the
+// inequality test in turn-clock-recovery-budget.test.ts that pins this
+// constant against it: a disconnected player's worst-case self-heal time
+// (detect the dead socket, back off, reopen, get resynced) must fit inside
+// this with real margin, or a routine Wi-Fi blip can silently cost a
+// player the round no matter which side of the trade they were on.
+// Computed with Math.min (not hand-copied) so adding a new turn phase with
+// a shorter clock automatically flows into that test instead of being
+// silently missed.
+export const MIN_TURN_DURATION_MS = Math.min(
+  PROPOSING_WIDTH_TURN_DURATION_MS,
+  NEGOTIATING_WIDTH_TURN_DURATION_MS,
+  CONFIGURING_MARKET_TURN_DURATION_MS,
+  CHOOSING_SIDE_TURN_DURATION_MS,
+);
+
 // proposingWidth has no spread width yet when the clock runs out (the market
 // maker never proposed one), so a forfeit there needs its own fixed stake
 // rather than "the width in play". Settlement PnL scales with the item's
