@@ -14,6 +14,7 @@ import {
   executeTrade,
   expireRoomTurn,
   failRoomItem,
+  failRoomSettlement,
   joinRoom,
   kickGuest,
   parseCapabilityToken,
@@ -429,6 +430,97 @@ describe("room commands", () => {
     expect(reset.game.phase).toBe("setup");
     expect(reset.game.players.B.name).toBe("Guest");
     expect(reset.game.roundNumber).toBe(0);
+  });
+
+  it("rejects RESET_TO_LOBBY while a trade is settling, without mutating the room", () => {
+    // The trade's outcome is already fixed the instant EXECUTE_TRADE lands
+    // (true_value was fixed back when the item was generated); only the
+    // reveal and score update are still pending. Letting a host-as-trader
+    // nuke the room here would let them duck a bad outcome, and the guest
+    // would never even learn what it would have been.
+    const { room, hostToken } = settlingRoom();
+    const result = resetRoomToLobby(room, {
+      credential: present(hostToken),
+      verifyToken,
+      nowMs: NOW_MS + 9,
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      room,
+      error: {
+        code: "round_settling",
+        message:
+          "This round's trade is locked in and settling. Wait for it to resolve, or use Retry if it's stuck, before resetting or kicking.",
+      },
+    });
+  });
+
+  it("rejects KICK_GUEST while a trade is settling, without mutating the room", () => {
+    const { room, hostToken } = settlingRoom();
+    const result = kickGuest(room, {
+      credential: present(hostToken),
+      verifyToken,
+      nowMs: NOW_MS + 9,
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      room,
+      error: {
+        code: "round_settling",
+        message:
+          "This round's trade is locked in and settling. Wait for it to resolve, or use Retry if it's stuck, before resetting or kicking.",
+      },
+    });
+  });
+
+  it("allows RESET_TO_LOBBY and KICK_GUEST again once settlement resolves", () => {
+    const { room, hostToken } = settlingRoom();
+    const settled = expectOk(
+      receiveRoomSettlement(room, settledItemFor(room.game, 1_200), NOW_MS + 10),
+    );
+
+    const reset = expectOk(
+      resetRoomToLobby(settled, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 11,
+      }),
+    );
+    expect(reset.lifecycle).toBe("lobby");
+
+    const kicked = expectOk(
+      kickGuest(settled, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 11,
+      }),
+    );
+    expect(kicked.lifecycle).toBe("lobby");
+    expect(kicked.guest).toBeNull();
+  });
+
+  it("still allows RESET_TO_LOBBY and KICK_GUEST before a trade is executed (choosingSide)", () => {
+    // Only the determined-but-unrevealed window (`settling`) is restricted.
+    // A host must still be able to abandon a round that hasn't committed to
+    // an outcome yet - e.g. an abandoned guest before either player has
+    // acted on the quote.
+    const { room, hostToken } = settlingRoom();
+    const choosingSide = expectOk(
+      failRoomSettlement(room, "forced back to choosingSide", NOW_MS + 9),
+    );
+
+    expect(choosingSide.game.phase).toBe("choosingSide");
+
+    const reset = expectOk(
+      resetRoomToLobby(choosingSide, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 10,
+      }),
+    );
+    expect(reset.lifecycle).toBe("lobby");
   });
 
   it("denies unauthorized commands without mutating the room", () => {

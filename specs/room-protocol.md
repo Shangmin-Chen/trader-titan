@@ -30,8 +30,8 @@ The room protocol is the boundary between client transports and the pure room do
 - `JOIN_ROOM`: guest display name and guest token hash. No `commandId` (see Command Identity And Replay below).
 - `CONFIGURE_ROOM`: host credential, `commandId`, and partial config.
 - `START_ROOM`: host credential and `commandId`.
-- `RESET_TO_LOBBY`: host credential and `commandId`.
-- `KICK_GUEST`: host credential and `commandId`.
+- `RESET_TO_LOBBY`: host credential and `commandId`. Rejected with `round_settling` (and the room state preserved) while the active game is `settling`, so a host cannot discard the room - and its private, not-yet-revealed settlement outcome - before a trade they made resolves. Allowed in every other phase.
+- `KICK_GUEST`: host credential and `commandId`. Same `round_settling` restriction as `RESET_TO_LOBBY`, for the same reason.
 - `ADVANCE_ROUND`: host credential and `commandId`.
 - `RETRY_ITEM_GENERATION`: host credential and `commandId`. Accepted for active rooms whose game is `error` with `previousPhase === "generatingItem"`, retrying generation, **or** whose game is `settling` (the room can become durably stuck here if the settlement effect never ran after `EXECUTE_TRADE`, or after an F-06 choosingSide timeout, committed the transition), retrying settlement for the current round from the already-committed item, quote, and pending trade decision without regenerating the item or restarting the round. Rejected with `invalid_game_phase` in every other phase.
 - `SUBMIT_INITIAL_WIDTH`: active player credential, `commandId`, and width.

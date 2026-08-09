@@ -230,6 +230,11 @@ export function resetRoomToLobby(
     return { ok: false, room, error: authorized.error };
   }
 
+  const settling = settlingRoundFailure(room);
+  if (settling !== null) {
+    return settling;
+  }
+
   return {
     ok: true,
     room: {
@@ -264,6 +269,11 @@ export function kickGuest(
 
   if (room.guest === null) {
     return commandFailure(room, "guest_slot_empty", "There is no guest to kick.");
+  }
+
+  const settling = settlingRoundFailure(room);
+  if (settling !== null) {
+    return settling;
   }
 
   return {
@@ -741,4 +751,62 @@ function commandFailure(
     room,
     error: roomDomainError(code, message),
   };
+}
+
+/**
+ * Closes a competitive-integrity hole: RESET_TO_LOBBY and KICK_GUEST are
+ * host-control commands with no other phase restriction, and both discard
+ * the entire match (including this round's private true_value, deleted by
+ * the Worker right after either command commits - see
+ * `shouldDeletePrivateGeneratedItemsAfterCommand`). A host who is also the
+ * trader this round has already locked in an outcome the instant
+ * EXECUTE_TRADE lands (the true value was fixed back when the item was
+ * generated; only the reveal and score update are still pending), so
+ * without this guard the host could always duck a trade going against them
+ * by nuking the room before settlement resolves - and the guest would never
+ * even learn what the outcome would have been.
+ *
+ * This intentionally targets only `settling`: every other active phase
+ * (including `choosingSide`, before a side is chosen, and `settlement`,
+ * after the outcome is revealed and scored) has no determined-but-hidden
+ * outcome to protect, so the host's reset/kick tools stay fully available
+ * there - including for a genuinely abandoned guest or a room the host
+ * wants to abandon before committing to a trade.
+ *
+ * This does not strand a stuck room: `retryRoomItemGeneration` is already
+ * authorized for hostControl and already accepts `settling` (see F-02
+ * above) as a signal to re-run the settlement effect, or, after enough
+ * failed attempts, to force the round out of `settling` via
+ * SETTLEMENT_FAILED - back to `choosingSide`, or, once
+ * SETTLEMENT_FAILURE_EPISODE_CAP consecutive episodes have failed for the
+ * same round, on to the terminal `error` phase (F-07). Every one of those
+ * outcomes leaves `settling`, whether by that command or by the Worker's
+ * own alarm-driven retry, after which RESET_TO_LOBBY/KICK_GUEST are
+ * available again - including from `error`, which is what makes the F-07
+ * terminal state recoverable rather than a dead end.
+ *
+ * The gate below checks `game.phase` only, not `room.lifecycle`. That is
+ * deliberate, not an oversight: `lifecycle` is derived from `phase` by
+ * `lifecycleForGame`, which only ever produces a non-"active" lifecycle once
+ * `phase === "gameOver"` - and `gameOver` can never be `settling`. Every
+ * `RoomState` reachable through the exported command API therefore already
+ * satisfies `phase === "settling" implies lifecycle === "active"`, so a
+ * `lifecycle !== "active"` check here can never be false when the phase
+ * check is true. Adding it back would just re-check the same fact through a
+ * second, derived representation - untestable through this module's public
+ * surface, and a trap for a future reader who might assume it is
+ * load-bearing. If a future phase/lifecycle change ever breaks that
+ * invariant, fix it at the source (`lifecycleForGame`), not by resurrecting
+ * a redundant check here.
+ */
+function settlingRoundFailure(room: RoomState): RoomCommandFailure | null {
+  if (room.game.phase !== "settling") {
+    return null;
+  }
+
+  return commandFailure(
+    room,
+    "round_settling",
+    "This round's trade is locked in and settling. Wait for it to resolve, or use Retry if it's stuck, before resetting or kicking.",
+  );
 }

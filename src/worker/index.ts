@@ -3180,6 +3180,7 @@ function statusForDomainError(error: RoomDomainError): number {
     case "guest_slot_empty":
     case "guest_required":
     case "invalid_game_phase":
+    case "round_settling":
       return 409;
     default:
       return assertNever(error.code);

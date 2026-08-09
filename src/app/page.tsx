@@ -539,8 +539,10 @@ function HomeContent() {
     room?.lifecycle === "lobby" &&
     guestSeatOccupied &&
     !isCommandPending("START_ROOM");
-  const canResetLobby = isHost && room !== null && !isCommandPending("RESET_TO_LOBBY");
-  const canKickGuest = isHost && room !== null && !isCommandPending("KICK_GUEST");
+  const canResetLobby =
+    isHost && room !== null && !isCommandPending("RESET_TO_LOBBY") && canAbortRound(game);
+  const canKickGuest =
+    isHost && room !== null && !isCommandPending("KICK_GUEST") && canAbortRound(game);
 
   const runCommand = useCallback(
     async (input: ClientCommandInput) => {
@@ -1951,6 +1953,23 @@ function publicRoomStateWithoutPresenceJson(room: PublicRoomSnapshot): string {
  * just an item-generation failure. See retryRoomItemGeneration in
  * src/lib/room/commands.ts.
  */
+/**
+ * Server-side, `settlingRoundFailure` in src/lib/room/commands.ts already
+ * rejects RESET_TO_LOBBY/KICK_GUEST while the room is `settling`: the
+ * trade's outcome is already fixed at that point (true_value was set back
+ * when the item was generated) but not yet revealed or scored, so allowing
+ * either command there would let a host-as-trader duck a bad outcome by
+ * nuking the room before it resolves - and the guest would never even learn
+ * what it would have been. This predicate only keeps the controls from
+ * offering an action the server will reject; it must match that guard
+ * exactly; it does not add any additional restriction of its own; every
+ * other phase (including before a trade is executed, and after settlement
+ * has resolved) leaves the controls enabled.
+ */
+export function canAbortRound(game: PublicRoomGameState | null): boolean {
+  return game === null || game.phase !== "settling";
+}
+
 export function canRetryItemGeneration(
   game: PublicRoomGameState,
   isHost: boolean,

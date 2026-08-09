@@ -76,6 +76,7 @@ export type RoomDomainErrorCode =
   | "guest_required"
   | "invalid_config"
   | "invalid_game_phase"
+  | "round_settling"
   | "persistence_invalid"
   | "persistence_version_unsupported"
   | "persistence_expired";
