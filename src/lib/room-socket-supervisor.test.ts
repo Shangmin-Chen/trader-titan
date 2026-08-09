@@ -3,6 +3,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_RECONNECT_BACKOFF,
   HEARTBEAT_TIMEOUT_CLOSE_CODE,
+  ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS,
   RoomSocketSupervisor,
   computeReconnectDelayMs,
   isRetryableRoomSocketCloseCode,
@@ -407,5 +408,32 @@ describe("RoomSocketSupervisor heartbeat watchdog", () => {
     // No ping should have been sent post-dispose, and no new timers created.
     expect(sockets[0].sent).toEqual([]);
     expect(vi.getTimerCount()).toBeLessThanOrEqual(pendingBefore);
+  });
+});
+
+describe("ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS (F-08 server sweep)", () => {
+  // A backgrounded browser tab has its timers throttled to roughly one
+  // firing per minute. A tab the user merely switched away from is alive,
+  // and sweeping it is a false eviction.
+  const BACKGROUND_TAB_THROTTLE_WORST_CASE_MS = 60_000;
+
+  it("stays at or above the background-tab throttle window, so a live but backgrounded tab is never swept", () => {
+    // This single assertion is also what guards against re-deriving the
+    // threshold from the client ping interval, which is a real cross-branch
+    // hazard rather than a hypothetical one. The interval is tuned DOWN so a
+    // client notices its own dead socket inside the shortest turn clock (PR
+    // #18 takes it to 5s); this threshold must stay UP for the reason above.
+    // Re-coupling them as `intervalMs * 3` would evaluate to 15s and start
+    // evicting healthy backgrounded tabs - and this assertion fails the
+    // moment it does.
+    //
+    // Note the guard has to be expressed as a floor, not as "differs from
+    // some multiple of intervalMs": today's correct literal (60s) happens to
+    // equal 3x today's interval (20s), so an inequality against the multiple
+    // would fail on a perfectly correct value. The coincidence is not the
+    // property worth protecting; the floor is.
+    expect(ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS).toBeGreaterThanOrEqual(
+      BACKGROUND_TAB_THROTTLE_WORST_CASE_MS,
+    );
   });
 });

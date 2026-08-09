@@ -83,15 +83,30 @@ export const HEARTBEAT_TIMEOUT_CLOSE_CODE = 4000;
 /**
  * F-08: a socket is declared stale once this long has passed with no fresh
  * edge auto-response observed for it (see the Worker's sweepStaleSockets,
- * src/worker/index.ts). Derived from the client's own ping cadence
- * (DEFAULT_ROOM_SOCKET_HEARTBEAT.intervalMs, above) rather than an
- * independent number, so the two sides cannot silently drift apart: a
- * healthy socket refreshes its auto-response timestamp roughly every
- * intervalMs (20s today). Sizing the threshold at 3x that interval means a
- * socket survives two consecutive missed ping cycles - jitter, a
- * backgrounded tab throttling timers, a brief edge hiccup - and is only
- * closed once a third full cycle has passed with no signal at all, which a
- * live, hibernation-auto-responding TCP connection should never do.
+ * src/worker/index.ts). A socket survives jitter, a backgrounded tab
+ * throttling its timers, and brief edge hiccups, and is closed only once a
+ * full window has passed with no signal at all - which a live,
+ * hibernation-auto-responding TCP connection should never do.
+ *
+ * This is an ABSOLUTE value, deliberately NOT derived from
+ * DEFAULT_ROOM_SOCKET_HEARTBEAT.intervalMs, even though 60s happens to
+ * equal 3x today's 20s interval. The two numbers answer opposite questions
+ * and must move independently:
+ *
+ *   - intervalMs is tuned DOWN, so a client notices its own dead socket
+ *     fast enough to reconnect inside the shortest turn clock. PR #18's
+ *     turn shot clock takes it to 5s for exactly that reason.
+ *   - This threshold must stay UP, because a backgrounded browser tab has
+ *     its timers throttled to roughly one firing per minute. A tab the user
+ *     merely switched away from is alive and must not be swept.
+ *
+ * Deriving one from the other couples them backwards: shrinking the ping
+ * interval to help a disconnected player would drag this down to 15s and
+ * start evicting perfectly healthy backgrounded tabs. That is a verified
+ * hazard between this branch and #18, not a hypothetical - which is why
+ * this is a literal, and why room-socket-supervisor.test.ts asserts a floor
+ * against the background-tab throttle window rather than trusting the
+ * comment.
  *
  * Lives here (not in the Worker entrypoint module) because
  * workerd treats every named export of an entrypoint module as a handler or
@@ -100,7 +115,7 @@ export const HEARTBEAT_TIMEOUT_CLOSE_CODE = 4000;
  * 'function or ExportedHandler'`) - see src/worker/index.ts's module-level
  * comment before adding anything here back to that file.
  */
-export const ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS = DEFAULT_ROOM_SOCKET_HEARTBEAT.intervalMs * 3;
+export const ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS = 60_000;
 
 /**
  * Deliberate, non-retryable close codes:
