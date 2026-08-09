@@ -337,17 +337,73 @@ runner -t "<test name>"`; none of the mutations above are present in the committ
 diff.
 
 `ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS` and `ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE`
-are now exported from `src/worker/index.ts` and imported directly into the worker test
-file, replacing a local `intervalMs * 3` / `4001` that had been independently
-re-derived there. This is a single-source-of-truth fix rather than something a single
-red/green mutation demonstrates cleanly: with the export in place, mutating the
-threshold's formula in `src/worker/index.ts` (confirmed with `intervalMs * 3` changed
-to `intervalMs * 2`, full worker-test suite re-run, then reverted) leaves every test
-passing, because the test's own expectations are computed from the same constant the
-production code uses rather than a hand-copied duplicate. Before this fix, that
-same change could have left a stale, independently-maintained test constant silently
-asserting against the wrong threshold value with no import-time signal that the two had
-diverged.
+are now exported from `src/lib/room-socket-supervisor.ts` (see "Round three" below for
+why not `src/worker/index.ts`, where they originally landed) and imported directly into
+both the Worker and the worker test file, replacing a local `intervalMs * 3` / `4001`
+that had been independently re-derived there. This is a single-source-of-truth fix
+rather than something a single red/green mutation demonstrates cleanly: with the export
+in place, mutating the threshold's formula in `src/lib/room-socket-supervisor.ts`
+(confirmed with `intervalMs * 3` changed to `intervalMs * 2`, full worker-test suite
+re-run, then reverted) leaves every test passing, because the test's own expectations
+are computed from the same constant the production code uses rather than a hand-copied
+duplicate. Before this fix, that same change could have left a stale,
+independently-maintained test constant silently asserting against the wrong threshold
+value with no import-time signal that the two had diverged.
+
+## Round three: the branch did not boot
+
+Running the e2e suite on this branch failed before a single test executed:
+
+```
+✘ [ERROR] service core:user:trader-titan: Uncaught TypeError: Incorrect type for map entry
+'ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS': the provided value is not of type 'function or ExportedHandler'.
+Error: Process from config.webServer was not able to start. Exit code: 1
+```
+
+`src/worker/index.ts` is the Worker's entrypoint module (the wrangler `main`).
+workerd requires every named export of an entrypoint to be either the default
+`ExportedHandler` or a class usable as a Durable Object / service binding - in this
+codebase, `GameRoomDurableObject`. The single-source-of-truth fix described just above
+this section added two plain numeric exports to that same file,
+`ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS` and `ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE`,
+so the constants could be imported into the worker test file instead of re-derived
+there. workerd rejects a plain value in that position at *service startup*, not at
+import time - so the Worker failed to boot entirely. In production terms this is a
+total outage, not a degraded feature: nothing about it is scoped to F-08 or to
+liveness sockets, every request would have failed.
+
+Four green check suites did not catch it: `npm run typecheck`, `npm run lint`,
+`npm test` (227 passing), and `npm run worker-test` (60 passing) all import
+`src/worker/index.ts` as a plain ES module - none of them start it as a workerd
+service, so none of them run the export-type validation that actually failed. This
+includes `worker-test` itself, which runs on real `workerd` via
+`@cloudflare/vitest-pool-workers`: its `main` wiring loads the entrypoint for test
+harness purposes, but does not reproduce workerd's own boot-time export check. This
+was confirmed directly, not assumed - reintroducing `export const FOO = 1` to
+`src/worker/index.ts` and re-running `npm run worker-test` left all 60 pre-existing
+tests passing. Only an actual service boot (`wrangler dev`, a real deploy, or
+Playwright's `webServer`, which shells out to the former) surfaces this class of bug.
+
+**Fix:** moved both constants to `src/lib/room-socket-supervisor.ts` - a
+non-entrypoint module - co-located with the values that give them meaning
+(`DEFAULT_ROOM_SOCKET_HEARTBEAT.intervalMs` and `isRetryableRoomSocketCloseCode`
+respectively, both already defined there) rather than a new dumping-ground module.
+Both `src/worker/index.ts` and its worker-test file now import them from there. Added
+a module-level comment on the entrypoint spelling out the constraint.
+
+**What now prevents a recurrence:** `src/worker/entrypoint-exports.worker-test.ts`
+imports `* as` the entrypoint module and asserts its export surface by reflection -
+the named-export set must equal the known-good set (`default` +
+`GameRoomDurableObject`), the default export must be `ExportedHandler`-shaped (has a
+`.fetch` method), and every other named export must be `typeof "function"`, which is
+workerd's actual rule. Verified by the same kind of mutation used above: adding
+`export const MUTATION_TEST_FOO = 1` to `src/worker/index.ts` turns this test red;
+removing it turns the suite green again. This is a structural assertion, not an actual
+service boot - there is no cheap way to force `@cloudflare/vitest-pool-workers` to run
+workerd's own service-startup validation instead of its normal module-loading path for
+test wiring, so this check is deliberately narrower than "does the Worker boot." It
+does directly encode the one rule that broke this branch, and it runs on every
+`npm run worker-test` rather than only on a full build + Playwright run.
 
 ## Left alone, deliberately
 
