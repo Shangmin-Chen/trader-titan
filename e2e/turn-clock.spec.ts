@@ -180,5 +180,32 @@ test.describe("F-05 turn shot clock", () => {
     await expect(host.getByTestId("settlement-forced-note")).toContainText(
       "Ada",
     );
+
+    // F-06 must force whichever side is *worse* for the trader (Ada), not
+    // just settle against an arbitrary side - a mutation that always forced
+    // BUY (or always SELL) regardless of which side is actually worse would
+    // still satisfy every assertion above. The deterministic item provider
+    // (WORKER_ITEM_PROVIDER=deterministic, see playwright.config.ts) fixes
+    // this custom Amazon query's true_value at DEFAULT_TEST_AMAZON_PRICE
+    // (99.99, see src/api/item-generation/amazon-provider.ts), and the
+    // quote above (bid 3,600 / ask 3,700) was chosen far above it on
+    // purpose: buyPnL = 99.99 - 3,700 = -3,600.01, sellPnL = 3,600 - 99.99 =
+    // +3,500.01, so BUY is overwhelmingly the worse side and SELL would be
+    // a large win - the two are not close enough for a mistaken side to
+    // accidentally land on the correct sign. The unit layer (reducer.test.ts
+    // and settlement.test.ts) already pins the exact PnL math for both the
+    // BUY-worse and SELL-worse cases; this only needs to confirm the same
+    // forced side and loss genuinely reach the rendered settlement panel
+    // end-to-end.
+    await expect(host.getByTestId("settlement-panel")).toContainText(
+      "Buy at 3,700",
+    );
+    await expect(host.getByTestId("settlement-panel")).not.toContainText(
+      "Sell at",
+    );
+    await expect(host.getByTestId("settlement-result")).toHaveAttribute(
+      "data-outcome",
+      "loss",
+    );
   });
 });
