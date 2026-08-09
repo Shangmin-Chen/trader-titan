@@ -81,6 +81,28 @@ export const DEFAULT_ROOM_SOCKET_HEARTBEAT: HeartbeatConfig = {
 export const HEARTBEAT_TIMEOUT_CLOSE_CODE = 4000;
 
 /**
+ * F-08: a socket is declared stale once this long has passed with no fresh
+ * edge auto-response observed for it (see the Worker's sweepStaleSockets,
+ * src/worker/index.ts). Derived from the client's own ping cadence
+ * (DEFAULT_ROOM_SOCKET_HEARTBEAT.intervalMs, above) rather than an
+ * independent number, so the two sides cannot silently drift apart: a
+ * healthy socket refreshes its auto-response timestamp roughly every
+ * intervalMs (20s today). Sizing the threshold at 3x that interval means a
+ * socket survives two consecutive missed ping cycles - jitter, a
+ * backgrounded tab throttling timers, a brief edge hiccup - and is only
+ * closed once a third full cycle has passed with no signal at all, which a
+ * live, hibernation-auto-responding TCP connection should never do.
+ *
+ * Lives here (not in the Worker entrypoint module) because
+ * workerd treats every named export of an entrypoint module as a handler or
+ * exported class, so a plain value export there fails the service at boot
+ * (`Incorrect type for map entry ...: the provided value is not of type
+ * 'function or ExportedHandler'`) - see src/worker/index.ts's module-level
+ * comment before adding anything here back to that file.
+ */
+export const ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS = DEFAULT_ROOM_SOCKET_HEARTBEAT.intervalMs * 3;
+
+/**
  * Deliberate, non-retryable close codes:
  *  - 1000: intentional teardown (effect cleanup, session change) — the
  *    caller is the one who closed the socket and does not want it back.
@@ -97,6 +119,24 @@ export const HEARTBEAT_TIMEOUT_CLOSE_CODE = 4000;
 export function isRetryableRoomSocketCloseCode(code: number): boolean {
   return code !== 1000 && code !== 1008;
 }
+
+/**
+ * Close code the server's own liveness sweep uses when it, rather than the
+ * client, decides a socket is dead (see the Worker's sweepStaleSockets,
+ * src/worker/index.ts). Deliberately not 1000 or 1008 - both are terminal
+ * per isRetryableRoomSocketCloseCode above and would stop the client from
+ * ever reconnecting, which is exactly wrong here: the client behind a stale
+ * socket is not being evicted for a policy reason, it is presumed still
+ * alive and expected to reconnect. Distinct from the client watchdog's own
+ * HEARTBEAT_TIMEOUT_CLOSE_CODE (4000) purely so a close code in logs/
+ * telemetry unambiguously identifies which side (client watchdog vs. server
+ * sweep) decided the connection was dead; both land on the same retryable
+ * side of isRetryableRoomSocketCloseCode.
+ *
+ * Lives here rather than in the Worker entrypoint module for the same
+ * boot-safety reason as ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS above.
+ */
+export const ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE = 4001;
 
 /**
  * attempt=0 is the first retry. Delay is `random() * min(maxDelayMs, base * 2^attempt)`

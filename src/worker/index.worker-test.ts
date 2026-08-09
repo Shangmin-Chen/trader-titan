@@ -8,11 +8,7 @@ import {
 } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
-import worker, {
-  GameRoomDurableObject,
-  ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS,
-  ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE
-} from "./index";
+import worker, { GameRoomDurableObject } from "./index";
 import {
   privateGeneratedItemStorageKey,
   privateGeneratedItemStoragePrefix
@@ -23,7 +19,11 @@ import {
 } from "./testing/open-next-worker";
 import { applySettlementToScores } from "../lib/game";
 import type { GameMode, ProviderGeneratedItem, TradeSide } from "../lib/game";
-import { isRetryableRoomSocketCloseCode } from "../lib/room-socket-supervisor";
+import {
+  isRetryableRoomSocketCloseCode,
+  ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS,
+  ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE
+} from "../lib/room-socket-supervisor";
 import {
   ROOM_CREATION_RATE_LIMIT_MAX_REQUESTS,
   ROOM_CUSTOM_AMAZON_RATE_LIMIT_MAX_REQUESTS

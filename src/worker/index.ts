@@ -1,3 +1,20 @@
+/**
+ * This module is the Worker's entrypoint (see wrangler config `main`).
+ * workerd inspects every named export of an entrypoint module and requires
+ * each one to be either an `ExportedHandler` (the `default` export) or a
+ * class usable as a Durable Object / service binding (`GameRoomDurableObject`
+ * below). A plain value or function export that is neither fails the whole
+ * service at boot with "Incorrect type for map entry ...: the provided
+ * value is not of type 'function or ExportedHandler'" - not a build error,
+ * not a test failure, a boot failure that only surfaces once something
+ * actually starts this module as a service (`wrangler dev`, a real deploy).
+ *
+ * Do not add another named export here. If a constant or helper needs to be
+ * shared with a test file, put it in a non-entrypoint module (e.g.
+ * ../lib/room-socket-supervisor.ts, alongside what gives it meaning) and
+ * import it into both sides instead. `npm run guard:worker-entrypoint-exports`
+ * enforces this - see that script before disabling or working around it.
+ */
 import { DurableObject } from "cloudflare:workers";
 import openNextWorker from "../../.open-next/worker.js";
 import {
@@ -61,7 +78,10 @@ import {
   buildGeminiBatchPrompt
 } from "../api/item-generation/config";
 import { createFetchAmazonLookup } from "../api/item-generation/amazon-provider";
-import { DEFAULT_ROOM_SOCKET_HEARTBEAT } from "../lib/room-socket-supervisor";
+import {
+  ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS,
+  ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE
+} from "../lib/room-socket-supervisor";
 
 const JSON_CONTENT_TYPE = "application/json; charset=utf-8";
 const ROOM_ENDPOINT = "/room";
@@ -101,34 +121,6 @@ const ROOM_SOCKET_ROLE_PROTOCOL_PREFIX = "tt-role-";
 const ROOM_SOCKET_SECRET_PROTOCOL_PREFIX = "tt-secret-";
 const ROOM_SOCKET_PING_MESSAGE = "tt-ping";
 const ROOM_SOCKET_PONG_MESSAGE = "tt-pong";
-/**
- * F-08: a socket is declared stale once this long has passed with no fresh
- * edge auto-response observed for it (see sweepStaleSockets). Derived from
- * the client's own ping cadence (DEFAULT_ROOM_SOCKET_HEARTBEAT.intervalMs,
- * room-socket-supervisor.ts) rather than an independent number, so the two
- * sides cannot silently drift apart: a healthy socket refreshes its
- * auto-response timestamp roughly every intervalMs (20s today). Sizing the
- * threshold at 3x that interval means a socket survives two consecutive
- * missed ping cycles - jitter, a backgrounded tab throttling timers, a
- * brief edge hiccup - and is only closed once a third full cycle has
- * passed with no signal at all, which a live, hibernation-auto-responding
- * TCP connection should never do.
- */
-export const ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS = DEFAULT_ROOM_SOCKET_HEARTBEAT.intervalMs * 3;
-/**
- * Close code the server's own liveness sweep uses when it, rather than the
- * client, decides a socket is dead. Deliberately not 1000 or 1008 - both
- * are terminal per isRetryableRoomSocketCloseCode (room-socket-
- * supervisor.ts) and would stop the client from ever reconnecting, which is
- * exactly wrong here: the client behind a stale socket is not being evicted
- * for a policy reason, it is presumed still alive and expected to
- * reconnect. Distinct from the client watchdog's own
- * HEARTBEAT_TIMEOUT_CLOSE_CODE (4000) purely so a close code in logs/
- * telemetry unambiguously identifies which side (client watchdog vs. server
- * sweep) decided the connection was dead; both land on the same retryable
- * side of isRetryableRoomSocketCloseCode.
- */
-export const ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE = 4001;
 const HTTP_SWITCHING_PROTOCOLS_STATUS = 101;
 const ROOM_ID_GENERATION_ATTEMPTS = 3;
 const TOKEN_SECRET_BYTE_LENGTH = 32;
