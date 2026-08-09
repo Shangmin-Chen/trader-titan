@@ -187,6 +187,43 @@ export const SERVER_PRESENCE_LIVENESS_TIMEOUT_MS = 60_000;
 export const HEARTBEAT_TIMEOUT_CLOSE_CODE = 4000;
 
 /**
+ * F-08: a socket is declared stale once this long has passed with no fresh
+ * edge auto-response observed for it (see the Worker's sweepStaleSockets,
+ * src/worker/index.ts). A socket survives jitter, a backgrounded tab
+ * throttling its timers, and brief edge hiccups, and is closed only once a
+ * full window has passed with no signal at all - which a live,
+ * hibernation-auto-responding TCP connection should never do.
+ *
+ * This is an ABSOLUTE value, deliberately NOT derived from
+ * DEFAULT_ROOM_SOCKET_HEARTBEAT.intervalMs, even though 60s happens to
+ * equal 3x today's 20s interval. The two numbers answer opposite questions
+ * and must move independently:
+ *
+ *   - intervalMs is tuned DOWN, so a client notices its own dead socket
+ *     fast enough to reconnect inside the shortest turn clock. PR #18's
+ *     turn shot clock takes it to 5s for exactly that reason.
+ *   - This threshold must stay UP, because a backgrounded browser tab has
+ *     its timers throttled to roughly one firing per minute. A tab the user
+ *     merely switched away from is alive and must not be swept.
+ *
+ * Deriving one from the other couples them backwards: shrinking the ping
+ * interval to help a disconnected player would drag this down to 15s and
+ * start evicting perfectly healthy backgrounded tabs. That is a verified
+ * hazard between this branch and #18, not a hypothetical - which is why
+ * this is a literal, and why room-socket-supervisor.test.ts asserts a floor
+ * against the background-tab throttle window rather than trusting the
+ * comment.
+ *
+ * Lives here (not in the Worker entrypoint module) because
+ * workerd treats every named export of an entrypoint module as a handler or
+ * exported class, so a plain value export there fails the service at boot
+ * (`Incorrect type for map entry ...: the provided value is not of type
+ * 'function or ExportedHandler'`) - see src/worker/index.ts's module-level
+ * comment before adding anything here back to that file.
+ */
+export const ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS = 60_000;
+
+/**
  * Deliberate, non-retryable close codes:
  *  - 1000: intentional teardown (effect cleanup, session change) — the
  *    caller is the one who closed the socket and does not want it back.
@@ -203,6 +240,24 @@ export const HEARTBEAT_TIMEOUT_CLOSE_CODE = 4000;
 export function isRetryableRoomSocketCloseCode(code: number): boolean {
   return code !== 1000 && code !== 1008;
 }
+
+/**
+ * Close code the server's own liveness sweep uses when it, rather than the
+ * client, decides a socket is dead (see the Worker's sweepStaleSockets,
+ * src/worker/index.ts). Deliberately not 1000 or 1008 - both are terminal
+ * per isRetryableRoomSocketCloseCode above and would stop the client from
+ * ever reconnecting, which is exactly wrong here: the client behind a stale
+ * socket is not being evicted for a policy reason, it is presumed still
+ * alive and expected to reconnect. Distinct from the client watchdog's own
+ * HEARTBEAT_TIMEOUT_CLOSE_CODE (4000) purely so a close code in logs/
+ * telemetry unambiguously identifies which side (client watchdog vs. server
+ * sweep) decided the connection was dead; both land on the same retryable
+ * side of isRetryableRoomSocketCloseCode.
+ *
+ * Lives here rather than in the Worker entrypoint module for the same
+ * boot-safety reason as ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS above.
+ */
+export const ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE = 4001;
 
 /**
  * attempt=0 is the first retry. Delay is `random() * min(maxDelayMs, base * 2^attempt)`

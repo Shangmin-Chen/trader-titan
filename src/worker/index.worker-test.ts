@@ -8,7 +8,7 @@ import {
 } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
-import worker from "./index";
+import worker, { GameRoomDurableObject } from "./index";
 import {
   privateGeneratedItemStorageKey,
   privateGeneratedItemStoragePrefix
@@ -19,6 +19,11 @@ import {
 } from "./testing/open-next-worker";
 import { applySettlementToScores, SETTLEMENT_FAILURE_EPISODE_CAP } from "../lib/game";
 import type { GameMode, ProviderGeneratedItem, TradeSide } from "../lib/game";
+import {
+  isRetryableRoomSocketCloseCode,
+  ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS,
+  ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE
+} from "../lib/room-socket-supervisor";
 import {
   ROOM_CREATION_RATE_LIMIT_MAX_REQUESTS,
   ROOM_CUSTOM_AMAZON_RATE_LIMIT_MAX_REQUESTS
@@ -82,6 +87,16 @@ const RESET_STALE_SOCKET_ROOM_NAME = "worker-room-reset-stale-socket";
 const HOST_SOCKET_EVICTION_ROOM_NAME = "worker-room-host-socket-eviction";
 const GUEST_SOCKET_CHURN_ROOM_NAME = "worker-room-guest-socket-churn";
 const PING_PONG_ROOM_NAME = "worker-room-ping-pong";
+const LIVENESS_SWEEP_STALE_VS_LIVE_ROOM_NAME = "worker-room-liveness-sweep-stale-vs-live";
+const LIVENESS_SWEEP_EXACT_BOUNDARY_ROOM_NAME = "worker-room-liveness-sweep-exact-boundary";
+const LIVENESS_SWEEP_ALARM_MULTIPLEX_ROOM_NAME = "worker-room-liveness-sweep-alarm-multiplex";
+const LIVENESS_SWEEP_WITH_PENDING_EFFECT_ROOM_NAME = "worker-room-liveness-sweep-with-pending-effect";
+const LIVENESS_LEGACY_ATTACHMENT_ROOM_NAME = "worker-room-liveness-legacy-attachment";
+const LIVENESS_LEGACY_ATTACHMENT_SWEEP_ROOM_NAME = "worker-room-liveness-legacy-attachment-sweep";
+const LIVENESS_LEGACY_ATTACHMENT_LONG_RUN_ROOM_NAME =
+  "worker-room-liveness-legacy-attachment-long-run";
+const LIVENESS_LEGACY_ATTACHMENT_REAL_PING_ROOM_NAME =
+  "worker-room-liveness-legacy-attachment-real-ping";
 const TIGHTEN_REPLAY_SAME_ID_ROOM_NAME = "worker-room-tighten-replay-same-id";
 const TIGHTEN_REPLAY_DIFFERENT_ID_ROOM_NAME = "worker-room-tighten-replay-different-id";
 const KICKED_GUEST_REPLAY_ROOM_NAME = "worker-room-kicked-guest-replay";
@@ -1899,6 +1914,16 @@ describe("Cloudflare worker scaffold", () => {
 
     expect(pendingEffect.notBeforeMs).toBeLessThan(ttlDeadline);
 
+    // This test is specifically about TTL/pending-effect multiplexing, not
+    // the F-08 liveness sweep - close the still-open guest socket (opened
+    // above only so START_ROOM's presence gate would pass) and confirm the
+    // DO's live-socket-derived state has caught up, so the alarm math below
+    // is not also folding in a liveness deadline.
+    await closeSocketAndWaitOffline(stub, guestConnection.socket, created.hostToken, {
+      A: false,
+      B: false
+    });
+
     // forceStuckSettling deliberately leaves the *scheduled* DO alarm at the
     // far TTL deadline rather than the pending effect's earlier, already-due
     // notBeforeMs (see its comment - an overdue alarm can fire
@@ -1922,8 +1947,6 @@ describe("Cloudflare worker scaffold", () => {
 
     await expect(storedRoomAlarm(stub)).resolves.toBe(ttlAfterResolution);
     expect(ttlAfterResolution).toBeGreaterThan(Date.now());
-
-    guestConnection.socket.close();
   });
 
   it("fires a due F-05 turn deadline via the alarm and forfeits the round into roundForfeited", async () => {
@@ -2684,6 +2707,19 @@ describe("Cloudflare worker scaffold", () => {
     expect(broadcast.room.game.phase).toBe("choosingSide");
     expect(broadcast.room.revision).toBe(afterExhaustion.room.revision);
 
+    // This test's remaining assertions are about the F-02/F-05 alarm
+    // deadline exactly matching the fresh turn clock, not about the F-08
+    // liveness sweep - close the guest socket (kept open only so the
+    // exhaustion broadcast above could be observed) and run one more no-op
+    // alarm tick so the liveness deadline the still-open socket would
+    // otherwise fold into the alarm slot is dropped before checking the
+    // exact stored alarm value below.
+    await closeSocketAndWaitOffline(stub, guestConnection.socket, created.hostToken, {
+      A: false,
+      B: false
+    });
+    await runRoomCleanupAlarm(stub);
+
     // The alarm slot must not spin: the pending settle-effect marker is
     // gone after exhaustion, so the only deadlines left are the room's TTL
     // and the fresh F-05 turn clock SETTLEMENT_FAILED just armed on
@@ -2699,8 +2735,6 @@ describe("Cloudflare worker scaffold", () => {
     const afterSecondTick = await accessRoom(stub, created.hostToken);
 
     expect(afterSecondTick.room.revision).toBe(afterExhaustion.room.revision);
-
-    guestConnection.socket.close();
   });
 
   it("does not force-fail a settling round whose round_id no longer matches the exhausted pending effect (self-heals instead)", async () => {
@@ -2946,6 +2980,17 @@ describe("Cloudflare worker scaffold", () => {
     // schedule the alarm against is the room's own TTL.
     await expect(readPendingRoomEffect(stub)).resolves.toBeNull();
 
+    // This assertion is about the F-02/F-05 alarm collapsing to the room's
+    // TTL, not about the F-08 liveness sweep - close the still-open guest
+    // socket (it never gated presence in this test) so it does not fold an
+    // unrelated liveness deadline into the alarm slot and break the exact
+    // equality check below.
+    await closeSocketAndWaitOffline(stub, guestConnection.socket, created.hostToken, {
+      A: false,
+      B: false
+    });
+    await runRoomCleanupAlarm(stub);
+
     const alarmAfterTerminal = await storedRoomAlarm(stub);
     const ttlAfterTerminal = await storedRoomExpiresAt(stub);
 
@@ -2971,8 +3016,6 @@ describe("Cloudflare worker scaffold", () => {
     });
 
     expect(staleRetryResponse.status).not.toBe(HTTP_OK_STATUS);
-
-    guestConnection.socket.close();
   });
 
   it("does not double-settle when a manual retry races the alarm: the alarm settles once, and the losing retry is rejected unchanged", async () => {
@@ -3454,6 +3497,15 @@ describe("Cloudflare worker scaffold", () => {
       throw new Error("Expected generated item to be ready.");
     }
 
+    // This test is specifically about the TTL-only reschedule path, not the
+    // F-08 liveness sweep - close the still-open guest socket (opened above
+    // only so START_ROOM's presence gate would pass) so the alarm this test
+    // asserts on below is not also folding in a liveness deadline.
+    await closeSocketAndWaitOffline(stub, guestConnection.socket, created.hostToken, {
+      A: false,
+      B: false
+    });
+
     const privateItemKey = privateGeneratedItemStorageKey(
       started.room.game.item.round_id
     );
@@ -3474,8 +3526,6 @@ describe("Cloudflare worker scaffold", () => {
       privateItemKey
     ]);
     await expect(storedRoomAlarm(stub)).resolves.toBe(expectedAlarm);
-
-    guestConnection.socket.close();
   });
 
   it("generates custom Amazon items from the current trader and rejects the wrong player", async () => {
@@ -4386,6 +4436,450 @@ describe("Cloudflare worker scaffold", () => {
 
     connection.socket.close();
   });
+
+  it("F-08 liveness sweep closes a socket that has gone stale, leaves a live one connected, and rebroadcasts presence for the closed one", async () => {
+    const stub = roomStub(LIVENESS_SWEEP_STALE_VS_LIVE_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created liveness-sweep room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const hostConnection = await openRoomSocket(stub, created.hostToken);
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+
+    await withPatchedAutoResponseTimestamp(
+      (ws) => {
+        // The guest's last signal was well past the stale threshold; the
+        // host's is left `null`, falling back to its (just-now) acceptance
+        // time - i.e. a live socket that simply has not been pinged yet,
+        // which must NOT be swept.
+        return socketAttachmentRole(ws) === "guest"
+          ? new Date(Date.now() - ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS - 1_000)
+          : null;
+      },
+      async () => {
+        const guestClosed = nextSocketCloseCode(guestConnection.socket);
+        const hostSawPresenceUpdate = nextSocketMessage<RoomSnapshotSocketMessage>(
+          hostConnection.socket
+        );
+
+        await runRoomCleanupAlarm(stub);
+
+        const closeInfo = await guestClosed;
+
+        // Property (a): the stale socket was closed, the live one was not.
+        expect(closeInfo.code).toBe(ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE);
+        expect(hostConnection.socket.readyState).toBe(WebSocket.OPEN);
+
+        // Property (c): the close code the sweep chose is one the client
+        // reconnect supervisor actually retries against (see
+        // isRetryableRoomSocketCloseCode / ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE).
+        expect(isRetryableRoomSocketCloseCode(closeInfo.code)).toBe(true);
+
+        // Presence is derived, not pushed by the sweep itself: closing a
+        // hibernatable socket always fires webSocketClose(), which is what
+        // actually rebroadcasts this snapshot to the remaining host socket.
+        const presenceUpdate = await hostSawPresenceUpdate;
+
+        expectRoomPresence(presenceUpdate.room, { A: true, B: false });
+      }
+    );
+
+    hostConnection.socket.close();
+  });
+
+  it("F-08 liveness sweep closes a socket exactly at the staleness boundary, not only strictly past it", async () => {
+    const stub = roomStub(LIVENESS_SWEEP_EXACT_BOUNDARY_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created liveness-sweep exact-boundary room.");
+    }
+
+    const connection = await openRoomSocket(stub, created.hostToken);
+    const fixedNowMs = Date.now();
+
+    // Pins nowMs - lastSeenMs to exactly ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS
+    // via runSweepStaleSocketsDirect (bypassing alarm()'s own Date.now() call,
+    // which would race this fixed value). sweepStaleSockets compares with
+    // `>=`; a mutation to `>` leaves a socket exactly at the boundary open
+    // forever, which the "well past threshold" test above (padded by a full
+    // second) cannot distinguish from correct behavior.
+    await withPatchedAutoResponseTimestamp(
+      () => new Date(fixedNowMs - ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS),
+      async () => {
+        const closed = nextSocketCloseCode(connection.socket);
+
+        await runSweepStaleSocketsDirect(stub, fixedNowMs);
+
+        const closeInfo = await closed;
+
+        expect(closeInfo.code).toBe(ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE);
+      }
+    );
+  });
+
+  it("does not force-close a pre-deploy socket lacking acceptedAtMs when an unrelated broadcast touches the room", async () => {
+    const stub = roomStub(LIVENESS_LEGACY_ATTACHMENT_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created legacy-attachment room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const hostConnection = await openRoomSocket(stub, created.hostToken);
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+
+    // Simulate a socket that was already connected and hibernating at the
+    // moment a deploy added `acceptedAtMs` to RoomSocketAttachment: strip it
+    // from the guest's live attachment directly, exactly as the review that
+    // found this gap reproduced it (acceptRoomSocket itself always writes
+    // acceptedAtMs today, so this shape cannot be produced any other way).
+    await stripAcceptedAtMsFromLiveAttachment(stub, "guest");
+
+    // Registered before the trigger below: the client-side close event for
+    // an eviction that happens as a synchronous side effect of the reconnect
+    // below can fire before a listener attached afterward would ever see it
+    // - see the pre-existing host-eviction test for the same ordering
+    // requirement.
+    const hostEvicted = nextSocketCloseCode(hostConnection.socket);
+    const guestSawRebroadcast = nextSocketMessage<RoomSnapshotSocketMessage>(
+      guestConnection.socket
+    );
+
+    // An ordinary, unrelated action - the host reconnecting - is enough to
+    // trigger broadcastRoomSnapshot for every other socket in the room,
+    // including the legacy-attachment guest. Before this fix,
+    // socketCanReceiveRoomSnapshot parsed that attachment as null
+    // (acceptedAtMs was required by parseRoomSocketAttachment), so this
+    // broadcast alone force-closed the guest with 1008 - the one code the
+    // client's reconnect supervisor treats as terminal
+    // (isRetryableRoomSocketCloseCode) - even though the guest did nothing
+    // and was never removed from the room.
+    const reconnectedHost = await openRoomSocket(stub, created.hostToken);
+
+    // The prior host socket is evicted by its own seat opening a new one -
+    // expected, unrelated seat-eviction behavior - so drain that close
+    // rather than asserting on it here.
+    await expect(hostEvicted).resolves.toMatchObject({ code: 1008 });
+
+    const rebroadcast = await guestSawRebroadcast;
+
+    expect(rebroadcast.type).toBe("ROOM_SNAPSHOT");
+    expect(guestConnection.socket.readyState).toBe(WebSocket.OPEN);
+
+    // Confirm directly against the Durable Object's own live-socket list -
+    // not just the client's local readyState - that the server still
+    // considers the guest connected. A server-side eviction (the pre-fix
+    // behavior) closes the socket from the DO's side with code 1008 before
+    // the client even sees the frame; checking the DO's own bookkeeping
+    // catches that even if client-side readyState were to lag.
+    const guestSocketReadyState = await runInDurableObject(stub, (_instance, state) =>
+      state.getWebSockets().find((ws) => socketAttachmentRole(ws) === "guest")?.readyState ??
+        null
+    );
+
+    expect(guestSocketReadyState).toBe(WebSocket.OPEN);
+
+    guestConnection.socket.close();
+    reconnectedHost.socket.close();
+  });
+
+  it("does not sweep-close a pre-deploy socket lacking acceptedAtMs before its first ping has ever been answered", async () => {
+    const stub = roomStub(LIVENESS_LEGACY_ATTACHMENT_SWEEP_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created legacy-attachment sweep room.");
+    }
+
+    const connection = await openRoomSocket(stub, created.hostToken);
+
+    // Same legacy shape as the broadcast-compatibility test above, but this
+    // one exercises the sweep's own fallback chain directly.
+    // readSocketAutoResponseTimestamp is left untouched (still `null`, as it
+    // genuinely would be for a socket that has never answered a real
+    // "tt-ping"), so socketLastSeenMs must fall all the way through to
+    // `nowMs` - not to `attachment.acceptedAtMs` (absent here) and not to
+    // some other default - to read this socket as "just seen" rather than
+    // stale since epoch.
+    await stripAcceptedAtMsFromLiveAttachment(stub, "host");
+
+    const closed = nextSocketCloseCode(connection.socket);
+    let sweepClosed = false;
+
+    closed.then(() => {
+      sweepClosed = true;
+    }).catch(() => {});
+
+    await runSweepStaleSocketsDirect(stub, Date.now());
+
+    // A mutation that falls back to epoch 0 instead of `nowMs` computes an
+    // enormous, already-elapsed "time since last seen" here and closes the
+    // socket immediately; give the sweep a moment to have done so before
+    // asserting it did not.
+    await delay(50);
+
+    expect(sweepClosed).toBe(false);
+    expect(connection.socket.readyState).toBe(WebSocket.OPEN);
+
+    connection.socket.close();
+  });
+
+  it("eventually sweep-closes a pre-deploy socket lacking acceptedAtMs once its memoized first-seen time ages out, surviving many sweeps before then", async () => {
+    const stub = roomStub(LIVENESS_LEGACY_ATTACHMENT_LONG_RUN_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created legacy-attachment long-run room.");
+    }
+
+    const connection = await openRoomSocket(stub, created.hostToken);
+
+    await stripAcceptedAtMsFromLiveAttachment(stub, "host");
+
+    const closed = nextSocketCloseCode(connection.socket);
+    let sweepClosed = false;
+
+    closed.then(() => {
+      sweepClosed = true;
+    }).catch(() => {});
+
+    const t0 = Date.now();
+
+    // First sweep hits the memoization branch (no auto-response yet, no
+    // acceptedAtMs) and must not close the socket - it grants the same one
+    // full fresh threshold window a legacy socket always got. Asserted
+    // separately from the loop below so a mutation that over-corrects FIX 1
+    // by closing legacy sockets immediately fails here, distinctly from a
+    // mutation that never closes them at all.
+    await runSweepStaleSocketsDirect(stub, t0);
+    await delay(50);
+
+    expect(sweepClosed).toBe(false);
+    expect(connection.socket.readyState).toBe(WebSocket.OPEN);
+
+    // The bug this reproduces: socketLastSeenMs's third fallback used to be
+    // a bare `?? nowMs`, recomputed fresh on every call rather than
+    // memoized anywhere. For a socket that never completes a single
+    // ping-pong, that made `nowMs - lastSeenMs` evaluate to exactly `0` on
+    // every single sweep, forever - the socket was permanently immune, not
+    // merely long-lived. A mutation that deletes the serializeAttachment
+    // write-back in socketLastSeenMs reproduces exactly that: this loop
+    // would run to completion with the socket still OPEN.
+    //
+    // This mirrors the reproduction that caught it: repeated
+    // sweepStaleSockets calls with nowMs advancing by a large multiple of
+    // the staleness threshold each time, spanning several simulated hours.
+    // With the fix, `acceptedAtMs` was memoized as `t0` above, so the
+    // socket ages out normally once that fixed point falls more than one
+    // threshold window behind - it must not survive all 19 remaining
+    // iterations here.
+    for (let i = 1; i < 20; i += 1) {
+      await runSweepStaleSocketsDirect(stub, t0 + i * ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS * 10);
+      await delay(5);
+
+      if (sweepClosed) {
+        break;
+      }
+    }
+
+    expect(sweepClosed).toBe(true);
+    expect(connection.socket.readyState).toBe(WebSocket.CLOSED);
+  });
+
+  it("lets a legacy socket lacking acceptedAtMs transition off the memoized fallback once it receives one real auto-response, becoming sweepable relative to that instead", async () => {
+    const stub = roomStub(LIVENESS_LEGACY_ATTACHMENT_REAL_PING_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created legacy-attachment real-ping room.");
+    }
+
+    const connection = await openRoomSocket(stub, created.hostToken);
+
+    await stripAcceptedAtMsFromLiveAttachment(stub, "host");
+
+    const t0 = Date.now();
+
+    // First sweep hits the memoization branch (no auto-response yet, no
+    // acceptedAtMs): acceptedAtMs is written back as t0.
+    await runSweepStaleSocketsDirect(stub, t0);
+    expect(connection.socket.readyState).toBe(WebSocket.OPEN);
+
+    // Now the socket receives one real "tt-ping" auto-response, well after
+    // t0 - simulated the same way the pre-existing sweep tests simulate a
+    // real edge auto-response, since getWebSocketAutoResponseTimestamp
+    // cannot be produced from test code any other way.
+    const t1 = t0 + ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS - 1_000;
+
+    await withPatchedAutoResponseTimestamp(
+      (ws) => (socketAttachmentRole(ws) === "host" ? new Date(t1) : null),
+      async () => {
+        const closed = nextSocketCloseCode(connection.socket);
+        let sweepClosed = false;
+
+        closed.then(() => {
+          sweepClosed = true;
+        }).catch(() => {});
+
+        // Sweeping just past the *old* (memoized-acceptedAtMs) boundary
+        // must not close the socket now that a real auto-response exists:
+        // socketLastSeenMs prefers the auto-response timestamp over the
+        // memoized fallback, so the effective deadline moved out to
+        // t1 + threshold. A mutation that kept using the memoized
+        // acceptedAtMs even after a real auto-response arrived would close
+        // the socket here.
+        await runSweepStaleSocketsDirect(stub, t0 + ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS + 500);
+        await delay(50);
+
+        expect(sweepClosed).toBe(false);
+        expect(connection.socket.readyState).toBe(WebSocket.OPEN);
+
+        // Sweeping past the *new* boundary (relative to t1, the real
+        // auto-response) does close it - proving the socket is now
+        // ordinarily sweepable off the auto-response signal, not stuck
+        // re-memoizing forever.
+        await runSweepStaleSocketsDirect(stub, t1 + ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS + 1_000);
+
+        const closeInfo = await closed;
+
+        expect(closeInfo.code).toBe(ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE);
+      }
+    );
+  });
+
+  it("folds a connected socket's liveness deadline into the alarm ahead of a much later TTL, then reverts to the TTL once the socket disconnects", async () => {
+    const stub = roomStub(LIVENESS_SWEEP_ALARM_MULTIPLEX_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created liveness-multiplex room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const ttlDeadline = await storedRoomExpiresAt(stub);
+    const beforeConnectMs = Date.now();
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const afterConnectMs = Date.now();
+
+    // acceptRoomSocket's rearmAlarmForLiveSockets must fold this brand-new
+    // socket's liveness deadline into the alarm slot immediately - a
+    // mutation that skips that call, or one that drops the liveness term
+    // from scheduleNextAlarm's Math.min entirely, would leave this pinned
+    // at the (much later) TTL deadline instead. Pinning the value to
+    // roughly acceptedAtMs + ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS (rather than
+    // just asserting "sooner than TTL") also catches a broken acceptedAtMs
+    // fallback - e.g. defaulting an un-pinged socket's last-seen time to
+    // epoch 0 would still be sooner than TTL, but would not land in this
+    // window.
+    const armedAfterConnect = await storedRoomAlarm(stub);
+
+    expect(armedAfterConnect).not.toBeNull();
+    expect(armedAfterConnect as number).toBeLessThan(ttlDeadline);
+    expect(armedAfterConnect as number).toBeGreaterThanOrEqual(
+      beforeConnectMs + ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS
+    );
+    expect(armedAfterConnect as number).toBeLessThanOrEqual(
+      afterConnectMs + ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS
+    );
+
+    await closeSocketAndWaitOffline(stub, guestConnection.socket, created.hostToken, {
+      A: false,
+      B: false
+    });
+
+    // Force a tick even though the (nearer, liveness-derived) alarm is not
+    // literally due yet - the same "no-op reschedule" branch workerd's own
+    // scheduler would eventually reach on its own. Property (b): with no
+    // sockets left to watch, the TTL deadline must resurface exactly - not
+    // stay pinned at the stale liveness value, and not be replaced by
+    // anything else. A mutation that drops the TTL term from the Math.min
+    // (rather than only adding the liveness term to it) fails here.
+    await runRoomCleanupAlarm(stub);
+
+    await expect(storedRoomAlarm(stub)).resolves.toBe(ttlDeadline);
+  });
+
+  it("resolves a due pending settlement effect and sweeps a stale socket in the same alarm tick, dropping neither", async () => {
+    const stub = roomStub(LIVENESS_SWEEP_WITH_PENDING_EFFECT_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created liveness-with-pending-effect room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected generated item to be ready.");
+    }
+
+    const marketMakerToken = tokenForPlayer(
+      started.room.game.roles.marketMaker,
+      created.hostToken,
+      joined.guestToken
+    );
+    const traderToken = tokenForPlayer(
+      started.room.game.roles.trader,
+      created.hostToken,
+      joined.guestToken
+    );
+
+    await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_INITIAL_WIDTH",
+      credential: marketMakerToken,
+      width: 100
+    });
+    await applyRoomCommandWithoutTrueValue(stub, {
+      type: "TRADE_ON_WIDTH",
+      credential: traderToken
+    });
+    const quoted = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_MARKET_QUOTE",
+      credential: marketMakerToken,
+      quote: { bid: 3400, ask: 3500 }
+    });
+
+    expect(quoted.room.game.phase).toBe("choosingSide");
+
+    // forceStuckSettling leaves a due pending settle-effect marker (F-02)
+    // for this room - the guest socket opened above (needed for
+    // START_ROOM's presence gate) is still connected throughout.
+    await forceStuckSettling(stub, traderToken, "BUY");
+    await expect(readPendingRoomEffect(stub)).resolves.not.toBeNull();
+
+    await withPatchedAutoResponseTimestamp(
+      (ws) =>
+        socketAttachmentRole(ws) === "guest"
+          ? new Date(Date.now() - ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS - 1_000)
+          : null,
+      async () => {
+        const guestClosed = nextSocketCloseCode(guestConnection.socket);
+
+        await runRoomCleanupAlarm(stub);
+
+        const closeInfo = await guestClosed;
+
+        expect(closeInfo.code).toBe(ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE);
+      }
+    );
+
+    // Neither concern lost the other in the same tick: the pending
+    // settlement effect actually resolved...
+    const resumed = await accessRoom(stub, created.hostToken);
+
+    expect(resumed.room.game.phase).toBe("settlement");
+    await expect(readPendingRoomEffect(stub)).resolves.toBeNull();
+  });
 });
 
 function roomStub(roomName: string) {
@@ -4786,6 +5280,109 @@ async function runRoomCleanupAlarm(stub: GameRoomStub): Promise<void> {
 }
 
 /**
+ * Invokes the private sweepStaleSockets(nowMs) directly, bypassing alarm()'s
+ * own `currentUnixTimeMs()` call. This is what makes it possible to pin the
+ * `nowMs - lastSeenMs >= ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS` comparison
+ * at an *exact* boundary in a test: going through alarm() would race real
+ * wall-clock time between when a test computes its expected "last seen"
+ * timestamp and when alarm() independently samples `Date.now()` for nowMs,
+ * which is fine for the existing "well past threshold" tests (they pad by a
+ * full second) but not precise enough to prove the comparison is `>=`
+ * rather than `>` right at the boundary.
+ */
+async function runSweepStaleSocketsDirect(
+  stub: GameRoomStub,
+  nowMs: number
+): Promise<void> {
+  await runInDurableObject(stub, (instance) => {
+    (instance as unknown as { sweepStaleSockets(nowMs: number): void }).sweepStaleSockets(
+      nowMs
+    );
+  });
+}
+
+/**
+ * Reproduces a socket accepted by pre-deploy code, before RoomSocketAttachment
+ * carried `acceptedAtMs` at all: rewrites the live, hibernation-serialized
+ * attachment for the socket with the given `role` to drop the field entirely
+ * (not set to `undefined` - simply never written, exactly as
+ * `server.serializeAttachment()` left it before the field existed).
+ * acceptRoomSocket always writes `acceptedAtMs` today, so this is the only
+ * way to produce this shape in a test - it has to be done directly against
+ * the live socket via `state.getWebSockets()`, matching how the review that
+ * found this gap reproduced it.
+ */
+async function stripAcceptedAtMsFromLiveAttachment(
+  stub: GameRoomStub,
+  role: "host" | "guest"
+): Promise<void> {
+  await runInDurableObject(stub, (_instance, state) => {
+    for (const socket of state.getWebSockets()) {
+      const attachment = socket.deserializeAttachment() as {
+        kind?: unknown;
+        roomId?: unknown;
+        role?: unknown;
+        tokenHash?: unknown;
+      } | null;
+
+      if (attachment === null || attachment.role !== role) {
+        continue;
+      }
+
+      socket.serializeAttachment({
+        kind: attachment.kind,
+        roomId: attachment.roomId,
+        role: attachment.role,
+        tokenHash: attachment.tokenHash
+      });
+    }
+  });
+}
+
+/**
+ * Substitutes a synthetic "last auto-response" clock for GameRoomDurableObject's
+ * private readSocketAutoResponseTimestamp for the duration of `run`, then
+ * restores the original. This is the one piece of F-08's liveness sweep
+ * that cannot be driven deterministically any other way:
+ * getWebSocketAutoResponseTimestamp is produced entirely inside workerd's
+ * edge auto-responder in response to a real "tt-ping" frame, and waiting
+ * out ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS (60s) in real time is not a
+ * viable test.
+ *
+ * This works because @cloudflare/vitest-pool-workers runs this test file
+ * inside the same workerd isolate as the worker under test (see
+ * runInDurableObject's own direct-private-method-call pattern elsewhere in
+ * this file) - `GameRoomDurableObject` imported here is the exact class
+ * object whose instances handle real `stub.fetch()`/alarm() calls, not a
+ * separate copy, so patching its prototype here is visible to those calls.
+ */
+async function withPatchedAutoResponseTimestamp<T>(
+  timestampFor: (ws: WebSocket) => Date | null,
+  run: () => Promise<T>
+): Promise<T> {
+  const proto = GameRoomDurableObject.prototype as unknown as {
+    readSocketAutoResponseTimestamp: (ws: WebSocket) => Date | null;
+  };
+  const original = proto.readSocketAutoResponseTimestamp;
+
+  proto.readSocketAutoResponseTimestamp = timestampFor;
+
+  try {
+    return await run();
+  } finally {
+    proto.readSocketAutoResponseTimestamp = original;
+  }
+}
+
+function socketAttachmentRole(ws: WebSocket): "host" | "guest" | null {
+  const attachment = ws.deserializeAttachment() as { role?: unknown } | null;
+
+  return attachment?.role === "host" || attachment?.role === "guest"
+    ? attachment.role
+    : null;
+}
+
+/**
  * Invokes the DO's private runDueSettleEffect directly, bypassing alarm()'s
  * outer transaction. alarm() freezes a single `nowMs` for its whole
  * invocation, so a room that alarm()'s outer transaction found loadable
@@ -5081,6 +5678,27 @@ async function waitForRoomPresence(
   }
 
   throw new Error("Timed out waiting for room presence.");
+}
+
+/**
+ * Closes a room socket and waits for the DO's live-socket-derived presence
+ * to actually reflect it being gone, rather than just the client-side close
+ * event. F-08's liveness sweep folds a deadline computed from
+ * ctx.getWebSockets() into the single alarm slot (see
+ * nextLivenessSweepDeadline/scheduleNextAlarm in src/worker/index.ts), so
+ * any test asserting an exact storedRoomAlarm() value must first be sure a
+ * socket it opened earlier is no longer counted - a bare `.close()` starts
+ * the closing handshake but does not synchronously guarantee
+ * ctx.getWebSockets() has already dropped it.
+ */
+async function closeSocketAndWaitOffline(
+  stub: GameRoomStub,
+  socket: WebSocket,
+  hostToken: RoomCapabilityToken,
+  players: PresencePlayers
+): Promise<void> {
+  socket.close();
+  await waitForRoomPresence(stub, hostToken, players);
 }
 
 function delay(ms: number): Promise<void> {

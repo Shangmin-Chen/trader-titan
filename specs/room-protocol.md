@@ -24,6 +24,7 @@ The room protocol is the boundary between client transports and the pure room do
 - Presence is public, non-secret, ephemeral, and Durable Object-authoritative in the Cloudflare runtime. It is computed from accepted WebSockets whose attached role and token hash still match the current room seats, and it is not persisted.
 - HTTP and WebSocket command handling use the same runtime presence source when building the public snapshot broadcast after a command.
 - Presence does not gate any room command (F-04). `START_ROOM` and `ADVANCE_ROUND` (final and non-final) all succeed regardless of Player B's live presence; an idle or absent opponent is instead handled by the F-05 turn shot clock forfeiting the round they are on the clock for. Presence is a purely cosmetic connection indicator in the public snapshot, not an authorization input to any room command.
+- A room socket whose TCP connection has died without a close frame (killed tab, sleeping laptop, blackholed network path) is not distinguishable from a healthy idle socket by the accepted-WebSockets list alone, since the Durable Object never wakes on a client ping (see Transport Notes for the F-08 liveness sweep that reclaims it).
 
 ## Client Commands
 
@@ -66,6 +67,8 @@ The Durable Object slice should implement one runtime decoder for these messages
 Fast-forwards a room's currently-armed F-05 `turnDeadlineMs` to a few seconds from now and re-arms the real Durable Object alarm against it, so an e2e test can observe a genuine clock expiry (the countdown reaching its urgent state, the alarm firing, `TURN_EXPIRED` committing, and the broadcast reaching connected clients) without sleeping out the real 30-60s duration. Takes the same `{ credential }` body as `access`, authorized the same way (any valid host or guest credential for the room); rejected with `invalid_game_phase` if the room has no active turn clock. The route only exists when `WORKER_ITEM_PROVIDER` is set (the same test/dev signal item generation already gates on - see `wrangler dev --var` in `playwright.config.ts`); it 404s like any other unknown route otherwise, so it cannot be reached in a real deploy. See `E2E_FAST_FORWARD_TURN_OFFSET_MS` in `src/worker/index.ts` and `fastForwardTurnClock` in `e2e/helpers.ts`.
 
 WebSocket connect, close, and error presence changes rebroadcast updated public snapshots to remaining authorized sockets. These snapshots may reuse the current room revision when only presence changed, and they must not expose secrets, token hashes, persistence metadata, or private generated values.
+
+The Durable Object registers a hibernation auto-response pair so a client's own heartbeat ping is answered at the edge without waking the object. A server-side liveness sweep, driven by the Durable Object's single alarm slot, independently detects a room socket that has gone silent for too long (no observed auto-response, and no recent accept) and closes it with a close code the client's reconnect supervisor treats as retryable - never one of the terminal eviction/teardown codes. This sweep is folded into the same alarm slot used for room TTL housekeeping and pending-effect resumption; it only contributes a deadline while at least one socket is connected, so a room with no connected sockets is not woken for this purpose.
 
 ## Client Snapshot Application
 
