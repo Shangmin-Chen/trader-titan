@@ -127,16 +127,19 @@ describe("room persistence", () => {
     const { room } = joinedRoom();
     const envelope = toPersistenceEnvelope(room, NOW_MS + 2);
 
-    // Neither the current version (2) nor the one known-migratable legacy
-    // version (1, see ROOM_PERSISTENCE_LEGACY_VERSION) - a future version
-    // this build predates.
-    expect(loadPersistenceEnvelope({ ...envelope, version: 3 }, envelope.expiresAtMs - 1)).toEqual({
-      ok: false,
-      error: {
-        code: "persistence_version_unsupported",
-        message: "Room persistence version is not supported.",
-      },
-    });
+    // Neither the current version (3) nor either known-migratable legacy
+    // version (1 or 2, see ROOM_PERSISTENCE_MIN_SUPPORTED_VERSION) - a
+    // future version this build predates, or a version below the oldest one
+    // this build still carries a migration path for.
+    for (const badVersion of [4, 0, -1]) {
+      expect(loadPersistenceEnvelope({ ...envelope, version: badVersion }, envelope.expiresAtMs - 1)).toEqual({
+        ok: false,
+        error: {
+          code: "persistence_version_unsupported",
+          message: "Room persistence version is not supported.",
+        },
+      });
+    }
   });
 
   it("rejects malformed persistence envelopes without returning private room state", () => {
@@ -584,16 +587,18 @@ describe("room persistence", () => {
 });
 
 /**
- * B1: production storage is full of version-1 envelopes (predating F-05's
- * turnDeadlineMs and F-06's pendingTrade/forcedByTimeout) that the strict
- * v2 allowlists above would otherwise reject outright the moment
- * ROOM_PERSISTENCE_VERSION became 2. These tests build exactly the
- * old-shaped records a pre-this-branch build actually wrote (by stripping
+ * B1: production storage is full of version-1 and version-2 envelopes
+ * (version-1 predates F-05's turnDeadlineMs and F-06's
+ * pendingTrade/forcedByTimeout; version-2 predates F-07's
+ * settlementFailureCount) that the strict current-version allowlists above
+ * would otherwise reject outright the moment ROOM_PERSISTENCE_VERSION
+ * advanced past them. These tests build exactly the old-shaped records a
+ * pre-this-branch build actually wrote (by stripping
  * the new fields back off a real command-produced RoomState) and assert
  * loadPersistenceEnvelope still decodes them - migrating each one forward -
  * rather than trusting the migration logic by reading it.
  */
-describe("legacy (version-1) envelope migration", () => {
+describe("legacy (version-1 and version-2) envelope migration", () => {
   it("migrates a version-1 proposingWidth envelope by stamping a fresh turnDeadlineMs (F-05)", () => {
     const fixtures = legacyMigrationFixtures();
     const readAtMs = NOW_MS + 500;
@@ -762,7 +767,7 @@ describe("legacy (version-1) envelope migration", () => {
     expect(loaded.room.game).toEqual(settled.game);
   });
 
-  it("re-persists a migrated legacy envelope as version 2 and round-trips it through the strict allowlist", () => {
+  it("re-persists a migrated legacy envelope as version 3 and round-trips it through the strict allowlist", () => {
     const { room, hostToken, guestToken } = joinedRoom();
     const settling = settlingRoomChosen(room, hostToken, guestToken);
 
@@ -784,9 +789,10 @@ describe("legacy (version-1) envelope migration", () => {
     const rePersisted = toPersistenceEnvelope(loaded.room, readAtMs + 1);
 
     // The next persist must write the current version, not silently keep
-    // carrying the room forward as a version-1 envelope forever.
+    // carrying the room forward as a version-1 (or version-2) envelope
+    // forever.
     expect(rePersisted.version).toBe(ROOM_PERSISTENCE_VERSION);
-    expect(rePersisted.version).toBe(2);
+    expect(rePersisted.version).toBe(3);
 
     // And that rewritten envelope must satisfy the strict, non-legacy path -
     // no lingering leniency once a room has been through one write.
@@ -794,6 +800,138 @@ describe("legacy (version-1) envelope migration", () => {
       ok: true,
       room: loaded.room,
     });
+  });
+
+  it("migrates a version-1 settling envelope's pendingSide and missing settlementFailureCount all the way to v3 in one read (F-06 + F-07 chained)", () => {
+    const { room, hostToken, guestToken } = joinedRoom();
+    const settling = settlingRoomChosen(room, hostToken, guestToken);
+
+    if (settling.game.phase !== "settling") {
+      throw new Error("Expected settling phase.");
+    }
+    expect(settling.game.pendingTrade).toEqual({ kind: "chosen", side: "BUY" });
+    expect(settling.game.settlementFailureCount).toBe(0);
+
+    const readAtMs = NOW_MS + 500;
+    // legacyEnvelopeWithPendingSide strips both pendingTrade (replaced with
+    // the old flat pendingSide) and settlementFailureCount entirely - a
+    // genuine version-1 envelope predates both F-06 and F-07, so it can only
+    // have neither field. Decoding this in one read must chain
+    // migrateV1ToV2GameStateRecord (pendingSide -> pendingTrade) into
+    // migrateV2ToV3GameStateRecord (settlementFailureCount defaulted to 0),
+    // not apply only the first step and leave settlementFailureCount missing.
+    const loaded = loadPersistenceEnvelope(
+      legacyEnvelopeWithPendingSide(settling, NOW_MS + 100),
+      readAtMs,
+    );
+
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) {
+      throw new Error("Expected legacy settling envelope to decode.");
+    }
+    if (loaded.room.game.phase !== "settling") {
+      throw new Error("Expected settling phase.");
+    }
+
+    expect(loaded.room.game.pendingTrade).toEqual({ kind: "chosen", side: "BUY" });
+    expect(loaded.room.game.settlementFailureCount).toBe(0);
+    expect(loaded.room.game).toEqual(settling.game);
+  });
+
+  it("migrates a version-2 settling envelope missing settlementFailureCount by defaulting it to 0 (F-07)", () => {
+    const { room, hostToken, guestToken } = joinedRoom();
+    const settling = settlingRoomChosen(room, hostToken, guestToken);
+
+    if (settling.game.phase !== "settling") {
+      throw new Error("Expected settling phase.");
+    }
+    expect(settling.game.settlementFailureCount).toBe(0);
+
+    const readAtMs = NOW_MS + 500;
+    const loaded = loadPersistenceEnvelope(
+      v2EnvelopeWithoutSettlementFailureCount(settling, NOW_MS + 100),
+      readAtMs,
+    );
+
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) {
+      throw new Error("Expected legacy version-2 settling envelope to decode.");
+    }
+    if (loaded.room.game.phase !== "settling") {
+      throw new Error("Expected settling phase.");
+    }
+
+    expect(loaded.room.game.settlementFailureCount).toBe(0);
+    expect(loaded.room.game).toEqual(settling.game);
+  });
+
+  it("migrates a version-2 locked choosingSide envelope missing settlementFailureCount by defaulting it to 0, respecting the lockedPendingTrade pairing (F-07)", () => {
+    const { room, hostToken, guestToken } = joinedRoom();
+    const settling = settlingRoomChosen(room, hostToken, guestToken);
+    const failed = normalizeForPersistence(
+      expectOk(failRoomSettlement(settling, "Settlement failed.", NOW_MS + 13)),
+    );
+
+    if (failed.game.phase !== "choosingSide") {
+      throw new Error("Expected locked choosingSide phase.");
+    }
+    expect(failed.game.lockedPendingTrade).toEqual({ kind: "chosen", side: "BUY" });
+    expect(failed.game.settlementFailureCount).toBe(1);
+
+    const readAtMs = NOW_MS + 500;
+    const loaded = loadPersistenceEnvelope(
+      v2EnvelopeWithoutSettlementFailureCount(failed, NOW_MS + 100),
+      readAtMs,
+    );
+
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) {
+      throw new Error("Expected legacy version-2 locked choosingSide envelope to decode.");
+    }
+    if (loaded.room.game.phase !== "choosingSide") {
+      throw new Error("Expected choosingSide phase.");
+    }
+
+    // The migration cannot know the real prior failure count (that history
+    // did not exist on a version-2 envelope) - it can only default to 0,
+    // same as a brand-new lock. This does not violate the paired invariant:
+    // lockedPendingTrade and settlementFailureCount both end up present.
+    expect(loaded.room.game.lockedPendingTrade).toEqual({ kind: "chosen", side: "BUY" });
+    expect(loaded.room.game.settlementFailureCount).toBe(0);
+  });
+
+  it("does not manufacture settlementFailureCount on an unlocked version-2 choosingSide envelope", () => {
+    const fixtures = legacyMigrationFixtures();
+    const readAtMs = NOW_MS + 500;
+
+    if (fixtures.choosingSide.game.phase !== "choosingSide") {
+      throw new Error("Expected choosingSide phase.");
+    }
+    expect(fixtures.choosingSide.game.lockedPendingTrade).toBeUndefined();
+    expect(fixtures.choosingSide.game.settlementFailureCount).toBeUndefined();
+
+    const envelope = toPersistenceEnvelope(fixtures.choosingSide, NOW_MS + 100);
+
+    // A plain, never-bounced choosingSide already has neither field at
+    // version 2 (settlementFailureCount did not exist yet, and
+    // lockedPendingTrade is only ever set by a SETTLEMENT_FAILED bounce).
+    // Tagging it version 2 directly - no stripping needed - exercises that
+    // migrateV2ToV3GameStateRecord's choosingSide branch leaves an unlocked
+    // record alone rather than defaulting settlementFailureCount to 0 and
+    // producing an illegal half-set state (settlementFailureCount present,
+    // lockedPendingTrade absent).
+    const loaded = loadPersistenceEnvelope({ ...envelope, version: 2 }, readAtMs);
+
+    expect(loaded.ok).toBe(true);
+    if (!loaded.ok) {
+      throw new Error("Expected legacy version-2 choosingSide envelope to decode.");
+    }
+    if (loaded.room.game.phase !== "choosingSide") {
+      throw new Error("Expected choosingSide phase.");
+    }
+
+    expect(loaded.room.game.lockedPendingTrade).toBeUndefined();
+    expect(loaded.room.game.settlementFailureCount).toBeUndefined();
   });
 
   it("still rejects a version-1 envelope that is genuinely corrupt, not just old-shaped", () => {
@@ -804,6 +942,30 @@ describe("legacy (version-1) envelope migration", () => {
     // Corrupt in a way migration has no branch for: drop the item entirely
     // rather than merely lacking the new turnDeadlineMs field.
     delete legacy.room.game.item;
+
+    expect(loadPersistenceEnvelope(legacy, NOW_MS + 500)).toEqual({
+      ok: false,
+      error: {
+        code: "persistence_invalid",
+        message: "Room persistence envelope is invalid.",
+      },
+    });
+  });
+
+  it("still rejects a version-2 envelope that is genuinely corrupt, not just old-shaped", () => {
+    const { room, hostToken, guestToken } = joinedRoom();
+    const settling = settlingRoomChosen(room, hostToken, guestToken);
+
+    if (settling.game.phase !== "settling") {
+      throw new Error("Expected settling phase.");
+    }
+
+    const legacy = v2EnvelopeWithoutSettlementFailureCount(settling, NOW_MS + 100) as {
+      room: { game: Record<string, unknown> };
+    };
+    // Corrupt in a way migration has no branch for: drop the quote entirely
+    // rather than merely lacking the new settlementFailureCount field.
+    delete legacy.room.game.quote;
 
     expect(loadPersistenceEnvelope(legacy, NOW_MS + 500)).toEqual({
       ok: false,
@@ -995,8 +1157,10 @@ function legacyEnvelopeWithoutTurnDeadline(room: RoomState, persistedAtMs: numbe
 /**
  * Builds a raw version-1 "settling" envelope the way pre-F-06 code actually
  * wrote one: `pendingSide: TradeSide` instead of today's
- * `pendingTrade: PendingTradeDecision`. Only meaningful for a `settlingRoom*`
- * fixture whose pendingTrade is `{ kind: "chosen", ... }` - F-06's
+ * `pendingTrade: PendingTradeDecision`, and no `settlementFailureCount` at
+ * all (F-07 postdates version 1 too - see withDefaultedSettlementFailureCount
+ * in persistence.ts). Only meaningful for a `settlingRoom*` fixture whose
+ * pendingTrade is `{ kind: "chosen", ... }` - F-06's
  * `timeoutForcedWorstSide` has no legacy representation at all (see
  * withMigratedPendingTrade in persistence.ts), so this throws rather than
  * silently producing a nonsensical fixture if ever called on one.
@@ -1016,10 +1180,36 @@ function legacyEnvelopeWithPendingSide(room: RoomState, persistedAtMs: number): 
 
   delete legacyGame.pendingTrade;
   legacyGame.pendingSide = (pendingTrade as { side: unknown }).side;
+  delete legacyGame.settlementFailureCount;
 
   return {
     ...envelope,
     version: 1,
+    room: { ...envelope.room, game: legacyGame },
+  };
+}
+
+/**
+ * Builds a raw version-2 envelope for `room` - the current shape minus
+ * F-07's settlementFailureCount (and, for a locked `choosingSide`,
+ * lockedPendingTrade left intact but settlementFailureCount stripped so the
+ * fixture matches exactly what pre-F-07 code would have persisted for that
+ * same locked state - see withDefaultedSettlementFailureCount and
+ * withDefaultedLockedSettlementFailureCount in persistence.ts).
+ */
+function v2EnvelopeWithoutSettlementFailureCount(room: RoomState, persistedAtMs: number): unknown {
+  const envelope = toPersistenceEnvelope(room, persistedAtMs);
+  const legacyGame: Record<string, unknown> = { ...envelope.room.game };
+
+  if (legacyGame.settlementFailureCount === undefined) {
+    throw new Error("v2EnvelopeWithoutSettlementFailureCount requires a fixture that has the field.");
+  }
+
+  delete legacyGame.settlementFailureCount;
+
+  return {
+    ...envelope,
+    version: 2,
     room: { ...envelope.room, game: legacyGame },
   };
 }
