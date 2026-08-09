@@ -6,6 +6,7 @@ import {
   MAX_ROUNDS,
   NEGOTIATING_WIDTH_TURN_DURATION_MS,
   PROPOSING_WIDTH_TURN_DURATION_MS,
+  SETTLEMENT_FAILURE_EPISODE_CAP,
   type GameMode,
   type GamePhase,
   type GameState,
@@ -58,23 +59,33 @@ export const FINISHED_ROOM_TTL_MS =
   FINISHED_ROOM_MINUTES * SECONDS_PER_MINUTE * MILLISECONDS_PER_SECOND;
 
 export const ROOM_PERSISTENCE_KIND = "trader-titan.room";
-export const ROOM_PERSISTENCE_VERSION = 2;
+export const ROOM_PERSISTENCE_VERSION = 3;
 
 /**
- * The one prior envelope shape this decoder still accepts and migrates
- * forward on read (see decodeRoomState/migrateLegacyGameStateRecord below).
+ * The oldest prior envelope version this decoder still accepts and migrates
+ * forward on read (see decodeRoomState/migrateGameStateRecordForward below).
+ * Every version from this floor up to (but excluding) ROOM_PERSISTENCE_VERSION
+ * is "legacy": readable, but only after being walked forward one step at a
+ * time through the chain of per-version migration functions.
+ *
  * Version 1 predates F-05's turnDeadlineMs and F-06's pendingTrade
- * (previously pendingSide) / RoundSettlement.forcedByTimeout - fields the
- * strict per-phase allowlists below now require. Bumping
- * ROOM_PERSISTENCE_VERSION without this made every version-1 envelope
- * already sitting in production storage fail to decode (persistence_invalid)
- * the moment this shipped, since nothing had rewritten them yet. Every
- * future shape change to a phase's persisted keys needs the same treatment:
- * bump ROOM_PERSISTENCE_VERSION, add the old value here (or extend this to a
- * set if more than one legacy version must ever be supported at once), and
- * add a migration branch below.
+ * (previously pendingSide) / RoundSettlement.forcedByTimeout. Version 2
+ * predates F-07's settlementFailureCount (on `settling`) and its paired,
+ * optional counterpart on a locked `choosingSide` - fields the strict
+ * per-phase allowlists below now require. Bumping ROOM_PERSISTENCE_VERSION
+ * without also migrating made every older envelope already sitting in
+ * production storage fail to decode (persistence_invalid) the moment the new
+ * shape shipped, since nothing had rewritten them yet.
+ *
+ * Every future shape change to a phase's persisted keys needs the same
+ * treatment: bump ROOM_PERSISTENCE_VERSION, add a new
+ * migrateVN-1ToVNGameStateRecord step to the chain in
+ * migrateGameStateRecordForward, and extend the range this floor plus that
+ * chain covers - never collapse back down to a single hardcoded "previous
+ * version", since two migrations already had to compose here and a third
+ * shape change will need to compose with both of them.
  */
-const ROOM_PERSISTENCE_LEGACY_VERSION = 1;
+const ROOM_PERSISTENCE_MIN_SUPPORTED_VERSION = 1;
 
 export type PersistedRoomEnvelope = Readonly<{
   kind: typeof ROOM_PERSISTENCE_KIND;
@@ -113,16 +124,22 @@ export function loadPersistenceEnvelope(
     return persistenceInvalid();
   }
 
-  // A legacy (version-1) envelope is decoded through the same strict
-  // per-phase allowlists as the current version, just after normalizing its
-  // game-state record forward to the version-2 shape first - see
-  // migrateLegacyGameStateRecord. Anything that is neither the current
-  // version nor this one known-migratable prior version is genuinely
-  // unsupported (a future version this build predates, or a bogus value),
-  // not something to guess at.
-  const legacy = envelope.version === ROOM_PERSISTENCE_LEGACY_VERSION;
+  // A legacy envelope (anything from ROOM_PERSISTENCE_MIN_SUPPORTED_VERSION
+  // up to, but excluding, the current version) is decoded through the same
+  // strict per-phase allowlists as the current version, just after
+  // normalizing its game-state record forward to the current shape first -
+  // see migrateGameStateRecordForward. A version outside that supported
+  // range entirely is genuinely unsupported (a future version this build
+  // predates, an ancient one this build no longer carries a migration path
+  // for, or a bogus value), not something to guess at.
+  const version = envelope.version;
 
-  if (!legacy && envelope.version !== ROOM_PERSISTENCE_VERSION) {
+  if (
+    typeof version !== "number" ||
+    !Number.isInteger(version) ||
+    version < ROOM_PERSISTENCE_MIN_SUPPORTED_VERSION ||
+    version > ROOM_PERSISTENCE_VERSION
+  ) {
     return {
       ok: false,
       error: roomDomainError(
@@ -136,7 +153,7 @@ export function loadPersistenceEnvelope(
     return persistenceInvalid();
   }
 
-  const room = decodeRoomState(envelope.room, { legacy, nowMs });
+  const room = decodeRoomState(envelope.room, { version, nowMs });
 
   if (room === null) {
     return persistenceInvalid();
@@ -170,12 +187,13 @@ export function isRoomExpired(room: RoomState, nowMs: UnixTimeMs): boolean {
 
 /**
  * Carries what a legacy-envelope migration needs through the decode
- * pipeline: whether the input is a version-1 game-state record that must be
- * forward-migrated before the (unmodified) strict v2 checks run, and the
- * reader's current time - needed only for stamping a fresh turnDeadlineMs
- * (see withFreshTurnDeadline) since a v1 record never had one to recover.
+ * pipeline: the envelope's own persisted version, which determines how many
+ * migration steps (if any) migrateGameStateRecordForward must chain before
+ * the (unmodified) strict current-version checks run, and the reader's
+ * current time - needed only for stamping a fresh turnDeadlineMs (see
+ * withFreshTurnDeadline) since a version-1 record never had one to recover.
  */
-type DecodeContext = Readonly<{ legacy: boolean; nowMs: UnixTimeMs }>;
+type DecodeContext = Readonly<{ version: number; nowMs: UnixTimeMs }>;
 
 function decodeRoomState(value: unknown, ctx: DecodeContext): RoomState | null {
   if (!isRecord(value)) {
@@ -283,15 +301,16 @@ function decodeGameState(value: unknown, ctx: DecodeContext): GameState | null {
     return null;
   }
 
-  // Normalize a legacy record to the version-2 shape first, then run it
-  // through exactly the same strict checks below as a native v2 record -
-  // see migrateLegacyGameStateRecord. A legacy record that does not actually
-  // match the expected v1 shape (e.g. a stray turnDeadlineMs already
-  // present, or genuine corruption) is left as-is here and then correctly
-  // rejected by the unmodified v2 allowlist checks that follow.
-  const migrated = ctx.legacy
-    ? migrateLegacyGameStateRecord(value, ctx.nowMs)
-    : value;
+  // Normalize a legacy record forward to the current (version-3) shape
+  // first, then run it through exactly the same strict checks below as a
+  // native current-version record - see migrateGameStateRecordForward. A
+  // legacy record that does not actually match its claimed prior shape
+  // (e.g. a stray turnDeadlineMs already present, or genuine corruption) is
+  // left as-is here and then correctly rejected by the unmodified allowlist
+  // checks that follow.
+  const migrated = ctx.version === ROOM_PERSISTENCE_VERSION
+    ? value
+    : migrateGameStateRecordForward(value, ctx.version, ctx.nowMs);
 
   switch (migrated.phase) {
     case "setup":
@@ -321,6 +340,7 @@ function decodeGameState(value: unknown, ctx: DecodeContext): GameState | null {
         "quote",
         "turnDeadlineMs",
         ...(migrated.lockedPendingTrade === undefined ? [] : ["lockedPendingTrade"]),
+        ...(migrated.settlementFailureCount === undefined ? [] : ["settlementFailureCount"]),
       ]) &&
         isGeneratedItem(migrated.item) &&
         isValidSpreadWidth(migrated.spreadWidth) &&
@@ -328,15 +348,32 @@ function decodeGameState(value: unknown, ctx: DecodeContext): GameState | null {
         isUnixTimeMs(migrated.turnDeadlineMs) &&
         (migrated.lockedPendingTrade === undefined ||
           isPendingTradeDecision(migrated.lockedPendingTrade)) &&
+        // F-07: lockedPendingTrade and settlementFailureCount are only ever
+        // set together, both by SETTLEMENT_FAILED (see
+        // ChoosingSideGameState's doc comment on settlementFailureCount) -
+        // reject a persisted state that has drifted to carrying only one of
+        // the pair rather than silently accepting an illegal blend.
+        (migrated.lockedPendingTrade === undefined) ===
+          (migrated.settlementFailureCount === undefined) &&
+        (migrated.settlementFailureCount === undefined ||
+          isSettlementFailureCount(migrated.settlementFailureCount)) &&
         isActiveRoundNumber(migrated)
         ? migrated as GameState
         : null;
     case "settling":
-      return hasOnlyKeys(migrated, [...baseGameKeysFor(migrated), "item", "spreadWidth", "quote", "pendingTrade"]) &&
+      return hasOnlyKeys(migrated, [
+        ...baseGameKeysFor(migrated),
+        "item",
+        "spreadWidth",
+        "quote",
+        "pendingTrade",
+        "settlementFailureCount",
+      ]) &&
         isGeneratedItem(migrated.item) &&
         isValidSpreadWidth(migrated.spreadWidth) &&
         isQuoteForWidth(migrated.quote, migrated.spreadWidth) &&
         isPendingTradeDecision(migrated.pendingTrade) &&
+        isSettlementFailureCount(migrated.settlementFailureCount) &&
         isActiveRoundNumber(migrated)
         ? migrated as GameState
         : null;
@@ -374,15 +411,45 @@ function decodeGameState(value: unknown, ctx: DecodeContext): GameState | null {
 }
 
 /**
- * Forward-migrates a version-1 game-state record to the version-2 shape
- * (see ROOM_PERSISTENCE_LEGACY_VERSION). Only touches the specific fields
- * each shape gained; everything else - including phases with no shape
- * change at all, like `setup` or `gameOver` - passes through untouched, so
- * a legacy record that is *actually* corrupt still falls through to fail
- * the unmodified v2 checks in decodeGameState above rather than being
- * silently coerced into something valid.
+ * Walks a game-state record forward from whatever version it was actually
+ * persisted at (`fromVersion`) up to the current shape, one migration step
+ * at a time. Each step only knows how to migrate from its own immediate
+ * predecessor version, so a version-1 record gets both steps applied in
+ * order - migrateV1ToV2GameStateRecord's output feeds directly into
+ * migrateV2ToV3GameStateRecord - while a version-2 record only gets the
+ * second. This composes rather than branching on fromVersion directly
+ * inside each step, which is what lets a future version bump add a third
+ * `if (fromVersion < 4) { ... }` here without touching the two that already
+ * exist.
  */
-function migrateLegacyGameStateRecord(
+function migrateGameStateRecordForward(
+  value: Record<string, unknown>,
+  fromVersion: number,
+  nowMs: UnixTimeMs,
+): Record<string, unknown> {
+  let record = value;
+
+  if (fromVersion < 2) {
+    record = migrateV1ToV2GameStateRecord(record, nowMs);
+  }
+
+  if (fromVersion < 3) {
+    record = migrateV2ToV3GameStateRecord(record);
+  }
+
+  return record;
+}
+
+/**
+ * Forward-migrates a version-1 game-state record to the version-2 shape
+ * (see ROOM_PERSISTENCE_MIN_SUPPORTED_VERSION). Only touches the specific
+ * fields each shape gained; everything else - including phases with no
+ * shape change at all, like `setup` or `gameOver` - passes through
+ * untouched, so a legacy record that is *actually* corrupt still falls
+ * through to fail the unmodified current-version checks in decodeGameState
+ * above rather than being silently coerced into something valid.
+ */
+function migrateV1ToV2GameStateRecord(
   value: Record<string, unknown>,
   nowMs: UnixTimeMs,
 ): Record<string, unknown> {
@@ -399,6 +466,29 @@ function migrateLegacyGameStateRecord(
       return withMigratedPendingTrade(value);
     case "settlement":
       return withDefaultedForcedByTimeout(value);
+    default:
+      return value;
+  }
+}
+
+/**
+ * Forward-migrates a version-2 game-state record to the version-3 shape:
+ * F-07's settlementFailureCount, required on `settling` and optionally
+ * paired with `lockedPendingTrade` on a locked `choosingSide`. A version-2
+ * record predates F-07 entirely, so it can only ever represent zero prior
+ * failed settling episodes for whatever round it is mid-round in - see
+ * withDefaultedSettlementFailureCount and
+ * withDefaultedLockedSettlementFailureCount for why that default is safe on
+ * each phase.
+ */
+function migrateV2ToV3GameStateRecord(
+  value: Record<string, unknown>,
+): Record<string, unknown> {
+  switch (value.phase) {
+    case "settling":
+      return withDefaultedSettlementFailureCount(value);
+    case "choosingSide":
+      return withDefaultedLockedSettlementFailureCount(value);
     default:
       return value;
   }
@@ -454,6 +544,43 @@ function withDefaultedForcedByTimeout(value: Record<string, unknown>): Record<st
   // the pre-F-06 settlement math already computed - isSettlementConsistent
   // below still re-derives and checks it, not just trusts this default.
   return { ...value, settlement: { ...value.settlement, forcedByTimeout: false } };
+}
+
+function withDefaultedSettlementFailureCount(
+  value: Record<string, unknown>,
+): Record<string, unknown> {
+  if (value.settlementFailureCount !== undefined) {
+    return value;
+  }
+
+  // F-07's settlementFailureCount did not exist when a version-2 "settling"
+  // envelope was written, so this episode cannot have inherited any prior
+  // failed-settlement count for its round - 0 reproduces exactly that
+  // absence of history rather than guessing at some other starting point.
+  // isSettlementFailureCount's [0, SETTLEMENT_FAILURE_EPISODE_CAP) range
+  // check still runs on the migrated record below, and 0 is always inside
+  // it regardless of where the cap itself is set.
+  return { ...value, settlementFailureCount: 0 };
+}
+
+function withDefaultedLockedSettlementFailureCount(
+  value: Record<string, unknown>,
+): Record<string, unknown> {
+  if (value.settlementFailureCount !== undefined || value.lockedPendingTrade === undefined) {
+    return value;
+  }
+
+  // Mirrors withDefaultedSettlementFailureCount, but only when this
+  // choosingSide is actually locked (lockedPendingTrade present) - a
+  // version-2 "choosingSide" already had F-06's lockedPendingTrade field,
+  // but F-07's settlementFailureCount pairs 1:1 with it (see
+  // ChoosingSideGameState's doc comment: both set together by
+  // SETTLEMENT_FAILED, both absent on a plain SUBMIT_MARKET_QUOTE
+  // choosingSide). Defaulting settlementFailureCount here unconditionally -
+  // rather than only when lockedPendingTrade is also present - would
+  // manufacture an illegal half-set state on every ordinary, never-bounced
+  // choosingSide instead of preserving both-absent.
+  return { ...value, settlementFailureCount: 0 };
 }
 
 function isGameStateBase(value: Record<string, unknown>): boolean {
@@ -758,6 +885,21 @@ function isPositiveInteger(value: unknown): value is number {
 
 function isNonNegativeInteger(value: unknown): value is number {
   return Number.isInteger(value) && Number(value) >= 0;
+}
+
+/**
+ * F-07: valid range is [0, SETTLEMENT_FAILURE_EPISODE_CAP) - a persisted
+ * `settling` or locked `choosingSide` can only ever have already failed
+ * *fewer* times than the cap, since reaching the cap routes to the
+ * terminal `error` phase instead of persisting another settling/choosingSide
+ * state at all (see the SETTLEMENT_FAILED case in reducer.ts). Rejecting an
+ * out-of-range value here - rather than only trusting the reducer to never
+ * produce one - keeps a corrupted or tampered envelope from smuggling in a
+ * round that looks like it is one bounce further along than any reducer
+ * transition could actually produce.
+ */
+function isSettlementFailureCount(value: unknown): value is number {
+  return isNonNegativeInteger(value) && value < SETTLEMENT_FAILURE_EPISODE_CAP;
 }
 
 function isFiniteNumber(value: unknown): value is number {

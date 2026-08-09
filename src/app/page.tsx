@@ -33,6 +33,7 @@ import {
 import {
   GAME_MODES,
   MAX_ROUNDS,
+  SETTLEMENT_FAILURE_EPISODE_CAP,
   formatGamePhase,
   formatSignedNumber,
   formatTradeSide,
@@ -1565,6 +1566,14 @@ function RoomGameView({
     // meaningfully different would be dishonest.
     if (game.lockedPendingTrade) {
       const lockedTrade = game.lockedPendingTrade;
+      // F-07: how many settling episodes have already failed for this
+      // round (see settlementFailureCount on ChoosingSideGameState). Always
+      // set alongside lockedPendingTrade - the `?? 0` is only a defensive
+      // fallback, not an expected case - and always strictly less than
+      // SETTLEMENT_FAILURE_EPISODE_CAP: reaching the cap routes to the
+      // terminal `error` phase instead, which renders a different panel
+      // entirely (see the fallback error-panel branch below).
+      const failureCount = game.settlementFailureCount ?? 0;
 
       return (
         <>
@@ -1585,7 +1594,11 @@ function RoomGameView({
                   : `${traderName}'s clock ran out before choosing a side, and settling the forced side failed. `}
                 The decision is locked in - retrying will not let {traderName}{" "}
                 choose a different side, and the clock will retry
-                automatically if it runs out again.
+                automatically if it runs out again. This round has failed to
+                settle {failureCount}{" "}
+                {failureCount === 1 ? "time" : "times"} so far; if it fails{" "}
+                {SETTLEMENT_FAILURE_EPISODE_CAP} times in a row it will stop
+                retrying and the host will need to reset the lobby.
               </p>
               <div className="room-actions">
                 {/* The side argument is a placeholder: the reducer ignores
@@ -1779,12 +1792,33 @@ function RoomGameView({
   }
 
   const canRetry = canRetryItemGeneration(game, isHost);
+  // F-07: a settlement that failed SETTLEMENT_FAILURE_EPISODE_CAP times in a
+  // row for the same round lands here with previousPhase "settling" instead
+  // of "generatingItem" - see the terminal branch of SETTLEMENT_FAILED in
+  // reducer.ts. Unlike an item-generation error (transient, and retryable
+  // via canRetry above), this is a permanent give-up: there is no
+  // RoundSettlement and no true_value to fall back on, so the copy must say
+  // so plainly instead of reusing the generic "Game error" wording that a
+  // host has already seen mean "retry and it'll probably work."
+  const isPermanentSettlementFailure = game.previousPhase === "settling";
 
   return (
     <section className="phase-panel" data-testid="error-panel">
-      <p className="eyebrow">Game error</p>
-      <h2>Round stopped</h2>
+      <p className="eyebrow">
+        {isPermanentSettlementFailure ? "Settlement failed permanently" : "Game error"}
+      </p>
+      <h2>
+        {isPermanentSettlementFailure
+          ? "This round could not be settled"
+          : "Round stopped"}
+      </h2>
       <p>{game.error}</p>
+      {isPermanentSettlementFailure ? (
+        <p data-testid="settlement-permanently-failed-note">
+          Automatic retries were exhausted for this round. It cannot be
+          resumed - the host can only reset the lobby.
+        </p>
+      ) : null}
       {isHost ? (
         <div className="room-actions">
           {canRetry ? (

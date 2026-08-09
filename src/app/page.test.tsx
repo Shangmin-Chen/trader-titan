@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { SETTLEMENT_FAILURE_EPISODE_CAP } from "../lib/game";
 import {
   parseCapabilityToken,
   parseRoomId,
@@ -403,6 +404,7 @@ describe("item generation retry affordance", () => {
       spreadWidth: 100,
       quote: { bid: 900, ask: 1000 },
       pendingTrade: { kind: "chosen", side: "BUY" },
+      settlementFailureCount: 0,
     } satisfies PublicRoomSnapshot["game"];
 
     expect(canRetryItemGeneration(settling, true)).toBe(true);
@@ -680,6 +682,24 @@ describe("per-command pending state (F-06)", () => {
 
     render(<Home />);
     const errorPanel = await screen.findByTestId("error-panel");
+
+    // F-07 regression coverage: previousPhase "generatingItem" is an
+    // ordinary, retryable item-generation error, not a permanently failed
+    // settlement (previousPhase "settling") - isPermanentSettlementFailure
+    // in page.tsx must read false here. If it were hardcoded to true, every
+    // retryable item-generation error would be framed to the host as
+    // unrecoverable, which is exactly the confusion this PR's new copy was
+    // added to prevent for the *real* terminal case.
+    expect(
+      within(errorPanel).getByText("Game error"),
+    ).toBeInTheDocument();
+    expect(
+      within(errorPanel).getByText("Round stopped"),
+    ).toBeInTheDocument();
+    expect(
+      within(errorPanel).queryByTestId("settlement-permanently-failed-note"),
+    ).not.toBeInTheDocument();
+
     const retryButton = within(errorPanel).getByRole("button", {
       name: /retry generation/i,
     });
@@ -698,5 +718,108 @@ describe("per-command pending state (F-06)", () => {
 
     expect(retryOptions?.signal).toBeInstanceOf(AbortSignal);
     expect(resetOptions?.signal).toBeUndefined();
+  });
+
+  // F-07 regression coverage: a settlement that has permanently failed
+  // (SETTLEMENT_FAILURE_EPISODE_CAP episodes in a row) must not render the
+  // same "everything is fine, just retrying" panel as a transient one - see
+  // the terminal branch of SETTLEMENT_FAILED in reducer.ts and the
+  // isPermanentSettlementFailure branch of the error panel in page.tsx.
+  it("renders a distinct terminal panel for a permanently failed settlement, with no misleading retry button", async () => {
+    const PERMANENT_SETTLEMENT_FAILURE_SNAPSHOT = {
+      ...BASE_SNAPSHOT,
+      lifecycle: "active",
+      presence: {
+        players: { A: true, B: true },
+      },
+      game: {
+        mode: "Chaos Quant",
+        players: {
+          A: { id: "A", name: "Ada" },
+          B: { id: "B", name: "Grace" },
+        },
+        scores: { A: 0, B: 0 },
+        roles: { marketMaker: "A", trader: "B" },
+        roundNumber: 1,
+        totalRounds: 3,
+        log: [],
+        phase: "error",
+        error: "Private generated item is unavailable for settlement.",
+        previousPhase: "settling",
+      },
+    } satisfies PublicRoomSnapshot;
+
+    vi.mocked(accessRoom).mockResolvedValue({
+      ok: true,
+      room: PERMANENT_SETTLEMENT_FAILURE_SNAPSHOT,
+    });
+
+    render(<Home />);
+    const errorPanel = await screen.findByTestId("error-panel");
+
+    expect(
+      within(errorPanel).getByText("This round could not be settled"),
+    ).toBeInTheDocument();
+    expect(
+      within(errorPanel).getByTestId("settlement-permanently-failed-note"),
+    ).toBeInTheDocument();
+    // The generic item-generation "Retry generation" affordance would be
+    // dishonest here - retrying is exactly what already failed
+    // SETTLEMENT_FAILURE_EPISODE_CAP times in a row - so it must not appear.
+    expect(
+      within(errorPanel).queryByRole("button", { name: /retry generation/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(errorPanel).getByRole("button", { name: /reset lobby/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("renders a healthy retrying panel (not the terminal one) for a locked choosingSide short of the cap", async () => {
+    const RETRYING_SETTLEMENT_SNAPSHOT = {
+      ...BASE_SNAPSHOT,
+      lifecycle: "active",
+      presence: {
+        players: { A: true, B: true },
+      },
+      game: {
+        mode: "Chaos Quant",
+        players: {
+          A: { id: "A", name: "Ada" },
+          B: { id: "B", name: "Grace" },
+        },
+        scores: { A: 0, B: 0 },
+        roles: { marketMaker: "A", trader: "B" },
+        roundNumber: 1,
+        totalRounds: 3,
+        log: [],
+        phase: "choosingSide",
+        item: {
+          item_title: "Widget",
+          category: "Test",
+          context_clue: "A useful test item.",
+          round_id: "round-1",
+        },
+        spreadWidth: 4,
+        quote: { bid: 10, ask: 14 },
+        turnDeadlineMs: Date.now() + 30_000,
+        lockedPendingTrade: { kind: "chosen", side: "BUY" },
+        settlementFailureCount: 1,
+      },
+    } satisfies PublicRoomSnapshot;
+
+    vi.mocked(accessRoom).mockResolvedValue({
+      ok: true,
+      room: RETRYING_SETTLEMENT_SNAPSHOT,
+    });
+
+    render(<Home />);
+    const retryPanel = await screen.findByTestId("settlement-retry-panel");
+
+    expect(screen.queryByTestId("error-panel")).not.toBeInTheDocument();
+    // Bounded, not open-ended: the host should be able to tell this will
+    // not retry forever, without it looking like the terminal state yet.
+    expect(retryPanel.textContent).toContain(
+      `if it fails ${SETTLEMENT_FAILURE_EPISODE_CAP} times in a row`,
+    );
   });
 });

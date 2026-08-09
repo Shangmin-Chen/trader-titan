@@ -17,7 +17,7 @@ import {
   SMOKE_HEADER_NAME,
   SMOKE_HEADER_VALUE
 } from "./testing/open-next-worker";
-import { applySettlementToScores } from "../lib/game";
+import { applySettlementToScores, SETTLEMENT_FAILURE_EPISODE_CAP } from "../lib/game";
 import type { GameMode, ProviderGeneratedItem, TradeSide } from "../lib/game";
 import {
   ROOM_CREATION_RATE_LIMIT_MAX_REQUESTS,
@@ -53,6 +53,7 @@ const STUCK_SETTLING_EXHAUSTION_ROOM_NAME = "worker-room-stuck-settling-exhausti
 const STUCK_SETTLING_STALE_ROUND_EXHAUSTION_ROOM_NAME =
   "worker-room-stuck-settling-stale-round-exhaustion";
 const STUCK_SETTLING_NO_DOUBLE_SETTLE_ROOM_NAME = "worker-room-stuck-settling-no-double-settle";
+const PERMANENT_SETTLEMENT_FAILURE_ROOM_NAME = "worker-room-permanent-settlement-failure";
 const STUCK_SETTLING_MID_ALARM_EXPIRY_ROOM_NAME = "worker-room-stuck-settling-mid-alarm-expiry";
 const RETRY_SUCCESS_ROOM_NAME = "worker-room-retry-success";
 const RETRY_FAILURE_ROOM_NAME = "worker-room-retry-failure";
@@ -2682,6 +2683,160 @@ describe("Cloudflare worker scaffold", () => {
       "Automatic settlement retries were exhausted. A host can retry settlement manually."
     );
     expect(afterGenuine.room.revision).toBe(revisionBefore + 1);
+
+    guestConnection.socket.close();
+  });
+
+  // F-07: nothing previously bounded how many times choosingSide(locked) ->
+  // settling -> SETTLEMENT_FAILED -> choosingSide(locked) could repeat for
+  // the same round. PENDING_SETTLE_EFFECT_MAX_ATTEMPTS only bounds retries
+  // *within* one settling episode before forceFailStuckSettlement bounces
+  // back to choosingSide - each bounce re-arms a fresh turn clock and a
+  // fresh pending-settle-effect with attempts reset to 0, so a persistent
+  // (non-transient) cause could cycle indefinitely with no terminal state.
+  // This reproduces that persistent cause directly (the private item is
+  // deleted once and never restored, so every settlement attempt fails the
+  // same way) and proves three things end to end: the failure count is
+  // tracked across episodes rather than reset by each bounce, the round
+  // reaches a genuinely terminal phase at exactly SETTLEMENT_FAILURE_EPISODE_CAP
+  // failures, and the Durable Object stops re-arming a near-term alarm for
+  // the dead round once it gets there.
+  it("stops bouncing choosingSide <-> settling after SETTLEMENT_FAILURE_EPISODE_CAP consecutive failures and reaches a terminal error phase (F-07)", async () => {
+    const stub = roomStub(PERMANENT_SETTLEMENT_FAILURE_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created permanent-settlement-failure room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected generated item to be ready.");
+    }
+
+    const privateItemKey = privateGeneratedItemStorageKey(
+      started.room.game.item.round_id
+    );
+
+    // The underlying cause is persistent, not transient: the private item
+    // is gone for good, so every settlement attempt for this round fails
+    // identically, no matter how many times it is retried.
+    await deleteStoredPrivateGeneratedItem(stub, privateItemKey);
+
+    const marketMakerToken = tokenForPlayer(
+      started.room.game.roles.marketMaker,
+      created.hostToken,
+      joined.guestToken
+    );
+    const traderToken = tokenForPlayer(
+      started.room.game.roles.trader,
+      created.hostToken,
+      joined.guestToken
+    );
+
+    await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_INITIAL_WIDTH",
+      credential: marketMakerToken,
+      width: 100
+    });
+    await applyRoomCommandWithoutTrueValue(stub, {
+      type: "TRADE_ON_WIDTH",
+      credential: traderToken
+    });
+    const quoted = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_MARKET_QUOTE",
+      credential: marketMakerToken,
+      quote: { bid: 3400, ask: 3500 }
+    });
+
+    expect(quoted.room.game.phase).toBe("choosingSide");
+
+    // Every failure before the cap-th must still bounce back to a locked
+    // choosingSide, with the failure count climbing across episodes rather
+    // than resetting each time (the exact property that was previously
+    // unbounded).
+    for (let attempt = 1; attempt < SETTLEMENT_FAILURE_EPISODE_CAP; attempt += 1) {
+      const settlementResponse = await postRoomCommand(stub, {
+        type: "EXECUTE_TRADE",
+        credential: traderToken,
+        side: "BUY"
+      });
+      const failed = await expectPublicJsonWithoutPrivateItemMetadata<CommandRoomResponse>(
+        settlementResponse
+      );
+
+      expect(settlementResponse.status).toBe(HTTP_OK_STATUS);
+      expect(failed.room.game.phase).toBe("choosingSide");
+
+      if (failed.room.game.phase !== "choosingSide") {
+        throw new Error("Expected settlement failure to bounce back to side choice.");
+      }
+
+      expect(failed.room.game.lockedPendingTrade).toEqual({ kind: "chosen", side: "BUY" });
+      expect(failed.room.game.settlementFailureCount).toBe(attempt);
+    }
+
+    // The cap-th failure - and only the cap-th - must be terminal.
+    const finalResponse = await postRoomCommand(stub, {
+      type: "EXECUTE_TRADE",
+      credential: traderToken,
+      side: "BUY"
+    });
+    const terminal = await expectPublicJsonWithoutPrivateItemMetadata<CommandRoomResponse>(
+      finalResponse
+    );
+
+    expect(finalResponse.status).toBe(HTTP_OK_STATUS);
+    expect(terminal.room.game.phase).toBe("error");
+
+    if (terminal.room.game.phase !== "error") {
+      throw new Error("Expected a terminal error phase.");
+    }
+
+    expect(terminal.room.game.previousPhase).toBe("settling");
+    expect(terminal.room.lifecycle).toBe("active");
+    // No RoundSettlement and no revealed true_value exist for a
+    // permanently failed settlement - the terminal error state must not
+    // carry either.
+    expect("item" in terminal.room.game).toBe(false);
+    expect("settlement" in terminal.room.game).toBe(false);
+
+    // A dead round must not keep waking the object: no pending settle
+    // effect and no turn-clocked deadline remain, so the only thing left to
+    // schedule the alarm against is the room's own TTL.
+    await expect(readPendingRoomEffect(stub)).resolves.toBeNull();
+
+    const alarmAfterTerminal = await storedRoomAlarm(stub);
+    const ttlAfterTerminal = await storedRoomExpiresAt(stub);
+
+    expect(alarmAfterTerminal).toBe(ttlAfterTerminal);
+
+    // A further alarm tick (simulating time passing with nothing left to
+    // do) must be a stable no-op, not another bounce.
+    const revisionBeforeExtraTick = terminal.room.revision;
+
+    await runRoomCleanupAlarm(stub);
+
+    const afterExtraTick = await accessRoom(stub, created.hostToken);
+
+    expect(afterExtraTick.room.revision).toBe(revisionBeforeExtraTick);
+    expect(afterExtraTick.room.game.phase).toBe("error");
+
+    // A further EXECUTE_TRADE (e.g. a stale client retry) must be rejected
+    // rather than resuming the dead round - `error` is not choosingSide.
+    const staleRetryResponse = await postRoomCommand(stub, {
+      type: "EXECUTE_TRADE",
+      credential: traderToken,
+      side: "BUY"
+    });
+
+    expect(staleRetryResponse.status).not.toBe(HTTP_OK_STATUS);
 
     guestConnection.socket.close();
   });
