@@ -8,7 +8,7 @@ import {
 } from "cloudflare:test";
 import { describe, expect, it } from "vitest";
 
-import worker from "./index";
+import worker, { GameRoomDurableObject } from "./index";
 import {
   privateGeneratedItemStorageKey,
   privateGeneratedItemStoragePrefix
@@ -19,6 +19,10 @@ import {
 } from "./testing/open-next-worker";
 import { applySettlementToScores } from "../lib/game";
 import type { GameMode, ProviderGeneratedItem, TradeSide } from "../lib/game";
+import {
+  DEFAULT_ROOM_SOCKET_HEARTBEAT,
+  isRetryableRoomSocketCloseCode
+} from "../lib/room-socket-supervisor";
 import {
   ROOM_CREATION_RATE_LIMIT_MAX_REQUESTS,
   ROOM_CUSTOM_AMAZON_RATE_LIMIT_MAX_REQUESTS
@@ -76,6 +80,9 @@ const RESET_STALE_SOCKET_ROOM_NAME = "worker-room-reset-stale-socket";
 const HOST_SOCKET_EVICTION_ROOM_NAME = "worker-room-host-socket-eviction";
 const GUEST_SOCKET_CHURN_ROOM_NAME = "worker-room-guest-socket-churn";
 const PING_PONG_ROOM_NAME = "worker-room-ping-pong";
+const LIVENESS_SWEEP_STALE_VS_LIVE_ROOM_NAME = "worker-room-liveness-sweep-stale-vs-live";
+const LIVENESS_SWEEP_ALARM_MULTIPLEX_ROOM_NAME = "worker-room-liveness-sweep-alarm-multiplex";
+const LIVENESS_SWEEP_WITH_PENDING_EFFECT_ROOM_NAME = "worker-room-liveness-sweep-with-pending-effect";
 const TIGHTEN_REPLAY_SAME_ID_ROOM_NAME = "worker-room-tighten-replay-same-id";
 const TIGHTEN_REPLAY_DIFFERENT_ID_ROOM_NAME = "worker-room-tighten-replay-different-id";
 const KICKED_GUEST_REPLAY_ROOM_NAME = "worker-room-kicked-guest-replay";
@@ -94,6 +101,12 @@ const TEST_PENDING_EFFECT_STORAGE_KEY = "room:pending-effect:v1";
 const TEST_COMMAND_DEDUPE_STORAGE_KEY = "room:command-dedupe:v1";
 // Mirrors PENDING_SETTLE_EFFECT_MAX_ATTEMPTS in src/worker/index.ts.
 const TEST_PENDING_SETTLE_EFFECT_MAX_ATTEMPTS = 5;
+// Mirrors ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS in src/worker/index.ts,
+// computed the same way (3x the client's own ping cadence) rather than
+// duplicated as a bare number, so the two cannot silently drift apart.
+const TEST_LIVENESS_STALE_THRESHOLD_MS = DEFAULT_ROOM_SOCKET_HEARTBEAT.intervalMs * 3;
+// Mirrors ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE in src/worker/index.ts.
+const TEST_LIVENESS_SWEEP_CLOSE_CODE = 4001;
 const HTTP_BAD_REQUEST_STATUS = 400;
 const HTTP_FORBIDDEN_STATUS = 403;
 const HTTP_CREATED_STATUS = 201;
@@ -1735,6 +1748,16 @@ describe("Cloudflare worker scaffold", () => {
 
     expect(pendingEffect.notBeforeMs).toBeLessThan(ttlDeadline);
 
+    // This test is specifically about TTL/pending-effect multiplexing, not
+    // the F-08 liveness sweep - close the still-open guest socket (opened
+    // above only so START_ROOM's presence gate would pass) and confirm the
+    // DO's live-socket-derived state has caught up, so the alarm math below
+    // is not also folding in a liveness deadline.
+    await closeSocketAndWaitOffline(stub, guestConnection.socket, created.hostToken, {
+      A: false,
+      B: false
+    });
+
     // forceStuckSettling deliberately leaves the *scheduled* DO alarm at the
     // far TTL deadline rather than the pending effect's earlier, already-due
     // notBeforeMs (see its comment - an overdue alarm can fire
@@ -1758,8 +1781,6 @@ describe("Cloudflare worker scaffold", () => {
 
     await expect(storedRoomAlarm(stub)).resolves.toBe(ttlAfterResolution);
     expect(ttlAfterResolution).toBeGreaterThan(Date.now());
-
-    guestConnection.socket.close();
   });
 
   it("schedules the nearer of the two deadlines while a pending effect is not yet due", async () => {
@@ -2010,6 +2031,16 @@ describe("Cloudflare worker scaffold", () => {
       notBeforeMs: Date.now() - 1
     });
 
+    // This test is specifically about the pending-effect attempt cap, not
+    // the F-08 liveness sweep - close the still-open guest socket (opened
+    // above only so START_ROOM's presence gate would pass) so the alarm
+    // this test asserts on below is not also folding in a liveness
+    // deadline.
+    await closeSocketAndWaitOffline(stub, guestConnection.socket, created.hostToken, {
+      A: false,
+      B: false
+    });
+
     await runRoomCleanupAlarm(stub);
 
     const afterExhaustion = await accessRoom(stub, created.hostToken);
@@ -2037,8 +2068,6 @@ describe("Cloudflare worker scaffold", () => {
     const afterSecondTick = await accessRoom(stub, created.hostToken);
 
     expect(afterSecondTick.room.revision).toBe(afterExhaustion.room.revision);
-
-    guestConnection.socket.close();
   });
 
   it("does not double-settle when a manual retry races the alarm: the alarm settles once, and the losing retry is rejected unchanged", async () => {
@@ -2423,6 +2452,15 @@ describe("Cloudflare worker scaffold", () => {
       throw new Error("Expected generated item to be ready.");
     }
 
+    // This test is specifically about the TTL-only reschedule path, not the
+    // F-08 liveness sweep - close the still-open guest socket (opened above
+    // only so START_ROOM's presence gate would pass) so the alarm this test
+    // asserts on below is not also folding in a liveness deadline.
+    await closeSocketAndWaitOffline(stub, guestConnection.socket, created.hostToken, {
+      A: false,
+      B: false
+    });
+
     const privateItemKey = privateGeneratedItemStorageKey(
       started.room.game.item.round_id
     );
@@ -2438,8 +2476,6 @@ describe("Cloudflare worker scaffold", () => {
       privateItemKey
     ]);
     await expect(storedRoomAlarm(stub)).resolves.toBe(expectedAlarm);
-
-    guestConnection.socket.close();
   });
 
   it("generates custom Amazon items from the current trader and rejects the wrong player", async () => {
@@ -3361,6 +3397,188 @@ describe("Cloudflare worker scaffold", () => {
 
     connection.socket.close();
   });
+
+  it("F-08 liveness sweep closes a socket that has gone stale, leaves a live one connected, and rebroadcasts presence for the closed one", async () => {
+    const stub = roomStub(LIVENESS_SWEEP_STALE_VS_LIVE_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created liveness-sweep room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const hostConnection = await openRoomSocket(stub, created.hostToken);
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+
+    await withPatchedAutoResponseTimestamp(
+      (ws) => {
+        // The guest's last signal was well past the stale threshold; the
+        // host's is left `null`, falling back to its (just-now) acceptance
+        // time - i.e. a live socket that simply has not been pinged yet,
+        // which must NOT be swept.
+        return socketAttachmentRole(ws) === "guest"
+          ? new Date(Date.now() - TEST_LIVENESS_STALE_THRESHOLD_MS - 1_000)
+          : null;
+      },
+      async () => {
+        const guestClosed = nextSocketCloseCode(guestConnection.socket);
+        const hostSawPresenceUpdate = nextSocketMessage<RoomSnapshotSocketMessage>(
+          hostConnection.socket
+        );
+
+        await runRoomCleanupAlarm(stub);
+
+        const closeInfo = await guestClosed;
+
+        // Property (a): the stale socket was closed, the live one was not.
+        expect(closeInfo.code).toBe(TEST_LIVENESS_SWEEP_CLOSE_CODE);
+        expect(hostConnection.socket.readyState).toBe(WebSocket.OPEN);
+
+        // Property (c): the close code the sweep chose is one the client
+        // reconnect supervisor actually retries against (see
+        // isRetryableRoomSocketCloseCode / ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE).
+        expect(isRetryableRoomSocketCloseCode(closeInfo.code)).toBe(true);
+
+        // Presence is derived, not pushed by the sweep itself: closing a
+        // hibernatable socket always fires webSocketClose(), which is what
+        // actually rebroadcasts this snapshot to the remaining host socket.
+        const presenceUpdate = await hostSawPresenceUpdate;
+
+        expectRoomPresence(presenceUpdate.room, { A: true, B: false });
+      }
+    );
+
+    hostConnection.socket.close();
+  });
+
+  it("folds a connected socket's liveness deadline into the alarm ahead of a much later TTL, then reverts to the TTL once the socket disconnects", async () => {
+    const stub = roomStub(LIVENESS_SWEEP_ALARM_MULTIPLEX_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created liveness-multiplex room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const ttlDeadline = await storedRoomExpiresAt(stub);
+    const beforeConnectMs = Date.now();
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const afterConnectMs = Date.now();
+
+    // acceptRoomSocket's rearmAlarmForLiveSockets must fold this brand-new
+    // socket's liveness deadline into the alarm slot immediately - a
+    // mutation that skips that call, or one that drops the liveness term
+    // from scheduleNextAlarm's Math.min entirely, would leave this pinned
+    // at the (much later) TTL deadline instead. Pinning the value to
+    // roughly acceptedAtMs + TEST_LIVENESS_STALE_THRESHOLD_MS (rather than
+    // just asserting "sooner than TTL") also catches a broken acceptedAtMs
+    // fallback - e.g. defaulting an un-pinged socket's last-seen time to
+    // epoch 0 would still be sooner than TTL, but would not land in this
+    // window.
+    const armedAfterConnect = await storedRoomAlarm(stub);
+
+    expect(armedAfterConnect).not.toBeNull();
+    expect(armedAfterConnect as number).toBeLessThan(ttlDeadline);
+    expect(armedAfterConnect as number).toBeGreaterThanOrEqual(
+      beforeConnectMs + TEST_LIVENESS_STALE_THRESHOLD_MS
+    );
+    expect(armedAfterConnect as number).toBeLessThanOrEqual(
+      afterConnectMs + TEST_LIVENESS_STALE_THRESHOLD_MS
+    );
+
+    await closeSocketAndWaitOffline(stub, guestConnection.socket, created.hostToken, {
+      A: false,
+      B: false
+    });
+
+    // Force a tick even though the (nearer, liveness-derived) alarm is not
+    // literally due yet - the same "no-op reschedule" branch workerd's own
+    // scheduler would eventually reach on its own. Property (b): with no
+    // sockets left to watch, the TTL deadline must resurface exactly - not
+    // stay pinned at the stale liveness value, and not be replaced by
+    // anything else. A mutation that drops the TTL term from the Math.min
+    // (rather than only adding the liveness term to it) fails here.
+    await runRoomCleanupAlarm(stub);
+
+    await expect(storedRoomAlarm(stub)).resolves.toBe(ttlDeadline);
+  });
+
+  it("resolves a due pending settlement effect and sweeps a stale socket in the same alarm tick, dropping neither", async () => {
+    const stub = roomStub(LIVENESS_SWEEP_WITH_PENDING_EFFECT_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created liveness-with-pending-effect room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+    const guestConnection = await openRoomSocket(stub, joined.guestToken);
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    if (started.room.game.phase !== "proposingWidth") {
+      throw new Error("Expected generated item to be ready.");
+    }
+
+    const marketMakerToken = tokenForPlayer(
+      started.room.game.roles.marketMaker,
+      created.hostToken,
+      joined.guestToken
+    );
+    const traderToken = tokenForPlayer(
+      started.room.game.roles.trader,
+      created.hostToken,
+      joined.guestToken
+    );
+
+    await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_INITIAL_WIDTH",
+      credential: marketMakerToken,
+      width: 100
+    });
+    await applyRoomCommandWithoutTrueValue(stub, {
+      type: "TRADE_ON_WIDTH",
+      credential: traderToken
+    });
+    const quoted = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "SUBMIT_MARKET_QUOTE",
+      credential: marketMakerToken,
+      quote: { bid: 3400, ask: 3500 }
+    });
+
+    expect(quoted.room.game.phase).toBe("choosingSide");
+
+    // forceStuckSettling leaves a due pending settle-effect marker (F-02)
+    // for this room - the guest socket opened above (needed for
+    // START_ROOM's presence gate) is still connected throughout.
+    await forceStuckSettling(stub, traderToken, "BUY");
+    await expect(readPendingRoomEffect(stub)).resolves.not.toBeNull();
+
+    await withPatchedAutoResponseTimestamp(
+      (ws) =>
+        socketAttachmentRole(ws) === "guest"
+          ? new Date(Date.now() - TEST_LIVENESS_STALE_THRESHOLD_MS - 1_000)
+          : null,
+      async () => {
+        const guestClosed = nextSocketCloseCode(guestConnection.socket);
+
+        await runRoomCleanupAlarm(stub);
+
+        const closeInfo = await guestClosed;
+
+        expect(closeInfo.code).toBe(TEST_LIVENESS_SWEEP_CLOSE_CODE);
+      }
+    );
+
+    // Neither concern lost the other in the same tick: the pending
+    // settlement effect actually resolved...
+    const resumed = await accessRoom(stub, created.hostToken);
+
+    expect(resumed.room.game.phase).toBe("settlement");
+    await expect(readPendingRoomEffect(stub)).resolves.toBeNull();
+  });
 });
 
 function roomStub(roomName: string) {
@@ -3640,6 +3858,49 @@ async function runRoomCleanupAlarm(stub: GameRoomStub): Promise<void> {
   await runInDurableObject(stub, async (instance) => {
     await (instance as { alarm(): Promise<void> }).alarm();
   });
+}
+
+/**
+ * Substitutes a synthetic "last auto-response" clock for GameRoomDurableObject's
+ * private readSocketAutoResponseTimestamp for the duration of `run`, then
+ * restores the original. This is the one piece of F-08's liveness sweep
+ * that cannot be driven deterministically any other way:
+ * getWebSocketAutoResponseTimestamp is produced entirely inside workerd's
+ * edge auto-responder in response to a real "tt-ping" frame, and waiting
+ * out ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS (60s) in real time is not a
+ * viable test.
+ *
+ * This works because @cloudflare/vitest-pool-workers runs this test file
+ * inside the same workerd isolate as the worker under test (see
+ * runInDurableObject's own direct-private-method-call pattern elsewhere in
+ * this file) - `GameRoomDurableObject` imported here is the exact class
+ * object whose instances handle real `stub.fetch()`/alarm() calls, not a
+ * separate copy, so patching its prototype here is visible to those calls.
+ */
+async function withPatchedAutoResponseTimestamp<T>(
+  timestampFor: (ws: WebSocket) => Date | null,
+  run: () => Promise<T>
+): Promise<T> {
+  const proto = GameRoomDurableObject.prototype as unknown as {
+    readSocketAutoResponseTimestamp: (ws: WebSocket) => Date | null;
+  };
+  const original = proto.readSocketAutoResponseTimestamp;
+
+  proto.readSocketAutoResponseTimestamp = timestampFor;
+
+  try {
+    return await run();
+  } finally {
+    proto.readSocketAutoResponseTimestamp = original;
+  }
+}
+
+function socketAttachmentRole(ws: WebSocket): "host" | "guest" | null {
+  const attachment = ws.deserializeAttachment() as { role?: unknown } | null;
+
+  return attachment?.role === "host" || attachment?.role === "guest"
+    ? attachment.role
+    : null;
 }
 
 /**
@@ -3938,6 +4199,27 @@ async function waitForRoomPresence(
   }
 
   throw new Error("Timed out waiting for room presence.");
+}
+
+/**
+ * Closes a room socket and waits for the DO's live-socket-derived presence
+ * to actually reflect it being gone, rather than just the client-side close
+ * event. F-08's liveness sweep folds a deadline computed from
+ * ctx.getWebSockets() into the single alarm slot (see
+ * nextLivenessSweepDeadline/scheduleNextAlarm in src/worker/index.ts), so
+ * any test asserting an exact storedRoomAlarm() value must first be sure a
+ * socket it opened earlier is no longer counted - a bare `.close()` starts
+ * the closing handshake but does not synchronously guarantee
+ * ctx.getWebSockets() has already dropped it.
+ */
+async function closeSocketAndWaitOffline(
+  stub: GameRoomStub,
+  socket: WebSocket,
+  hostToken: RoomCapabilityToken,
+  players: PresencePlayers
+): Promise<void> {
+  socket.close();
+  await waitForRoomPresence(stub, hostToken, players);
 }
 
 function delay(ms: number): Promise<void> {
