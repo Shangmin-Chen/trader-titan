@@ -283,7 +283,7 @@ describe("game reducer", () => {
     expect("true_value" in settling.item).toBe(false);
   });
 
-  it("returns to side choice without revealing true value after failed settlement, with a fresh turn deadline", () => {
+  it("returns to side choice without revealing true value after failed settlement, with a fresh turn deadline, locking the pending trade forward", () => {
     const choosing = readyForSideChoice({ bid: 200, ask: 400 });
     const settling = executeTrade(choosing, "BUY");
     const failed = gameReducer(settling, {
@@ -304,6 +304,159 @@ describe("game reducer", () => {
     expect("pendingSide" in failed).toBe(false);
     expect(failed.lastError).toBe("Settlement failed.");
     expect(failed.turnDeadlineMs).toBe(999);
+    // The regression this branch exists to prevent: the pendingTrade that
+    // was already in flight (a trader's own EXECUTE_TRADE choice, here) must
+    // not be silently discarded on a settlement bounce-back - see
+    // lockedPendingTrade's doc comment on ChoosingSideGameState.
+    expect(failed.lockedPendingTrade).toEqual({ kind: "chosen", side: "BUY" });
+  });
+
+  describe("SETTLEMENT_FAILED locks the pending trade decision against re-choice (C1 regression)", () => {
+    it("carries an F-06 timeoutForcedWorstSide decision forward as a locked marker rather than dropping it", () => {
+      // trueValue 3600, quote 3600/3800: BUY is the worse side for the
+      // trader (buyPnL -200 < sellPnL 0) - see the identical fixture in the
+      // "settles a choosingSide timeout against BUY..." F-06 tests below.
+      const choosing = readyForSideChoice({ bid: 3600, ask: 3800 });
+      const settling = expireTurn(choosing);
+
+      expect(settling.phase).toBe("settling");
+
+      if (settling.phase !== "settling") {
+        throw new Error("Expected settling state.");
+      }
+
+      expect(settling.pendingTrade).toEqual({ kind: "timeoutForcedWorstSide" });
+
+      const failed = gameReducer(settling, {
+        type: "SETTLEMENT_FAILED",
+        error: "Settlement failed.",
+        turnDeadlineMs: 999,
+      });
+
+      expect(failed.phase).toBe("choosingSide");
+
+      if (failed.phase !== "choosingSide") {
+        throw new Error("Expected side choice state.");
+      }
+
+      expect(failed.lockedPendingTrade).toEqual({ kind: "timeoutForcedWorstSide" });
+    });
+
+    it("BUG this pins: EXECUTE_TRADE on a locked choosingSide ignores the requested side and re-enters settling with the locked decision instead", () => {
+      // The exploit a86745a closed: a trader whose clock expiry forced BUY
+      // (the worse side for them) must not be able to escape it by
+      // re-choosing SELL just because settlement happened to fail once and
+      // bounce the round back through choosingSide.
+      const choosing = readyForSideChoice({ bid: 3600, ask: 3800 });
+      const timedOut = expireTurn(choosing);
+      const failed = gameReducer(timedOut, {
+        type: "SETTLEMENT_FAILED",
+        error: "Settlement failed.",
+        turnDeadlineMs: 999,
+      });
+
+      expect(failed.phase).toBe("choosingSide");
+
+      if (failed.phase !== "choosingSide") {
+        throw new Error("Expected side choice state.");
+      }
+
+      expect(failed.lockedPendingTrade).toEqual({ kind: "timeoutForcedWorstSide" });
+
+      // The trader (or their client) tries to claw back the better side.
+      const retried = executeTrade(failed, "SELL");
+
+      expect(retried.phase).toBe("settling");
+
+      if (retried.phase !== "settling") {
+        throw new Error("Expected settling state.");
+      }
+
+      // Must still be the locked, forced decision - NOT { kind: "chosen",
+      // side: "SELL" }. Reverting SETTLEMENT_FAILED to drop the locked
+      // marker (the pre-fix behavior) makes this assertion fail: the
+      // resulting pendingTrade would be the trader's freely re-chosen SELL.
+      expect(retried.pendingTrade).toEqual({ kind: "timeoutForcedWorstSide" });
+
+      const { item: revealedItem, settlement } = serverSettlement(retried, 3600);
+      const settled = receiveSettlement(retried, revealedItem, settlement);
+
+      expect(settled.phase).toBe("settlement");
+
+      if (settled.phase !== "settlement") {
+        throw new Error("Expected settlement state.");
+      }
+
+      // BUY is still the side actually settled against, exactly as F-06
+      // requires - not the SELL the trader tried to re-choose.
+      expect(settled.settlement.side).toBe("BUY");
+      expect(settled.settlement.traderPnL).toBe(-200);
+      expect(settled.settlement.forcedByTimeout).toBe(true);
+    });
+
+    it("also locks a trader's own 'chosen' decision: a re-EXECUTE_TRADE with a different side does not override it", () => {
+      const choosing = readyForSideChoice({ bid: 200, ask: 400 });
+      const settling = executeTrade(choosing, "BUY");
+      const failed = gameReducer(settling, {
+        type: "SETTLEMENT_FAILED",
+        error: "Settlement failed.",
+        turnDeadlineMs: 999,
+      });
+
+      expect(failed.phase).toBe("choosingSide");
+
+      if (failed.phase !== "choosingSide") {
+        throw new Error("Expected side choice state.");
+      }
+
+      const retried = executeTrade(failed, "SELL");
+
+      expect(retried.phase).toBe("settling");
+
+      if (retried.phase !== "settling") {
+        throw new Error("Expected settling state.");
+      }
+
+      expect(retried.pendingTrade).toEqual({ kind: "chosen", side: "BUY" });
+    });
+
+    it("TURN_EXPIRED on a locked choosingSide re-enters settling with the same locked decision rather than resetting it", () => {
+      const choosing = readyForSideChoice({ bid: 200, ask: 400 });
+      const settling = executeTrade(choosing, "BUY");
+      const failed = gameReducer(settling, {
+        type: "SETTLEMENT_FAILED",
+        error: "Settlement failed.",
+        turnDeadlineMs: 999,
+      });
+
+      expect(failed.phase).toBe("choosingSide");
+
+      if (failed.phase !== "choosingSide") {
+        throw new Error("Expected side choice state.");
+      }
+
+      // The trader does nothing this time and the clock (now measuring
+      // time until an automatic retry, not a live choice) runs out again.
+      const reExpired = expireTurn(failed);
+
+      expect(reExpired.phase).toBe("settling");
+
+      if (reExpired.phase !== "settling") {
+        throw new Error("Expected settling state.");
+      }
+
+      // Must stay the trader's own locked "chosen" BUY, not get reset to
+      // the generic "timeoutForcedWorstSide" sentinel a plain (unlocked)
+      // choosingSide expiry would produce.
+      expect(reExpired.pendingTrade).toEqual({ kind: "chosen", side: "BUY" });
+    });
+
+    it("a plain (unlocked) choosingSide has no lockedPendingTrade field at all", () => {
+      const choosing = readyForSideChoice({ bid: 200, ask: 400 });
+
+      expect(choosing.phase).toBe("choosingSide");
+      expect("lockedPendingTrade" in choosing).toBe(false);
+    });
   });
 
   it("retries item generation errors without dropping round context or log history", () => {

@@ -1555,6 +1555,61 @@ function RoomGameView({
     const waitingForName = !isYourTurn
       ? game.players[game.roles.trader].name
       : undefined;
+    const traderName = game.players[game.roles.trader].name;
+
+    // F-02/F-06: a settlement failure bounced this round back out of
+    // `settling` with a pendingTrade already locked in (see
+    // lockedPendingTrade's doc comment). Buy/Sell must not be shown as a
+    // live choice here - whichever button is clicked, the server ignores
+    // it and retries the same already-decided side, so presenting them as
+    // meaningfully different would be dishonest.
+    if (game.lockedPendingTrade) {
+      const lockedTrade = game.lockedPendingTrade;
+
+      return (
+        <>
+          {stepper}
+          <TurnBanner isYourTurn={isYourTurn} waitingForName={waitingForName} />
+          <TurnCountdown turnDeadlineMs={game.turnDeadlineMs} />
+          <div className="play-stack">
+            <ItemPanel item={game.item} />
+            <section className="phase-panel" data-testid="settlement-retry-panel">
+              <p className="eyebrow">Settlement failed</p>
+              <h2>Retrying {traderName}&rsquo;s trade</h2>
+              <p
+                className="settlement-panel__forced-note"
+                data-testid="settlement-locked-note"
+              >
+                {lockedTrade.kind === "chosen"
+                  ? `${traderName}'s trade already went through, but settling it failed. `
+                  : `${traderName}'s clock ran out before choosing a side, and settling the forced side failed. `}
+                The decision is locked in - retrying will not let {traderName}{" "}
+                choose a different side, and the clock will retry
+                automatically if it runs out again.
+              </p>
+              <div className="room-actions">
+                {/* The side argument is a placeholder: the reducer ignores
+                    it entirely while lockedPendingTrade is set and re-uses
+                    the locked decision instead (see EXECUTE_TRADE in
+                    reducer.ts), so this button just triggers a retry
+                    attempt rather than making any real choice. */}
+                <button
+                  className="secondary-button"
+                  disabled={
+                    isCommandPending("EXECUTE_TRADE") || actor !== game.roles.trader
+                  }
+                  onClick={() => onExecuteTrade("BUY")}
+                  type="button"
+                >
+                  Retry settlement
+                </button>
+              </div>
+              <LastError game={game} />
+            </section>
+          </div>
+        </>
+      );
+    }
 
     return (
       <>

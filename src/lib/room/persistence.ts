@@ -266,11 +266,20 @@ function decodeGameState(value: unknown): GameState | null {
         ? value as GameState
         : null;
     case "choosingSide":
-      return hasOnlyKeys(value, [...baseGameKeysFor(value), "item", "spreadWidth", "quote", "turnDeadlineMs"]) &&
+      return hasOnlyKeys(value, [
+        ...baseGameKeysFor(value),
+        "item",
+        "spreadWidth",
+        "quote",
+        "turnDeadlineMs",
+        ...(value.lockedPendingTrade === undefined ? [] : ["lockedPendingTrade"]),
+      ]) &&
         isGeneratedItem(value.item) &&
         isValidSpreadWidth(value.spreadWidth) &&
         isQuoteForWidth(value.quote, value.spreadWidth) &&
         isUnixTimeMs(value.turnDeadlineMs) &&
+        (value.lockedPendingTrade === undefined ||
+          isPendingTradeDecision(value.lockedPendingTrade)) &&
         isActiveRoundNumber(value)
         ? value as GameState
         : null;

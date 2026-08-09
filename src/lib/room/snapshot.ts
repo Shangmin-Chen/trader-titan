@@ -251,6 +251,13 @@ export function toPublicGameState(game: GameState): PublicRoomGameState {
           ask: game.quote.ask,
         },
         turnDeadlineMs: game.turnDeadlineMs,
+        // F-06/F-02: forwarded as-is (never derived from private data) so
+        // the client can tell a locked, retry-only choosingSide apart from
+        // a live one and render Buy/Sell honestly - see lockedPendingTrade's
+        // doc comment on ChoosingSideGameState.
+        ...(game.lockedPendingTrade === undefined
+          ? {}
+          : { lockedPendingTrade: game.lockedPendingTrade }),
       };
     case "roundForfeited":
       return {

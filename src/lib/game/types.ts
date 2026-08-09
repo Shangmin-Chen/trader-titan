@@ -221,6 +221,28 @@ export type ChoosingSideGameState = GameStateBase & {
   spreadWidth: number;
   quote: Quote;
   turnDeadlineMs: UnixTimeMs;
+  /**
+   * Set only when this choosingSide state was re-entered via SETTLEMENT_FAILED
+   * bouncing back out of `settling` (private item missing/corrupt, or F-02's
+   * forceFailStuckSettlement exhaustion fallback) - never by a normal
+   * SUBMIT_MARKET_QUOTE transition into a fresh choice. Carries forward
+   * whichever PendingTradeDecision was already in flight when settlement
+   * failed - a trader's own EXECUTE_TRADE choice, or an F-06
+   * timeoutForcedWorstSide - so it isn't silently discarded.
+   *
+   * When present, the decision is locked: EXECUTE_TRADE's requested side is
+   * ignored and settling is re-entered with this same decision instead (see
+   * the EXECUTE_TRADE and TURN_EXPIRED cases in reducer.ts). Without this,
+   * a trader who deliberately stalled choosingSide's clock to force a
+   * worst-side settlement (F-06) could get a second, unlocked roll of the
+   * dice for free any time settlement happened to fail - reopening exactly
+   * the exploit F-06 closed. The clock still runs and can still expire
+   * normally; while locked it measures time until the decision is retried
+   * automatically, not a live choice, and the UI must not present Buy/Sell
+   * as though clicking either one matters (see RoomGameView in
+   * src/app/page.tsx).
+   */
+  lockedPendingTrade?: PendingTradeDecision;
 };
 
 export type SettlingGameState = GameStateBase & {

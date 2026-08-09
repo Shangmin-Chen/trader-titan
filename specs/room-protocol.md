@@ -15,6 +15,7 @@ The room protocol is the boundary between client transports and the pure room do
 - Pre-settlement public item snapshots expose only `round_id`, `item_title`, `category`, and `context_clue`; they must redact `true_value`, `scraped_items`, and `amazon_url` even if those fields are present on an internal object.
 - Post-settlement public item snapshots expose `true_value` and may expose Amazon `scraped_items` and `amazon_url` when those fields are present on the settled generated item.
 - Public room snapshots expose `turnDeadlineMs` on the `proposingWidth`, `negotiatingWidth`, `configuringMarket`, and `choosingSide` game phases: an absolute, server-stamped Unix millisecond deadline for the F-05 turn shot clock, never a client-computed or remaining-seconds value.
+- A `choosingSide` snapshot may additionally carry `lockedPendingTrade` (see F-06's settlement-failure bounce-back in room-domain.md) when this `choosingSide` was re-entered after `SETTLEMENT_FAILED` rather than reached normally. It is forwarded from internal state as-is, never derived from private data. Clients must treat its presence as "the decision is locked - do not present Buy/Sell as a live choice", not merely as extra display data.
 
 ## Presence
 
@@ -53,7 +54,7 @@ The room protocol is the boundary between client transports and the pure room do
 - `ITEM_RECEIVED`: generated public item.
 - `ITEM_FAILED`: safe error message.
 - `SETTLEMENT_RECEIVED`: settled private item. No caller-provided settlement is accepted.
-- `SETTLEMENT_FAILED`: safe error message.
+- `SETTLEMENT_FAILED`: safe error message. Moves `settling` back to `choosingSide` with a fresh `turnDeadlineMs`, carrying the pending trade decision that failed to settle forward as `lockedPendingTrade` (see F-06's settlement-failure bounce-back in room-domain.md) rather than discarding it - this applies to a trader's own `chosen` decision exactly as it does to an F-06 `timeoutForcedWorstSide` one.
 - `TURN_EXPIRED`: F-05 turn shot-clock expiry. Carries no caller-supplied data beyond the server's own timestamp. For `proposingWidth`, `negotiatingWidth`, and `configuringMarket`, the room command layer derives who forfeits, who is awarded, and the penalty entirely from the room's own current state (active role for the phase, and the spread width in play, or a named fallback constant in `proposingWidth` where no width has been proposed yet). For `choosingSide`, F-06 instead moves the room to `settling` with an unresolved `pendingTrade` (`{ kind: "timeoutForcedWorstSide" }`) - see room-domain.md - rather than forfeiting, since the trader has already seen a quote by that point. Valid only while the room is in `proposingWidth`, `negotiatingWidth`, `configuringMarket`, or `choosingSide`; rejected with `invalid_game_phase` everywhere else. Dispatched only by the Worker's Durable Object alarm when a stamped `turnDeadlineMs` elapses - never accepted from a client. Like every other successful mutation, committing `TURN_EXPIRED` (and any settlement effect it triggers via F-06) broadcasts a public snapshot - alarm-driven mutations are not a client request/response a caller is waiting on, so without an explicit broadcast a connected client would never learn a genuinely expired clock, an auto-resumed settlement, or the exhausted-retries fallback happened until its own next unrelated command.
 
 ## Transport Notes
