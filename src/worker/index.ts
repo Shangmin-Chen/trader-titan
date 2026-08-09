@@ -114,7 +114,7 @@ const ROOM_SOCKET_PONG_MESSAGE = "tt-pong";
  * passed with no signal at all, which a live, hibernation-auto-responding
  * TCP connection should never do.
  */
-const ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS = DEFAULT_ROOM_SOCKET_HEARTBEAT.intervalMs * 3;
+export const ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS = DEFAULT_ROOM_SOCKET_HEARTBEAT.intervalMs * 3;
 /**
  * Close code the server's own liveness sweep uses when it, rather than the
  * client, decides a socket is dead. Deliberately not 1000 or 1008 - both
@@ -128,7 +128,7 @@ const ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS = DEFAULT_ROOM_SOCKET_HEARTBEAT.in
  * sweep) decided the connection was dead; both land on the same retryable
  * side of isRetryableRoomSocketCloseCode.
  */
-const ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE = 4001;
+export const ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE = 4001;
 const HTTP_SWITCHING_PROTOCOLS_STATUS = 101;
 const ROOM_ID_GENERATION_ATTEMPTS = 3;
 const TOKEN_SECRET_BYTE_LENGTH = 32;
@@ -278,8 +278,18 @@ type RoomSocketAttachment = Readonly<{
    * first edge auto-response recorded - getWebSocketAutoResponseTimestamp
    * returns null until then. Not presence: presence stays derived solely
    * from ctx.getWebSockets() membership and is never persisted.
+   *
+   * Optional deliberately: a socket accepted by pre-deploy code before this
+   * field existed hibernates with an attachment that lacks it, and that
+   * attachment keeps arriving at parseRoomSocketAttachment for the lifetime
+   * of the socket - hibernation does not re-run acceptRoomSocket. Every
+   * attachment-consuming path other than socketLastSeenMs (snapshot
+   * eligibility, presence, the per-seat eviction match) never looked at this
+   * field at all, so treating it as required there would only have made a
+   * liveness-only concern reject the whole attachment. See socketLastSeenMs
+   * for how a missing value is treated for liveness purposes.
    */
-  acceptedAtMs: UnixTimeMs;
+  acceptedAtMs?: UnixTimeMs;
 }>;
 
 type RoomSocketError = RoomHttpError | RoomDomainError | RoomProtocolDecodeError;
@@ -833,7 +843,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         // would have reported that above), and no pending effect is due
         // yet, so this tick is a no-op besides keeping the single alarm
         // slot pointed at whichever deadline is now soonest.
-        await this.scheduleNextAlarm(transaction, loaded.room, pendingEffect);
+        await this.scheduleNextAlarm(transaction, loaded.room, pendingEffect, nowMs);
         return null;
       }
 
@@ -903,7 +913,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         }
 
         await writePendingRoomEffect(transaction, null);
-        await this.scheduleNextAlarm(transaction, loaded.room, null);
+        await this.scheduleNextAlarm(transaction, loaded.room, null, nowMs);
       });
       return;
     }
@@ -934,7 +944,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         loaded.room.game.item.round_id !== pendingEffect.roundId
       ) {
         await writePendingRoomEffect(transaction, null);
-        await this.scheduleNextAlarm(transaction, loaded.room, null);
+        await this.scheduleNextAlarm(transaction, loaded.room, null, nowMs);
         return false;
       }
 
@@ -943,7 +953,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       // alarm wake rather than retrying forever.
       const bumped = nextSettlePendingEffectAttempt(pendingEffect, nowMs);
       await writePendingRoomEffect(transaction, bumped);
-      await this.scheduleNextAlarm(transaction, loaded.room, bumped);
+      await this.scheduleNextAlarm(transaction, loaded.room, bumped, nowMs);
       return true;
     });
 
@@ -988,7 +998,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         loaded.room.game.item.round_id !== roundId
       ) {
         await writePendingRoomEffect(transaction, null);
-        await this.scheduleNextAlarm(transaction, loaded.room, null);
+        await this.scheduleNextAlarm(transaction, loaded.room, null, nowMs);
         return;
       }
 
@@ -1008,7 +1018,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         // alarm against the room's TTL deadline so it isn't silently
         // dropped - the marker itself is no longer trustworthy either way.
         await writePendingRoomEffect(transaction, null);
-        await this.scheduleNextAlarm(transaction, loaded.room, null);
+        await this.scheduleNextAlarm(transaction, loaded.room, null, nowMs);
         return;
       }
 
@@ -1704,7 +1714,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         continue;
       }
 
-      const lastSeenMs = this.socketLastSeenMs(socket, attachment);
+      const lastSeenMs = this.socketLastSeenMs(socket, attachment, nowMs);
 
       if (nowMs - lastSeenMs >= ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS) {
         closeStaleRoomSocket(socket);
@@ -1723,7 +1733,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
    * new socket connects - this is how an idle (fully vacant) room settles
    * back to quiescence instead of re-arming a liveness check forever.
    */
-  private nextLivenessSweepDeadline(): UnixTimeMs | null {
+  private nextLivenessSweepDeadline(nowMs: UnixTimeMs): UnixTimeMs | null {
     let earliest: UnixTimeMs | null = null;
 
     for (const socket of this.ctx.getWebSockets()) {
@@ -1733,7 +1743,8 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         continue;
       }
 
-      const deadline = this.socketLastSeenMs(socket, attachment) + ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS;
+      const deadline =
+        this.socketLastSeenMs(socket, attachment, nowMs) + ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS;
 
       if (earliest === null || deadline < earliest) {
         earliest = deadline;
@@ -1749,10 +1760,29 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
    * acceptance time (getWebSocketAutoResponseTimestamp returns `null` until
    * the first "tt-ping" has been auto-answered for this specific socket,
    * which for a freshly-connected client can legitimately be true for up to
-   * one ping interval).
+   * one ping interval), otherwise `nowMs`.
+   *
+   * The third fallback is the compatibility case: a socket accepted by
+   * pre-deploy code has no `acceptedAtMs` on its attachment at all (see
+   * RoomSocketAttachment). Reading such a socket as "last seen right now"
+   * rather than treating the missing field as an error means a legacy
+   * socket is never force-closed by the liveness sweep on the strength of
+   * something else in the room merely broadcasting - it gets a full fresh
+   * threshold window from whichever moment this is first evaluated, and
+   * from then on is indistinguishable from any other socket for liveness
+   * purposes (its next real auto-response, or an actual period of silence,
+   * takes over).
    */
-  private socketLastSeenMs(socket: WebSocket, attachment: RoomSocketAttachment): UnixTimeMs {
-    return this.readSocketAutoResponseTimestamp(socket)?.getTime() ?? attachment.acceptedAtMs;
+  private socketLastSeenMs(
+    socket: WebSocket,
+    attachment: RoomSocketAttachment,
+    nowMs: UnixTimeMs
+  ): UnixTimeMs {
+    return (
+      this.readSocketAutoResponseTimestamp(socket)?.getTime() ??
+      attachment.acceptedAtMs ??
+      nowMs
+    );
   }
 
   /**
@@ -1790,7 +1820,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
     );
 
     await this.ctx.storage.transaction(async (transaction) => {
-      await this.scheduleNextAlarm(transaction, loaded.room, pendingEffect);
+      await this.scheduleNextAlarm(transaction, loaded.room, pendingEffect, nowMs);
     });
   }
 
@@ -1809,7 +1839,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
   ): Promise<void> {
     await transaction.put(ROOM_STORAGE_KEY, persistenceEnvelopeForStorage(room, nowMs));
     await writePendingRoomEffect(transaction, pendingEffect);
-    await this.scheduleNextAlarm(transaction, room, pendingEffect);
+    await this.scheduleNextAlarm(transaction, room, pendingEffect, nowMs);
   }
 
   /**
@@ -1831,7 +1861,8 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
   private async scheduleNextAlarm(
     transaction: DurableObjectTransaction,
     room: RoomState,
-    pendingEffect: PendingRoomEffect | null
+    pendingEffect: PendingRoomEffect | null,
+    nowMs: UnixTimeMs
   ): Promise<void> {
     const deadlines: UnixTimeMs[] = [roomExpiresAtMs(room)];
 
@@ -1839,7 +1870,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       deadlines.push(pendingEffect.notBeforeMs);
     }
 
-    const livenessDeadline = this.nextLivenessSweepDeadline();
+    const livenessDeadline = this.nextLivenessSweepDeadline(nowMs);
 
     if (livenessDeadline !== null) {
       deadlines.push(livenessDeadline);
@@ -2355,11 +2386,19 @@ function parseRoomSocketAttachment(value: unknown): RoomSocketAttachment | null 
   const roomId = parseRoomId(value.roomId);
   const tokenHash = parseTokenHash(value.tokenHash);
 
+  // acceptedAtMs is intentionally NOT validated as required here: a socket
+  // accepted by pre-deploy code hibernates with an attachment that has no
+  // acceptedAtMs at all, and that attachment must keep parsing successfully
+  // for every path below (snapshot eligibility, presence, seat eviction) -
+  // none of which read this field. Only socketLastSeenMs cares about it, and
+  // it already treats a missing value as "unknown, not stale". A present but
+  // malformed value (wrong type, negative, non-finite) still fails parsing,
+  // exactly like a malformed roomId/tokenHash/role would.
   if (
     !roomId.ok ||
     !tokenHash.ok ||
     (value.role !== "host" && value.role !== "guest") ||
-    !isFiniteNonNegativeNumber(value.acceptedAtMs)
+    (value.acceptedAtMs !== undefined && !isFiniteNonNegativeNumber(value.acceptedAtMs))
   ) {
     return null;
   }
@@ -2369,7 +2408,7 @@ function parseRoomSocketAttachment(value: unknown): RoomSocketAttachment | null 
     roomId: roomId.roomId,
     role: value.role,
     tokenHash: tokenHash.tokenHash,
-    acceptedAtMs: value.acceptedAtMs
+    ...(value.acceptedAtMs !== undefined ? { acceptedAtMs: value.acceptedAtMs } : {})
   };
 }
 
