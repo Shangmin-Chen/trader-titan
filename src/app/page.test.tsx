@@ -536,6 +536,40 @@ describe("per-command pending state (F-06)", () => {
     },
   } satisfies PublicRoomSnapshot;
 
+  // Same room, one phase earlier: the trade is locked in but not yet
+  // revealed/scored. This is the exact window `settlingRoundFailure` in
+  // src/lib/room/commands.ts guards server-side, and the one `canAbortRound`
+  // is meant to mirror client-side.
+  const SETTLING_SNAPSHOT = {
+    ...BASE_SNAPSHOT,
+    lifecycle: "active",
+    presence: {
+      players: { A: true, B: true },
+    },
+    game: {
+      mode: "Chaos Quant",
+      players: {
+        A: { id: "A", name: "Ada" },
+        B: { id: "B", name: "Grace" },
+      },
+      scores: { A: 5, B: -5 },
+      roles: { marketMaker: "A", trader: "B" },
+      roundNumber: 1,
+      totalRounds: 3,
+      log: [],
+      phase: "settling",
+      spreadWidth: 4,
+      quote: { bid: 10, ask: 14 },
+      pendingSide: "BUY",
+      item: {
+        item_title: "Widget",
+        category: "Test",
+        context_clue: "A useful test item.",
+        round_id: "round-1",
+      },
+    },
+  } satisfies PublicRoomSnapshot;
+
   // Minimal EventTarget-based stand-in for the real WebSocket the socket
   // effect opens — the tests below never need it to emit anything.
   class FakeRoomSocket extends EventTarget {
@@ -582,6 +616,34 @@ describe("per-command pending state (F-06)", () => {
     render(<Home />);
     return screen.findByTestId("settlement-panel");
   }
+
+  async function renderInSettlingPhase() {
+    vi.mocked(accessRoom).mockResolvedValue({
+      ok: true,
+      room: SETTLING_SNAPSHOT,
+    });
+    render(<Home />);
+    return screen.findByTestId("settling-panel");
+  }
+
+  it("disables both reset lobby and kick guest while a trade is settling", async () => {
+    // Mirrors the server-side guard: settlingRoundFailure in
+    // src/lib/room/commands.ts rejects RESET_TO_LOBBY/KICK_GUEST only in
+    // this exact phase, because the trade's outcome is fixed but not yet
+    // revealed or scored - a host could otherwise nuke the room before the
+    // guest ever learns what would have happened. canAbortRound is the pure
+    // predicate meant to keep the client's buttons in sync with that guard;
+    // this test checks the actual rendered DOM, not just the predicate, so a
+    // regression that unwires only one of the two buttons (or forgets to
+    // wire canAbortRound into a button at all) cannot ship silently.
+    await renderInSettlingPhase();
+
+    const resetButton = screen.getByRole("button", { name: /reset lobby/i });
+    const kickButton = screen.getByRole("button", { name: /kick guest/i });
+
+    expect(resetButton).toBeDisabled();
+    expect(kickButton).toBeDisabled();
+  });
 
   it("does not let a hung command disable unrelated controls", async () => {
     // ADVANCE_ROUND hangs forever (simulating F-06's unresponsive
