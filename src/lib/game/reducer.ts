@@ -20,7 +20,12 @@ import type {
   TradeSide,
   UnixTimeMs,
 } from "./types";
-import { GAME_MODES, MAX_ROUNDS, PROPOSING_WIDTH_FORFEIT_PENALTY } from "./types";
+import {
+  GAME_MODES,
+  MAX_ROUNDS,
+  PROPOSING_WIDTH_FORFEIT_PENALTY,
+  SETTLEMENT_FAILURE_EPISODE_CAP,
+} from "./types";
 import {
   validateQuoteForWidth,
   validateSpreadWidth,
@@ -222,6 +227,12 @@ function settlingStateFromChoosingSideTimeout(
     spreadWidth: state.spreadWidth,
     quote: state.quote,
     pendingTrade,
+    // F-07: inherited unchanged - a plain (unlocked) choosingSide has no
+    // prior failures for this round, and a locked one carries its own count
+    // forward exactly like it carries lockedPendingTrade forward. Entering
+    // (or re-entering) `settling` is not itself a failure - only
+    // SETTLEMENT_FAILED increments this.
+    settlementFailureCount: state.settlementFailureCount ?? 0,
     lastError: undefined,
   };
 }
@@ -518,6 +529,10 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         spreadWidth: state.spreadWidth,
         quote: state.quote,
         pendingTrade,
+        // F-07: see the identical field on settlingStateFromChoosingSideTimeout -
+        // inherited unchanged, since choosing to trade (or retry a locked
+        // trade) is not itself a settlement failure.
+        settlementFailureCount: state.settlementFailureCount ?? 0,
         lastError: undefined,
       };
 
@@ -569,6 +584,51 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         return state;
       }
 
+      const failureCount = state.settlementFailureCount + 1;
+
+      // F-07: a persistent (non-transient) failure cause must not bounce
+      // choosingSide <-> settling forever - see SETTLEMENT_FAILURE_EPISODE_CAP.
+      // Route to the same terminal `error` phase ITEM_FAILED already uses
+      // instead of inventing a new "stuck" phase: a permanently failed
+      // settlement has no RoundSettlement and no revealed true_value, which
+      // is exactly the shape `error` already has (see ErrorGameState) and
+      // `settlement`/`roundForfeited` do not. `previousPhase: "settling"`
+      // (rather than "generatingItem") is what keeps
+      // canRetryItemGeneration in src/app/page.tsx from offering a
+      // misleading "Retry generation" button here - the host's only path
+      // forward is RESET_TO_LOBBY, already wired for every `error` state
+      // regardless of previousPhase.
+      if (failureCount >= SETTLEMENT_FAILURE_EPISODE_CAP) {
+        const nextState: GameState = {
+          phase: "error",
+          mode: state.mode,
+          ...(state.customAmazonQuery === undefined
+            ? {}
+            : { customAmazonQuery: state.customAmazonQuery }),
+          ...(state.aiGenerated === undefined
+            ? {}
+            : { aiGenerated: state.aiGenerated }),
+          players: state.players,
+          scores: state.scores,
+          roles: state.roles,
+          roundNumber: state.roundNumber,
+          totalRounds: state.totalRounds,
+          log: state.log,
+          error: action.error,
+          previousPhase: "settling",
+          lastError: action.error,
+        };
+
+        return {
+          ...nextState,
+          log: addLog(
+            nextState,
+            "error",
+            `Settlement failed ${failureCount} times in a row for this round and will not be retried automatically again: ${action.error}`,
+          ),
+        };
+      }
+
       // Carry the pendingTrade that was already in flight forward as a
       // lockedPendingTrade instead of discarding it: without this, a
       // trader whose choosingSide clock expired (F-06's
@@ -598,6 +658,9 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         quote: state.quote,
         turnDeadlineMs: action.turnDeadlineMs,
         lockedPendingTrade: state.pendingTrade,
+        // F-07: this episode's failure, counted. See
+        // SETTLEMENT_FAILURE_EPISODE_CAP.
+        settlementFailureCount: failureCount,
         lastError: action.error,
       };
 

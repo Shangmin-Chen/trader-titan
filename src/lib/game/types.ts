@@ -43,6 +43,26 @@ export const CHOOSING_SIDE_TURN_DURATION_MS = 30_000;
 // worse for them, so stalling can never beat acting.
 export const PROPOSING_WIDTH_FORFEIT_PENALTY = 100;
 
+// F-07: bounds cross-episode SETTLEMENT_FAILED bounces (choosingSide(locked)
+// -> settling -> SETTLEMENT_FAILED -> choosingSide(locked)), i.e. how many
+// separate `settling` episodes a single round may burn through before this
+// is treated as a persistent, non-transient failure rather than a one-off
+// hiccup. This is a different axis from PENDING_SETTLE_EFFECT_MAX_ATTEMPTS
+// (src/worker/index.ts), which bounds alarm-driven retries *within* one
+// settling episode with its own exponential backoff (up to 5 attempts, up
+// to 5 minutes apart) before that episode itself bounces back to
+// choosingSide - this constant instead bounds how many times that bounce
+// itself may happen for the same round. Each episode is already fairly
+// resilient to a transient blip (network hiccup, a momentarily evicted
+// isolate) via its own attempt budget, so recovering from a genuinely
+// transient cause rarely needs more than a bounce or two; 3 total episodes
+// allows one retry beyond that margin while still keeping the worst case
+// (a structurally broken round - e.g. corrupted private item storage) to a
+// handful of bounded episodes instead of an unbounded cycle with no
+// terminal state. See settlementFailureCount on ChoosingSideGameState and
+// SettlingGameState, and the SETTLEMENT_FAILED case in reducer.ts.
+export const SETTLEMENT_FAILURE_EPISODE_CAP = 3;
+
 export type GameMode = (typeof GAME_MODES)[number];
 
 export type UnixTimeMs = number;
@@ -243,6 +263,17 @@ export type ChoosingSideGameState = GameStateBase & {
    * src/app/page.tsx).
    */
   lockedPendingTrade?: PendingTradeDecision;
+  /**
+   * How many prior `settling` episodes have already failed for this round.
+   * Always present exactly when `lockedPendingTrade` is (both set together
+   * by SETTLEMENT_FAILED, both absent on a plain SUBMIT_MARKET_QUOTE
+   * choosingSide) - see SETTLEMENT_FAILURE_EPISODE_CAP. Carried forward
+   * unchanged by EXECUTE_TRADE/TURN_EXPIRED re-entering `settling` (see
+   * SettlingGameState.settlementFailureCount); SETTLEMENT_FAILED increments
+   * it and, once it reaches the cap, routes to the terminal `error` phase
+   * instead of bouncing back here again.
+   */
+  settlementFailureCount?: number;
 };
 
 export type SettlingGameState = GameStateBase & {
@@ -251,6 +282,14 @@ export type SettlingGameState = GameStateBase & {
   spreadWidth: number;
   quote: Quote;
   pendingTrade: PendingTradeDecision;
+  /**
+   * Inherited from the choosingSide this episode entered from (0 for a
+   * fresh, never-yet-failed round - see ChoosingSideGameState's own doc
+   * comment on this field). Untouched by this episode's own outcome until
+   * SETTLEMENT_FAILED reads it to decide whether to bounce back to
+   * choosingSide again or give up - see SETTLEMENT_FAILURE_EPISODE_CAP.
+   */
+  settlementFailureCount: number;
 };
 
 export type SettlementGameState = GameStateBase & {

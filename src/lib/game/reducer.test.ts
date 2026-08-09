@@ -17,6 +17,7 @@ import {
 } from "./index";
 import {
   PROPOSING_WIDTH_FORFEIT_PENALTY,
+  SETTLEMENT_FAILURE_EPISODE_CAP,
   type GameAction,
   type GameState,
   type GeneratedItem,
@@ -78,6 +79,18 @@ function serverSettlement(
       forcedByTimeout: state.pendingTrade.kind === "timeoutForcedWorstSide",
     }),
   };
+}
+
+function toSideChoiceFromGeneratingItem(
+  state: Extract<GameState, { phase: "generatingItem" }>,
+  roundId: string,
+  quote: { bid: number; ask: number },
+): GameState {
+  const withItem = receiveItem(state, { ...item, round_id: roundId });
+  const opened = submitInitialWidth(withItem, 500);
+  const tightened = tightenWidth(opened, quote.ask - quote.bid);
+  const traded = tradeOnWidth(tightened);
+  return submitMarketQuote(traded, quote);
 }
 
 function settleTrade(
@@ -456,6 +469,210 @@ describe("game reducer", () => {
 
       expect(choosing.phase).toBe("choosingSide");
       expect("lockedPendingTrade" in choosing).toBe(false);
+    });
+  });
+
+  describe("F-07 bounds SETTLEMENT_FAILED bounces across settling episodes", () => {
+    it("starts a round's first settling episode with settlementFailureCount 0", () => {
+      const choosing = readyForSideChoice({ bid: 200, ask: 400 });
+      const settling = executeTrade(choosing, "BUY");
+
+      expect(settling.phase).toBe("settling");
+
+      if (settling.phase !== "settling") {
+        throw new Error("Expected settling state.");
+      }
+
+      expect(settling.settlementFailureCount).toBe(0);
+    });
+
+    it("increments settlementFailureCount across separate settling episodes rather than resetting each bounce", () => {
+      const choosing = readyForSideChoice({ bid: 200, ask: 400 });
+      const settlingEpisode1 = executeTrade(choosing, "BUY");
+
+      expect(settlingEpisode1.phase).toBe("settling");
+
+      if (settlingEpisode1.phase !== "settling") {
+        throw new Error("Expected settling state.");
+      }
+
+      expect(settlingEpisode1.settlementFailureCount).toBe(0);
+
+      const failedOnce = gameReducer(settlingEpisode1, {
+        type: "SETTLEMENT_FAILED",
+        error: "attempt 1 failed",
+        turnDeadlineMs: 1,
+      });
+
+      expect(failedOnce.phase).toBe("choosingSide");
+
+      if (failedOnce.phase !== "choosingSide") {
+        throw new Error("Expected side choice state.");
+      }
+
+      expect(failedOnce.settlementFailureCount).toBe(1);
+
+      // Retrying re-enters `settling` for a second episode. The count this
+      // episode starts with is the load-bearing assertion here: it must
+      // carry the 1 failure forward, not reset to a fresh 0 the way episode
+      // 1 started - a fresh-per-episode counter would never reach the cap
+      // no matter how many times the round bounces.
+      const settlingEpisode2 = executeTrade(failedOnce, "SELL");
+
+      expect(settlingEpisode2.phase).toBe("settling");
+
+      if (settlingEpisode2.phase !== "settling") {
+        throw new Error("Expected settling state.");
+      }
+
+      expect(settlingEpisode2.settlementFailureCount).toBe(1);
+
+      const failedTwice = gameReducer(settlingEpisode2, {
+        type: "SETTLEMENT_FAILED",
+        error: "attempt 2 failed",
+        turnDeadlineMs: 2,
+      });
+
+      expect(failedTwice.phase).toBe("choosingSide");
+
+      if (failedTwice.phase !== "choosingSide") {
+        throw new Error("Expected side choice state.");
+      }
+
+      expect(failedTwice.settlementFailureCount).toBe(2);
+    });
+
+    it("reaches the terminal error phase exactly at SETTLEMENT_FAILURE_EPISODE_CAP failures, not one bounce early or late", () => {
+      const choosing = readyForSideChoice({ bid: 200, ask: 400 });
+      let state: GameState = executeTrade(choosing, "BUY");
+
+      // Every failure before the cap-th must still bounce back to a locked
+      // choosingSide, carrying the count forward for the next episode.
+      for (let attempt = 1; attempt < SETTLEMENT_FAILURE_EPISODE_CAP; attempt += 1) {
+        expect(state.phase).toBe("settling");
+
+        if (state.phase !== "settling") {
+          throw new Error("Expected settling state.");
+        }
+
+        expect(state.settlementFailureCount).toBe(attempt - 1);
+
+        const failed = gameReducer(state, {
+          type: "SETTLEMENT_FAILED",
+          error: `attempt ${attempt} failed`,
+          turnDeadlineMs: attempt,
+        });
+
+        expect(failed.phase).toBe("choosingSide");
+
+        if (failed.phase !== "choosingSide") {
+          throw new Error("Expected side choice state.");
+        }
+
+        expect(failed.settlementFailureCount).toBe(attempt);
+
+        state = executeTrade(failed, "BUY");
+      }
+
+      expect(state.phase).toBe("settling");
+
+      if (state.phase !== "settling") {
+        throw new Error("Expected settling state.");
+      }
+
+      expect(state.settlementFailureCount).toBe(SETTLEMENT_FAILURE_EPISODE_CAP - 1);
+
+      // The cap-th failure - and only the cap-th - must be terminal.
+      const terminal = gameReducer(state, {
+        type: "SETTLEMENT_FAILED",
+        error: "final failure",
+        turnDeadlineMs: 999,
+      });
+
+      expect(terminal.phase).toBe("error");
+
+      if (terminal.phase !== "error") {
+        throw new Error("Expected terminal error state.");
+      }
+
+      expect(terminal.previousPhase).toBe("settling");
+      expect(terminal.error).toBe("final failure");
+      expect(terminal.lastError).toBe("final failure");
+      // A permanently failed settlement has no RoundSettlement and no
+      // revealed true_value, and cannot be turn-clocked (so no further
+      // alarm can be armed from it) - the `error` phase structurally
+      // cannot carry any of these fields.
+      expect("lockedPendingTrade" in terminal).toBe(false);
+      expect("settlementFailureCount" in terminal).toBe(false);
+      expect("turnDeadlineMs" in terminal).toBe(false);
+      expect("item" in terminal).toBe(false);
+      expect("settlement" in terminal).toBe(false);
+    });
+
+    it("a fresh round does not inherit a stale settlementFailureCount from an earlier round's bounce", () => {
+      const choosing = readyForSideChoice({ bid: 500, ask: 700 });
+      const settlingRound1 = executeTrade(choosing, "BUY");
+
+      if (settlingRound1.phase !== "settling") {
+        throw new Error("Expected settling state.");
+      }
+
+      const failedRound1 = gameReducer(settlingRound1, {
+        type: "SETTLEMENT_FAILED",
+        error: "transient",
+        turnDeadlineMs: 1,
+      });
+
+      if (failedRound1.phase !== "choosingSide") {
+        throw new Error("Expected side choice state.");
+      }
+
+      expect(failedRound1.settlementFailureCount).toBe(1);
+
+      const retriedRound1 = executeTrade(failedRound1, "BUY");
+
+      if (retriedRound1.phase !== "settling") {
+        throw new Error("Expected settling state.");
+      }
+
+      // This time settlement actually succeeds.
+      const { item: revealedItem, settlement } = serverSettlement(retriedRound1, 650);
+      const settledRound1 = receiveSettlement(retriedRound1, revealedItem, settlement);
+
+      expect(settledRound1.phase).toBe("settlement");
+      expect("settlementFailureCount" in settledRound1).toBe(false);
+
+      const generatingRound2 = nextRound(settledRound1);
+
+      expect(generatingRound2.phase).toBe("generatingItem");
+      expect(generatingRound2.roundNumber).toBe(2);
+      expect("settlementFailureCount" in generatingRound2).toBe(false);
+
+      if (generatingRound2.phase !== "generatingItem") {
+        throw new Error("Expected generatingItem state.");
+      }
+
+      const choosingRound2 = toSideChoiceFromGeneratingItem(
+        generatingRound2,
+        "round-2",
+        { bid: 500, ask: 700 },
+      );
+
+      expect(choosingRound2.phase).toBe("choosingSide");
+      expect("lockedPendingTrade" in choosingRound2).toBe(false);
+      expect("settlementFailureCount" in choosingRound2).toBe(false);
+
+      const settlingRound2 = executeTrade(choosingRound2, "BUY");
+
+      expect(settlingRound2.phase).toBe("settling");
+
+      if (settlingRound2.phase !== "settling") {
+        throw new Error("Expected settling state.");
+      }
+
+      // The key assertion: round 2's very first settling episode starts
+      // back at 0, not at round 1's leftover count of 1.
+      expect(settlingRound2.settlementFailureCount).toBe(0);
     });
   });
 
