@@ -287,7 +287,11 @@ type RoomSocketAttachment = Readonly<{
    * eligibility, presence, the per-seat eviction match) never looked at this
    * field at all, so treating it as required there would only have made a
    * liveness-only concern reject the whole attachment. See socketLastSeenMs
-   * for how a missing value is treated for liveness purposes.
+   * for how a missing value is treated for liveness purposes - including
+   * that socketLastSeenMs itself is the *other* writer of this field: for a
+   * legacy socket lacking it entirely, socketLastSeenMs memoizes a
+   * first-observed time back onto this same field via serializeAttachment
+   * the first time it is asked, rather than leaving the gap open forever.
    */
   acceptedAtMs?: UnixTimeMs;
 }>;
@@ -1760,29 +1764,50 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
    * acceptance time (getWebSocketAutoResponseTimestamp returns `null` until
    * the first "tt-ping" has been auto-answered for this specific socket,
    * which for a freshly-connected client can legitimately be true for up to
-   * one ping interval), otherwise `nowMs`.
+   * one ping interval), otherwise a *memoized* first-observed time.
    *
    * The third fallback is the compatibility case: a socket accepted by
    * pre-deploy code has no `acceptedAtMs` on its attachment at all (see
-   * RoomSocketAttachment). Reading such a socket as "last seen right now"
-   * rather than treating the missing field as an error means a legacy
-   * socket is never force-closed by the liveness sweep on the strength of
-   * something else in the room merely broadcasting - it gets a full fresh
-   * threshold window from whichever moment this is first evaluated, and
-   * from then on is indistinguishable from any other socket for liveness
-   * purposes (its next real auto-response, or an actual period of silence,
-   * takes over).
+   * RoomSocketAttachment). The first time that happens for a given socket,
+   * this writes `nowMs` back onto the attachment as `acceptedAtMs` via
+   * serializeAttachment before returning it, so the value becomes a fixed
+   * point in time rather than something recomputed as "now" on every call.
+   * Without that write-back, a socket that never completes a single
+   * ping-pong would read `nowMs - lastSeenMs === 0` on every sweep forever
+   * and could never age out. With it, a legacy socket gets exactly one full
+   * fresh threshold window from whichever moment this is first evaluated,
+   * and from then on is indistinguishable from any other socket for
+   * liveness purposes: its next real auto-response takes over (via the
+   * first branch above, which is preferred over the memoized value), or,
+   * absent one, it ages out and is swept like anything else once that
+   * window elapses.
+   *
+   * serializeAttachment always writes back the *whole* parsed attachment
+   * (spread first, `acceptedAtMs` added last) so the fields other paths
+   * depend on - `roomId`, `role`, `tokenHash` - are round-tripped unchanged;
+   * this only ever adds the missing timestamp, never touches anything else.
    */
   private socketLastSeenMs(
     socket: WebSocket,
     attachment: RoomSocketAttachment,
     nowMs: UnixTimeMs
   ): UnixTimeMs {
-    return (
-      this.readSocketAutoResponseTimestamp(socket)?.getTime() ??
-      attachment.acceptedAtMs ??
-      nowMs
-    );
+    const autoResponseMs = this.readSocketAutoResponseTimestamp(socket)?.getTime();
+
+    if (autoResponseMs !== undefined) {
+      return autoResponseMs;
+    }
+
+    if (attachment.acceptedAtMs !== undefined) {
+      return attachment.acceptedAtMs;
+    }
+
+    socket.serializeAttachment({
+      ...attachment,
+      acceptedAtMs: nowMs
+    } satisfies RoomSocketAttachment);
+
+    return nowMs;
   }
 
   /**
