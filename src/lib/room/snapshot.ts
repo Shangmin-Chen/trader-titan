@@ -9,6 +9,8 @@ import type {
   NegotiatingWidthGameState,
   Player,
   PlayerId,
+  RoundForfeit,
+  RoundForfeitedGameState,
   RoundLogEntry,
   RoundSettlement,
   Scores,
@@ -68,6 +70,7 @@ export type PublicSettledGeneratedItem = PublicGeneratedItem &
   }>;
 export type PublicSettlementGameState = Omit<SettlementGameState, "item"> &
   Readonly<{ item: PublicSettledGeneratedItem }>;
+export type PublicRoundForfeitedGameState = RoundForfeitedGameState;
 export type PublicGameOverState = GameOverState;
 export type PublicErrorGameState = ErrorGameState;
 
@@ -80,6 +83,7 @@ export type PublicRoomGameState =
   | PublicChoosingSideGameState
   | PublicSettlingGameState
   | PublicSettlementGameState
+  | PublicRoundForfeitedGameState
   | PublicGameOverState
   | PublicErrorGameState;
 
@@ -218,6 +222,7 @@ export function toPublicGameState(game: GameState): PublicRoomGameState {
         ...publicGameBase(game),
         phase: "proposingWidth",
         item: toPublicItem(game.item),
+        turnDeadlineMs: game.turnDeadlineMs,
       };
     case "negotiatingWidth":
       return {
@@ -225,6 +230,7 @@ export function toPublicGameState(game: GameState): PublicRoomGameState {
         phase: "negotiatingWidth",
         item: toPublicItem(game.item),
         spreadWidth: game.spreadWidth,
+        turnDeadlineMs: game.turnDeadlineMs,
       };
     case "configuringMarket":
       return {
@@ -232,6 +238,7 @@ export function toPublicGameState(game: GameState): PublicRoomGameState {
         phase: "configuringMarket",
         item: toPublicItem(game.item),
         spreadWidth: game.spreadWidth,
+        turnDeadlineMs: game.turnDeadlineMs,
       };
     case "choosingSide":
       return {
@@ -243,6 +250,26 @@ export function toPublicGameState(game: GameState): PublicRoomGameState {
           bid: game.quote.bid,
           ask: game.quote.ask,
         },
+        turnDeadlineMs: game.turnDeadlineMs,
+        // F-06/F-02: forwarded as-is (never derived from private data) so
+        // the client can tell a locked, retry-only choosingSide apart from
+        // a live one and render Buy/Sell honestly - see lockedPendingTrade's
+        // doc comment on ChoosingSideGameState.
+        ...(game.lockedPendingTrade === undefined
+          ? {}
+          : { lockedPendingTrade: game.lockedPendingTrade }),
+        // F-07: not privacy-sensitive (a small integer, never derived from
+        // private data) - forwarded alongside lockedPendingTrade so the
+        // client can tell how close a retrying round is to the terminal cap.
+        ...(game.settlementFailureCount === undefined
+          ? {}
+          : { settlementFailureCount: game.settlementFailureCount }),
+      };
+    case "roundForfeited":
+      return {
+        ...publicGameBase(game),
+        phase: "roundForfeited",
+        forfeit: toPublicForfeit(game.forfeit),
       };
     case "settling":
       return {
@@ -254,7 +281,8 @@ export function toPublicGameState(game: GameState): PublicRoomGameState {
           bid: game.quote.bid,
           ask: game.quote.ask,
         },
-        pendingSide: game.pendingSide,
+        pendingTrade: game.pendingTrade,
+        settlementFailureCount: game.settlementFailureCount,
       };
     default:
       return assertNever(game);
@@ -354,5 +382,17 @@ function toPublicSettlement(settlement: RoundSettlement): RoundSettlement {
     marketMaker: settlement.marketMaker,
     traderPnL: settlement.traderPnL,
     marketMakerPnL: settlement.marketMakerPnL,
+    forcedByTimeout: settlement.forcedByTimeout,
+  };
+}
+
+function toPublicForfeit(forfeit: RoundForfeit): RoundForfeit {
+  return {
+    roundNumber: forfeit.roundNumber,
+    itemTitle: forfeit.itemTitle,
+    phase: forfeit.phase,
+    forfeitedBy: forfeit.forfeitedBy,
+    awardedTo: forfeit.awardedTo,
+    penalty: forfeit.penalty,
   };
 }

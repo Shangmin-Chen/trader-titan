@@ -1,19 +1,19 @@
-import {
-  expect,
-  test,
-  type Browser,
-  type BrowserContext,
-  type Page,
-} from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
+import { createAndJoinRoom, ROOM_PHASE_TIMEOUT_MS } from "./helpers";
 
-const ROOM_PHASE_TIMEOUT_MS = 15_000;
-// The reconnect supervisor's heartbeat watchdog needs up to ~40s to notice a
-// socket that went silent without a clean close (20s ping interval, 10s pong
-// deadline, 2 missed pongs) before it force-closes the socket and the
-// backoff loop reopens it. Give assertions that depend on that full detour
-// through the watchdog (rather than an immediate transport-level close)
-// enough headroom.
-const HEARTBEAT_RECOVERY_TIMEOUT_MS = 75_000;
+// The reconnect supervisor's heartbeat watchdog needs up to
+// HEARTBEAT_WORST_CASE_DETECTION_MS (src/lib/room-socket-supervisor.ts) —
+// currently 9s (5s ping interval, 2s pong deadline, 2 missed pongs) — to
+// notice a socket that went silent without a clean close, before it
+// force-closes the socket and the backoff loop reopens it. This was tuned
+// down from a much slower 20s/10s config specifically so a disconnected
+// player can self-heal well inside even the shortest turn clock (see
+// DEAD_SOCKET_RECOVERY_BUDGET_MS and turn-clock-recovery-budget.test.ts).
+// Give assertions that depend on that full detour through the watchdog
+// (rather than an immediate transport-level close) generous headroom for
+// CI/browser overhead on top of the ~9-10s theoretical worst case, without
+// resurrecting the old 75s allowance a slow watchdog no longer needs.
+const HEARTBEAT_RECOVERY_TIMEOUT_MS = 25_000;
 
 test.describe("Cloudflare room invite flow", () => {
   test("creates an invite room, plays one round, and frees the guest slot", async ({
@@ -69,7 +69,11 @@ test.describe("Cloudflare room invite flow", () => {
     expect(inviteUrl).not.toContain("secret=");
   });
 
-  test("blocks non-final settlement advance while player B is offline and recovers on reconnect", async ({
+  // F-04: presence gating was dropped entirely (the turn shot clock now
+  // handles an absent opponent instead), so a disconnected Player B no
+  // longer blocks a non-final round advance. The connection badge is now
+  // purely a cosmetic indicator.
+  test("allows non-final settlement advance while player B is offline (F-04) and the badge still reflects reconnect", async ({
     baseURL,
     browser,
   }) => {
@@ -89,8 +93,10 @@ test.describe("Cloudflare room invite flow", () => {
       "Player B: Disconnected",
       { timeout: ROOM_PHASE_TIMEOUT_MS },
     );
-    await expect(host.getByRole("button", { name: "Next round" })).toBeDisabled();
-    await expect(host.getByTestId("settlement-panel")).toContainText(
+    // The turn shot clock (not presence) now handles an absent opponent,
+    // so a non-final "Next round" stays enabled while Player B is offline.
+    await expect(host.getByRole("button", { name: "Next round" })).toBeEnabled();
+    await expect(host.getByTestId("settlement-panel")).not.toContainText(
       "Player B is disconnected",
     );
 
@@ -127,7 +133,7 @@ test.describe("Cloudflare room invite flow", () => {
     await expect(guest.getByRole("button", { name: "Propose width" })).toBeDisabled();
   });
 
-  test("keeps lobby start blocked while player B is disconnected and enables it on reconnect", async ({
+  test("allows lobby start while player B is disconnected (F-04); the badge still reflects reconnect", async ({
     baseURL,
     browser,
   }) => {
@@ -143,8 +149,9 @@ test.describe("Cloudflare room invite flow", () => {
       "Player B: Disconnected",
       { timeout: ROOM_PHASE_TIMEOUT_MS },
     );
-    await expect(host.getByRole("button", { name: "Start game" })).toBeDisabled();
-    await expect(host.getByText("Player B is disconnected")).toBeVisible();
+    // The shot clock (not presence) now handles an absent opponent, so
+    // Start stays enabled once a guest has joined the seat at all.
+    await expect(host.getByRole("button", { name: "Start game" })).toBeEnabled();
 
     await guest.goto(inviteUrl);
     await expect(guest.getByTestId("room-controls")).toBeVisible({
@@ -238,13 +245,16 @@ test.describe("Cloudflare room invite flow", () => {
     // a close frame until the client's own watchdog eventually sends one
     // (see the PR description's "Discovered, not fixed" section) — so this
     // assertion can only pass once two ping/pong cycles have gone
-    // unanswered (~40-60s) and the watchdog force-closes the socket.
+    // unanswered (~9s, HEARTBEAT_WORST_CASE_DETECTION_MS) and the watchdog
+    // force-closes the socket.
     await expect(host.getByTestId("room-controls")).toContainText(
       "Player B: Disconnected",
       { timeout: HEARTBEAT_RECOVERY_TIMEOUT_MS },
     );
-    await expect(host.getByRole("button", { name: "Next round" })).toBeDisabled();
-    await expect(host.getByTestId("settlement-panel")).toContainText(
+    // F-04: presence gating was dropped entirely, so "Next round" stays
+    // enabled through the drop - only the reconnect badge itself changes.
+    await expect(host.getByRole("button", { name: "Next round" })).toBeEnabled();
+    await expect(host.getByTestId("settlement-panel")).not.toContainText(
       "Player B is disconnected",
     );
 
@@ -318,61 +328,6 @@ test.describe("Mobile viewport and a11y smoke", () => {
     await expect(skipLink).toHaveCount(1);
   });
 });
-
-async function createAndJoinRoom(
-  browser: Browser,
-  baseURL: string | undefined,
-  options: Readonly<{
-    totalRounds?: number;
-    /**
-     * Runs right after the guest `Page` is created but before it navigates
-     * anywhere — i.e. strictly before the guest's first WebSocket connects.
-     * Lets a test install a `page.routeWebSocket()` interceptor (or similar)
-     * that must govern the *first* socket (the one carrying live gameplay),
-     * not just a later reconnect attempt.
-     */
-    beforeGuestJoin?: (guest: Page) => Promise<void>;
-  }> = {},
-): Promise<{
-  host: Page;
-  guest: Page;
-  hostContext: BrowserContext;
-  guestContext: BrowserContext;
-  inviteUrl: string;
-}> {
-  const hostContext = await browser.newContext({ baseURL });
-  const guestContext = await browser.newContext({ baseURL });
-  const host = await hostContext.newPage();
-  const guest = await guestContext.newPage();
-
-  if (options.beforeGuestJoin) {
-    await options.beforeGuestJoin(guest);
-  }
-
-  await host.goto("/");
-  await expect(host.getByTestId("create-room-form")).toBeVisible();
-  await host.getByTestId("create-room-form").getByLabel("Your name").fill("Ada");
-  await host.getByLabel("Total rounds").fill(String(options.totalRounds ?? 1));
-  await host.getByRole("button", { name: "Create invite room" }).click();
-  await expect(host.getByTestId("room-controls")).toBeVisible({
-    timeout: ROOM_PHASE_TIMEOUT_MS,
-  });
-  await expect(host.getByRole("button", { name: "Start game" })).toBeDisabled();
-
-  const inviteUrl = await host.locator("#room-invite-link").inputValue();
-
-  await guest.goto(inviteUrl);
-  await expect(guest.getByTestId("join-room-form")).toBeVisible();
-  await expect(guest.getByTestId("create-room-form")).toHaveCount(0);
-  await guest.getByTestId("join-room-form").getByLabel("Your name").fill("Grace");
-  await guest.getByRole("button", { name: "Join as player B" }).click();
-  await expect(guest.getByTestId("room-controls")).toBeVisible({
-    timeout: ROOM_PHASE_TIMEOUT_MS,
-  });
-  await expect(guest.locator("#room-invite-link")).toHaveCount(0);
-
-  return { host, guest, hostContext, guestContext, inviteUrl };
-}
 
 /**
  * Plays round 1 to settlement under the default player-entered-query flow:

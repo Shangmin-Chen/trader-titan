@@ -13,7 +13,11 @@ const players: Record<PlayerId, Player> = {
   B: { id: "B", name: "Bob" },
 };
 
-function makeSettlement(traderPnL: number, marketMakerPnL: number): RoundSettlement {
+function makeSettlement(
+  traderPnL: number,
+  marketMakerPnL: number,
+  forcedByTimeout = false,
+): RoundSettlement {
   return {
     roundNumber: 1,
     itemTitle: "Vintage Watch",
@@ -24,6 +28,7 @@ function makeSettlement(traderPnL: number, marketMakerPnL: number): RoundSettlem
     marketMaker: "B",
     traderPnL,
     marketMakerPnL,
+    forcedByTimeout,
   };
 }
 
@@ -149,5 +154,31 @@ describe("SettlementPanel", () => {
     expect(reason).toHaveAttribute("role", "status");
     expect(reason.id).not.toBe("");
     expect(btn).toHaveAttribute("aria-describedby", reason.id);
+  });
+
+  it("T29h: forcedByTimeout=true (F-06) shows the forced-settlement note naming the trader", () => {
+    render(
+      <SettlementPanel
+        players={players}
+        settlement={makeSettlement(-30, 30, true)}
+        onContinue={vi.fn()}
+      />
+    );
+
+    const note = screen.getByTestId("settlement-forced-note");
+    expect(note).toBeInTheDocument();
+    expect(note.textContent).toContain("Alice");
+  });
+
+  it("T29i: forcedByTimeout=false does not render the forced-settlement note", () => {
+    render(
+      <SettlementPanel
+        players={players}
+        settlement={makeSettlement(50, -50, false)}
+        onContinue={vi.fn()}
+      />
+    );
+
+    expect(screen.queryByTestId("settlement-forced-note")).not.toBeInTheDocument();
   });
 });

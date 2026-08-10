@@ -132,6 +132,10 @@ export type SystemRoomEvent =
       type: "SETTLEMENT_FAILED";
       error: string;
       nowMs: UnixTimeMs;
+    }>
+  | Readonly<{
+      type: "TURN_EXPIRED";
+      nowMs: UnixTimeMs;
     }>;
 
 export type ClientRoomCommand =
@@ -313,6 +317,8 @@ export function parseSystemRoomEvent(
         ? { ok: true, event: { type: type.value, error: error.value, nowMs: now.value } }
         : decodeEventFailure(error.error);
     }
+    case "TURN_EXPIRED":
+      return { ok: true, event: { type: type.value, nowMs: now.value } };
     default:
       return assertNever(type.value);
   }
@@ -565,6 +571,7 @@ function decodeSystemEventType(value: unknown): DecodeResult<SystemEventType> {
     case "ITEM_FAILED":
     case "SETTLEMENT_RECEIVED":
     case "SETTLEMENT_FAILED":
+    case "TURN_EXPIRED":
       return { ok: true, value };
     default:
       return decodeFailure("message_type_unknown", "Room system event type is not supported.", "type");

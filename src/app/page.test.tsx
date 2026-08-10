@@ -1,6 +1,7 @@
 import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { SETTLEMENT_FAILURE_EPISODE_CAP } from "../lib/game";
 import {
   parseCapabilityToken,
   parseRoomId,
@@ -18,6 +19,7 @@ import {
 } from "../lib/room-client";
 import Home, {
   applyPublicRoomSnapshotMonotonically,
+  canAbortRound,
   canRetryItemGeneration,
   parseRoomSocketMessage,
   resolveExistingRoomCreateState,
@@ -402,11 +404,35 @@ describe("item generation retry affordance", () => {
       item: { round_id: "round-1", item_title: "Item", category: "Cat", context_clue: "Clue" },
       spreadWidth: 100,
       quote: { bid: 900, ask: 1000 },
-      pendingSide: "BUY",
+      pendingTrade: { kind: "chosen", side: "BUY" },
+      settlementFailureCount: 0,
     } satisfies PublicRoomSnapshot["game"];
 
     expect(canRetryItemGeneration(settling, true)).toBe(true);
     expect(canRetryItemGeneration(settling, false)).toBe(false);
+  });
+});
+
+describe("reset/kick abort-round affordance", () => {
+  it("disables reset and kick only while a trade is settling", () => {
+    const settling = {
+      ...BASE_SNAPSHOT.game,
+      phase: "settling",
+      item: { round_id: "round-1", item_title: "Item", category: "Cat", context_clue: "Clue" },
+      spreadWidth: 100,
+      quote: { bid: 900, ask: 1000 },
+      pendingTrade: { kind: "chosen", side: "BUY" },
+      settlementFailureCount: 0,
+    } satisfies PublicRoomSnapshot["game"];
+
+    // Server-side, settlingRoundFailure in src/lib/room/commands.ts rejects
+    // RESET_TO_LOBBY/KICK_GUEST only in this exact phase - the outcome is
+    // fixed but not yet revealed or scored. This predicate must match that
+    // guard: allowed everywhere else (including no room at all), blocked
+    // only here.
+    expect(canAbortRound(settling)).toBe(false);
+    expect(canAbortRound(BASE_SNAPSHOT.game)).toBe(true);
+    expect(canAbortRound(null)).toBe(true);
   });
 });
 
@@ -509,6 +535,42 @@ describe("per-command pending state (F-06)", () => {
         marketMaker: "A",
         traderPnL: 0,
         marketMakerPnL: 0,
+        forcedByTimeout: false,
+      },
+    },
+  } satisfies PublicRoomSnapshot;
+
+  // Same room, one phase earlier: the trade is locked in but not yet
+  // revealed/scored. This is the exact window `settlingRoundFailure` in
+  // src/lib/room/commands.ts guards server-side, and the one `canAbortRound`
+  // is meant to mirror client-side.
+  const SETTLING_SNAPSHOT = {
+    ...BASE_SNAPSHOT,
+    lifecycle: "active",
+    presence: {
+      players: { A: true, B: true },
+    },
+    game: {
+      mode: "Chaos Quant",
+      players: {
+        A: { id: "A", name: "Ada" },
+        B: { id: "B", name: "Grace" },
+      },
+      scores: { A: 5, B: -5 },
+      roles: { marketMaker: "A", trader: "B" },
+      roundNumber: 1,
+      totalRounds: 3,
+      log: [],
+      phase: "settling",
+      spreadWidth: 4,
+      quote: { bid: 10, ask: 14 },
+      pendingTrade: { kind: "chosen", side: "BUY" },
+      settlementFailureCount: 0,
+      item: {
+        item_title: "Widget",
+        category: "Test",
+        context_clue: "A useful test item.",
+        round_id: "round-1",
       },
     },
   } satisfies PublicRoomSnapshot;
@@ -559,6 +621,34 @@ describe("per-command pending state (F-06)", () => {
     render(<Home />);
     return screen.findByTestId("settlement-panel");
   }
+
+  async function renderInSettlingPhase() {
+    vi.mocked(accessRoom).mockResolvedValue({
+      ok: true,
+      room: SETTLING_SNAPSHOT,
+    });
+    render(<Home />);
+    return screen.findByTestId("settling-panel");
+  }
+
+  it("disables both reset lobby and kick guest while a trade is settling", async () => {
+    // Mirrors the server-side guard: settlingRoundFailure in
+    // src/lib/room/commands.ts rejects RESET_TO_LOBBY/KICK_GUEST only in
+    // this exact phase, because the trade's outcome is fixed but not yet
+    // revealed or scored - a host could otherwise nuke the room before the
+    // guest ever learns what would have happened. canAbortRound is the pure
+    // predicate meant to keep the client's buttons in sync with that guard;
+    // this test checks the actual rendered DOM, not just the predicate, so a
+    // regression that unwires only one of the two buttons (or forgets to
+    // wire canAbortRound into a button at all) cannot ship silently.
+    await renderInSettlingPhase();
+
+    const resetButton = screen.getByRole("button", { name: /reset lobby/i });
+    const kickButton = screen.getByRole("button", { name: /kick guest/i });
+
+    expect(resetButton).toBeDisabled();
+    expect(kickButton).toBeDisabled();
+  });
 
   it("does not let a hung command disable unrelated controls", async () => {
     // ADVANCE_ROUND hangs forever (simulating F-06's unresponsive
@@ -679,6 +769,24 @@ describe("per-command pending state (F-06)", () => {
 
     render(<Home />);
     const errorPanel = await screen.findByTestId("error-panel");
+
+    // F-07 regression coverage: previousPhase "generatingItem" is an
+    // ordinary, retryable item-generation error, not a permanently failed
+    // settlement (previousPhase "settling") - isPermanentSettlementFailure
+    // in page.tsx must read false here. If it were hardcoded to true, every
+    // retryable item-generation error would be framed to the host as
+    // unrecoverable, which is exactly the confusion this PR's new copy was
+    // added to prevent for the *real* terminal case.
+    expect(
+      within(errorPanel).getByText("Game error"),
+    ).toBeInTheDocument();
+    expect(
+      within(errorPanel).getByText("Round stopped"),
+    ).toBeInTheDocument();
+    expect(
+      within(errorPanel).queryByTestId("settlement-permanently-failed-note"),
+    ).not.toBeInTheDocument();
+
     const retryButton = within(errorPanel).getByRole("button", {
       name: /retry generation/i,
     });
@@ -697,5 +805,108 @@ describe("per-command pending state (F-06)", () => {
 
     expect(retryOptions?.signal).toBeInstanceOf(AbortSignal);
     expect(resetOptions?.signal).toBeUndefined();
+  });
+
+  // F-07 regression coverage: a settlement that has permanently failed
+  // (SETTLEMENT_FAILURE_EPISODE_CAP episodes in a row) must not render the
+  // same "everything is fine, just retrying" panel as a transient one - see
+  // the terminal branch of SETTLEMENT_FAILED in reducer.ts and the
+  // isPermanentSettlementFailure branch of the error panel in page.tsx.
+  it("renders a distinct terminal panel for a permanently failed settlement, with no misleading retry button", async () => {
+    const PERMANENT_SETTLEMENT_FAILURE_SNAPSHOT = {
+      ...BASE_SNAPSHOT,
+      lifecycle: "active",
+      presence: {
+        players: { A: true, B: true },
+      },
+      game: {
+        mode: "Chaos Quant",
+        players: {
+          A: { id: "A", name: "Ada" },
+          B: { id: "B", name: "Grace" },
+        },
+        scores: { A: 0, B: 0 },
+        roles: { marketMaker: "A", trader: "B" },
+        roundNumber: 1,
+        totalRounds: 3,
+        log: [],
+        phase: "error",
+        error: "Private generated item is unavailable for settlement.",
+        previousPhase: "settling",
+      },
+    } satisfies PublicRoomSnapshot;
+
+    vi.mocked(accessRoom).mockResolvedValue({
+      ok: true,
+      room: PERMANENT_SETTLEMENT_FAILURE_SNAPSHOT,
+    });
+
+    render(<Home />);
+    const errorPanel = await screen.findByTestId("error-panel");
+
+    expect(
+      within(errorPanel).getByText("This round could not be settled"),
+    ).toBeInTheDocument();
+    expect(
+      within(errorPanel).getByTestId("settlement-permanently-failed-note"),
+    ).toBeInTheDocument();
+    // The generic item-generation "Retry generation" affordance would be
+    // dishonest here - retrying is exactly what already failed
+    // SETTLEMENT_FAILURE_EPISODE_CAP times in a row - so it must not appear.
+    expect(
+      within(errorPanel).queryByRole("button", { name: /retry generation/i }),
+    ).not.toBeInTheDocument();
+    expect(
+      within(errorPanel).getByRole("button", { name: /reset lobby/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("renders a healthy retrying panel (not the terminal one) for a locked choosingSide short of the cap", async () => {
+    const RETRYING_SETTLEMENT_SNAPSHOT = {
+      ...BASE_SNAPSHOT,
+      lifecycle: "active",
+      presence: {
+        players: { A: true, B: true },
+      },
+      game: {
+        mode: "Chaos Quant",
+        players: {
+          A: { id: "A", name: "Ada" },
+          B: { id: "B", name: "Grace" },
+        },
+        scores: { A: 0, B: 0 },
+        roles: { marketMaker: "A", trader: "B" },
+        roundNumber: 1,
+        totalRounds: 3,
+        log: [],
+        phase: "choosingSide",
+        item: {
+          item_title: "Widget",
+          category: "Test",
+          context_clue: "A useful test item.",
+          round_id: "round-1",
+        },
+        spreadWidth: 4,
+        quote: { bid: 10, ask: 14 },
+        turnDeadlineMs: Date.now() + 30_000,
+        lockedPendingTrade: { kind: "chosen", side: "BUY" },
+        settlementFailureCount: 1,
+      },
+    } satisfies PublicRoomSnapshot;
+
+    vi.mocked(accessRoom).mockResolvedValue({
+      ok: true,
+      room: RETRYING_SETTLEMENT_SNAPSHOT,
+    });
+
+    render(<Home />);
+    const retryPanel = await screen.findByTestId("settlement-retry-panel");
+
+    expect(screen.queryByTestId("error-panel")).not.toBeInTheDocument();
+    // Bounded, not open-ended: the host should be able to tell this will
+    // not retry forever, without it looking like the terminal state yet.
+    expect(retryPanel.textContent).toContain(
+      `if it fails ${SETTLEMENT_FAILURE_EPISODE_CAP} times in a row`,
+    );
   });
 });

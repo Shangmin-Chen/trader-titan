@@ -1,3 +1,21 @@
+/**
+ * This module is the Worker's entrypoint (see wrangler config `main`).
+ * workerd inspects every named export of an entrypoint module and requires
+ * each one to be either an `ExportedHandler` (the `default` export) or a
+ * class usable as a Durable Object / service binding (`GameRoomDurableObject`
+ * below). A plain value or function export that is neither fails the whole
+ * service at boot with "Incorrect type for map entry ...: the provided
+ * value is not of type 'function or ExportedHandler'" - not a build error,
+ * not a test failure, a boot failure that only surfaces once something
+ * actually starts this module as a service (`wrangler dev`, a real deploy).
+ *
+ * Do not add another named export here. If a constant or helper needs to be
+ * shared with a test file, put it in a non-entrypoint module (e.g.
+ * ../lib/room-socket-supervisor.ts, alongside what gives it meaning) and
+ * import it into both sides instead. entrypoint-exports.worker-test.ts
+ * (`npm run worker-test`) asserts this module's export surface directly -
+ * see that file before disabling or working around it.
+ */
 import { DurableObject } from "cloudflare:workers";
 import openNextWorker from "../../.open-next/worker.js";
 import {
@@ -61,6 +79,10 @@ import {
   buildGeminiBatchPrompt
 } from "../api/item-generation/config";
 import { createFetchAmazonLookup } from "../api/item-generation/amazon-provider";
+import {
+  ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS,
+  ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE
+} from "../lib/room-socket-supervisor";
 
 const JSON_CONTENT_TYPE = "application/json; charset=utf-8";
 const ROOM_ENDPOINT = "/room";
@@ -69,8 +91,26 @@ const ROOM_JOIN_ENDPOINT = "/room/join";
 const ROOM_COMMAND_ENDPOINT = "/room/command";
 const ROOM_CUSTOM_AMAZON_ITEM_ENDPOINT = "/room/custom-amazon-item";
 const ROOM_SOCKET_ENDPOINT = "/room/socket";
+const ROOM_TEST_EXPIRE_TURN_ENDPOINT = "/room/test-expire-turn";
 const PUBLIC_ROOMS_ENDPOINT = "/api/rooms";
 const PUBLIC_CUSTOM_AMAZON_ITEM_ROUTE = "custom-amazon-item";
+const PUBLIC_TEST_EXPIRE_TURN_ROUTE = "test-expire-turn";
+/**
+ * Test-only affordance for e2e coverage of the F-05 shot clock (PR #18,
+ * "Add e2e coverage of the shot clock"). Real turn durations are 30-60s
+ * (see *_TURN_DURATION_MS in src/lib/game/types.ts) - too slow for
+ * Playwright to honestly sleep out. Rather than mocking the countdown or
+ * the expiry logic, testExpireTurnSoon (below) fast-forwards a room's
+ * already-armed, server-authoritative turnDeadlineMs to this many ms from
+ * now and re-arms the *real* Durable Object alarm against it, so the
+ * production alarm handler, reducer transition, persistence, and
+ * WebSocket broadcast all still run for real - only the wait is
+ * shortened. It is only reachable when this.env.WORKER_TEST_MODE is set
+ * (see testExpireTurnSoon's own comment for why that - and specifically
+ * not this.env.WORKER_ITEM_PROVIDER - is the gate), which is never the
+ * case in a real deploy.
+ */
+const E2E_FAST_FORWARD_TURN_OFFSET_MS = 3_000;
 const LEGACY_NEXT_GAME_API_PATHS = new Set([
   "/api/commit-market",
   "/api/generate-custom-amazon-item",
@@ -225,11 +265,13 @@ type PendingItemGeneration = Readonly<{
  * A durably-persisted marker for a room-level effect that must run outside
  * the storage transaction that committed the state transition requiring it
  * (see receiveStoredSettlement / F-02). A Durable Object has exactly one
- * alarm slot, so scheduleNextAlarm() always arms it for whichever is sooner
- * of the room's TTL or this marker's notBeforeMs - see that function for the
- * multiplexing contract. `kind` is a discriminant so a future effect (e.g.
- * F-05 turn timers) can extend this union instead of adding a second marker
- * or a second scheduler.
+ * alarm slot, so scheduleNextAlarm() always arms it for whichever of the
+ * room's TTL, this marker's notBeforeMs, or F-05's turn-clock deadline is
+ * soonest - see that function for the multiplexing contract. `kind` is a
+ * discriminant for future effects that, like "settle", need their own retry
+ * state; F-05's turn clock did not need one - its deadline is already
+ * durable as `turnDeadlineMs` on `room.game` itself, so scheduleNextAlarm
+ * derives it straight from `room` instead (see turnDeadlineForRoom()).
  */
 type PendingRoomEffect = Readonly<{
   kind: "settle";
@@ -238,11 +280,45 @@ type PendingRoomEffect = Readonly<{
   notBeforeMs: UnixTimeMs;
 }>;
 
+/**
+ * runDueTurnExpiry's own transaction result: distinguishes "nothing about
+ * the room actually changed" (a stale wake, a rejected event, or the room
+ * having already expired) from "TURN_EXPIRED genuinely committed", since
+ * only the latter needs a broadcast afterward. `enteredSettling` tells the
+ * caller whether an F-06 settle-effect follow-up is also needed - a plain
+ * roundForfeited commit has nothing further to do once broadcast.
+ */
+type TurnExpiryOutcome =
+  | Readonly<{ kind: "unchanged" }>
+  | Readonly<{ kind: "committed"; room: RoomState; enteredSettling: boolean }>;
+
 type RoomSocketAttachment = Readonly<{
   kind: "trader-titan.room-socket.v1";
   roomId: RoomId;
   role: CapabilityRole;
   tokenHash: TokenHash;
+  /**
+   * Acceptance time, used only as the liveness sweep's fallback "last seen"
+   * signal (see socketLastSeenMs) for a socket that has not yet had its
+   * first edge auto-response recorded - getWebSocketAutoResponseTimestamp
+   * returns null until then. Not presence: presence stays derived solely
+   * from ctx.getWebSockets() membership and is never persisted.
+   *
+   * Optional deliberately: a socket accepted by pre-deploy code before this
+   * field existed hibernates with an attachment that lacks it, and that
+   * attachment keeps arriving at parseRoomSocketAttachment for the lifetime
+   * of the socket - hibernation does not re-run acceptRoomSocket. Every
+   * attachment-consuming path other than socketLastSeenMs (snapshot
+   * eligibility, presence, the per-seat eviction match) never looked at this
+   * field at all, so treating it as required there would only have made a
+   * liveness-only concern reject the whole attachment. See socketLastSeenMs
+   * for how a missing value is treated for liveness purposes - including
+   * that socketLastSeenMs itself is the *other* writer of this field: for a
+   * legacy socket lacking it entirely, socketLastSeenMs memoizes a
+   * first-observed time back onto this same field via serializeAttachment
+   * the first time it is asked, rather than leaving the gap open forever.
+   */
+  acceptedAtMs?: UnixTimeMs;
 }>;
 
 type RoomSocketError = RoomHttpError | RoomDomainError | RoomProtocolDecodeError;
@@ -321,13 +397,18 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       return this.applyCustomAmazonItem(request);
     }
 
+    if (pathname === ROOM_TEST_EXPIRE_TURN_ENDPOINT && request.method === "POST") {
+      return this.testExpireTurnSoon(request);
+    }
+
     if (
       pathname === ROOM_ENDPOINT ||
       pathname === ROOM_ACCESS_ENDPOINT ||
       pathname === ROOM_JOIN_ENDPOINT ||
       pathname === ROOM_COMMAND_ENDPOINT ||
       pathname === ROOM_CUSTOM_AMAZON_ITEM_ENDPOINT ||
-      pathname === ROOM_SOCKET_ENDPOINT
+      pathname === ROOM_SOCKET_ENDPOINT ||
+      pathname === ROOM_TEST_EXPIRE_TURN_ENDPOINT
     ) {
       return errorResponse(
         { code: "method_not_allowed", message: "HTTP method is not supported for this room endpoint." },
@@ -458,6 +539,13 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       );
 
       if (!loaded.ok) {
+        // B1: purge here too (not just on the alarm path - see alarm() and
+        // purgeExpiredRoomState) so a room whose envelope cannot be loaded
+        // self-heals into "missing" (404) after being observed once,
+        // instead of returning the same status on every join attempt until
+        // whatever deadline this room's now-orphaned alarm was scheduled
+        // against eventually fires - up to ABANDONED_ROOM_TTL_MS later.
+        await purgeExpiredRoomState(transaction);
         return {
           ok: false,
           status: statusForStoredRoomLoadFailure(loaded),
@@ -474,7 +562,6 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
           nowMs
         },
         {
-          presence: this.currentRoomPresence(loaded.room),
           verifyToken: rejectTokenVerification
         }
       );
@@ -487,7 +574,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         } as const;
       }
 
-      await persistRoomEnvelope(transaction, joined.room, null, nowMs);
+      await this.persistRoomEnvelope(transaction, joined.room, null, nowMs);
 
       return {
         ok: true,
@@ -589,6 +676,131 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
     });
   }
 
+  /**
+   * Test-only (see E2E_FAST_FORWARD_TURN_OFFSET_MS above): fast-forwards
+   * the room's currently-armed F-05 turn deadline to a few seconds from
+   * now and re-arms the real Durable Object alarm against it, instead of
+   * requiring a Playwright test to sleep out the genuine 30-60s duration.
+   * Everything downstream of the deadline - the alarm firing, TURN_EXPIRED
+   * dispatch, the settling/roundForfeited transition, persistence, and the
+   * WebSocket broadcast - still runs through the exact same production
+   * code path a real deadline would trigger; only the wait is shortened.
+   *
+   * Gated on this.env.WORKER_TEST_MODE being set - a dedicated var with no
+   * meaning anywhere else in this codebase and no legitimate reason to be
+   * set on a real deploy, unlike this.env.WORKER_ITEM_PROVIDER (which this
+   * gate deliberately does NOT key off). WORKER_ITEM_PROVIDER is a real
+   * provider-selection override (see its use in
+   * applyAutomaticRoomEffects/isTestEnv and the "deterministic" | "gemini"
+   * type in worker-configuration.d.ts) that an operator could legitimately
+   * set on a genuine deploy - e.g. to force the deterministic provider
+   * during an incident - which would have silently un-404d a route able to
+   * force any player's clock to expire in ~3s. wrangler.toml currently sets
+   * no vars at all, so that was not reachable in the shipped config, but it
+   * was one plausible config change away from open. WORKER_TEST_MODE has no
+   * such double duty: nothing else in this file reads it, so setting it can
+   * only ever be a deliberate, test-specific choice (see
+   * playwright.config.ts and vitest.worker.config.ts).
+   *
+   * Authorization below is intentionally `{ type: "access" }` rather than
+   * `{ type: "activePlayer" }`: this lets *either* seated player expire the
+   * *other* player's active turn, not just their own. That is load-bearing
+   * for the e2e helper (e2e/helpers.ts's fastForwardTurnClock), which forces
+   * the guest's turn from the host's page. This is safe specifically
+   * because it is unreachable outside test/dev once the gate above holds -
+   * it does not, and must not, ship as a general "either player can expire
+   * either player's clock" affordance in production; do not loosen it
+   * without also reconsidering this gate.
+   */
+  private async testExpireTurnSoon(request: Request): Promise<Response> {
+    if (this.env.WORKER_TEST_MODE === undefined) {
+      return errorResponse(
+        { code: "not_found", message: "Room endpoint was not found." },
+        404
+      );
+    }
+
+    const decoded = await decodeAccessRoomBody(request);
+
+    if (!decoded.ok) {
+      return decoded.response;
+    }
+
+    const verifyToken = await buildTokenVerifier(decoded.value.credential);
+    const nowMs = currentUnixTimeMs();
+
+    const result = await this.ctx.storage.transaction(async (transaction) => {
+      const loaded = loadStoredRoomEnvelope(
+        await transaction.get<unknown>(ROOM_STORAGE_KEY),
+        nowMs
+      );
+
+      if (!loaded.ok) {
+        return {
+          ok: false,
+          status: statusForStoredRoomLoadFailure(loaded),
+          error: loaded.error
+        } as const;
+      }
+
+      const authorized = authorizeRoomAction(
+        loaded.room,
+        decoded.value.credential,
+        { type: "access" },
+        verifyToken
+      );
+
+      if (!authorized.ok) {
+        return {
+          ok: false,
+          status: statusForDomainError(authorized.error),
+          error: authorized.error
+        } as const;
+      }
+
+      if (
+        loaded.room.game.phase !== "proposingWidth" &&
+        loaded.room.game.phase !== "negotiatingWidth" &&
+        loaded.room.game.phase !== "configuringMarket" &&
+        loaded.room.game.phase !== "choosingSide"
+      ) {
+        return {
+          ok: false,
+          status: 409,
+          error: {
+            code: "invalid_game_phase",
+            message: "Room has no active turn clock to fast-forward."
+          }
+        } as const;
+      }
+
+      // A turn deadline never coexists with a pending settle effect (see
+      // the class-level alarm() comment), so having just confirmed this
+      // room IS on a turn clock, there is no pending effect to preserve
+      // here - passing null also self-heals any stale marker.
+      const patchedRoom: RoomState = {
+        ...loaded.room,
+        game: { ...loaded.room.game, turnDeadlineMs: nowMs + E2E_FAST_FORWARD_TURN_OFFSET_MS },
+        revision: loaded.room.revision + 1
+      };
+
+      await this.persistRoomEnvelope(transaction, patchedRoom, null, nowMs);
+
+      return { ok: true, room: patchedRoom } as const;
+    });
+
+    if (!result.ok) {
+      return errorResponse(result.error, result.status);
+    }
+
+    this.broadcastRoomSnapshot(result.room);
+
+    return jsonResponse<CommandRoomResponse>({
+      ok: true,
+      room: this.publicRoomSnapshot(result.room)
+    });
+  }
+
   private async acceptRoomSocket(request: Request): Promise<Response> {
     if (request.method !== "GET") {
       return errorResponse(
@@ -609,7 +821,8 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       return credential.response;
     }
 
-    const loaded = await this.loadStoredRoom(currentUnixTimeMs());
+    const nowMs = currentUnixTimeMs();
+    const loaded = await this.loadStoredRoom(nowMs);
 
     if (!loaded.ok) {
       return errorResponse(loaded.error, statusForStoredRoomLoadFailure(loaded));
@@ -645,7 +858,8 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       kind: "trader-titan.room-socket.v1",
       roomId: roomId.roomId,
       role: credentialToken.token.role,
-      tokenHash
+      tokenHash,
+      acceptedAtMs: nowMs
     } satisfies RoomSocketAttachment);
 
     // One seat, one socket: evict any prior live socket for this exact
@@ -675,6 +889,15 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       excludeRecipient: server,
       presence
     });
+
+    // F-08: fold this new socket's liveness deadline into the single alarm
+    // slot now, rather than waiting for some unrelated future room mutation
+    // to reschedule it. Without this, a room that sits open with a live
+    // socket but no further commands (e.g. a lobby waiting on a second
+    // player) would keep whatever far-future TTL-only deadline was already
+    // armed, and this socket would never be checked for staleness until the
+    // room itself expired.
+    await this.rearmAlarmForLiveSockets(nowMs);
 
     return new Response(null, {
       headers: {
@@ -723,6 +946,15 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
     this.broadcastRoomSnapshot(result.room);
   }
 
+  /**
+   * A close the liveness sweep (alarm()) itself initiated also reaches this
+   * handler once the close handshake completes - closing a hibernatable
+   * WebSocket always fires webSocketClose(), regardless of who or what
+   * requested the close - so a server-evicted stale socket rebroadcasts
+   * presence through exactly this same path as an ordinary client-driven
+   * disconnect. No separate presence-update wiring is needed in the sweep
+   * itself.
+   */
   async webSocketClose(ws: WebSocket): Promise<void> {
     await this.broadcastPresenceChangeForSocket(ws);
   }
@@ -732,16 +964,44 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
-   * Multiplexes the Durable Object's single alarm slot between two concerns:
-   * room TTL housekeeping (unchanged from before F-02) and resuming a
-   * pending room effect that was durably committed but never ran (the F-02
-   * trapdoor - see receiveStoredSettlement). Each alarm invocation figures
-   * out which deadline actually fired and handles only that one; every
-   * write path that follows reschedules via scheduleNextAlarm() so the slot
-   * never falls out of sync with whichever deadline is now soonest.
+   * Multiplexes the Durable Object's single alarm slot between four
+   * concerns: room TTL housekeeping (unchanged from before F-02), resuming a
+   * pending settlement effect that was durably committed but never ran (the
+   * F-02 trapdoor - see receiveStoredSettlement), F-05's turn shot clock,
+   * and the F-08 liveness sweep (closing room sockets the client-side
+   * heartbeat cannot itself detect as dead - see sweepStaleSockets).
+   *
+   * Each alarm invocation runs the liveness sweep unconditionally first (it
+   * is cheap - a scan of this room's live sockets plus timestamp
+   * comparisons, no storage I/O) and then figures out which *stored*
+   * deadline - TTL, pending settle effect, or turn clock - actually fired,
+   * handling only that one. Every write path that follows reschedules via
+   * scheduleNextAlarm() so the slot never falls out of sync with whichever
+   * deadline is now soonest. scheduleNextAlarm() recomputes the liveness
+   * deadline from live sockets on every call (it is never persisted), so
+   * once the sweep above has closed every stale socket (or there were none
+   * to begin with), a room with no remaining sockets naturally drops the
+   * liveness term and this alarm settles back to firing only for
+   * TTL/pending-effect/turn-clock purposes - it does not re-arm itself
+   * forever.
+   *
+   * The pending-settle-effect and turn-clock deadlines can never both be
+   * due for the same room at once - a turn deadline only exists on the four
+   * actionable phases (proposingWidth / negotiatingWidth / configuringMarket
+   * / choosingSide) and a pending settle effect only exists in "settling",
+   * so there is no ordering to get wrong between them. (F-06's choosingSide
+   * timeout moves the room INTO "settling" as part of processing a
+   * turn-clock wake, so a turnExpiry tick can itself durably write a fresh
+   * pending settle effect - see runDueTurnExpiry - but that is a one-way
+   * transition, never a state where both were simultaneously due for the
+   * same tick.) The liveness sweep is independent of both: it acts directly
+   * on live sockets rather than on stored room state, so it can fire
+   * alongside either (or neither) of them on the same tick.
    */
   async alarm(): Promise<void> {
     const nowMs = currentUnixTimeMs();
+
+    this.sweepStaleSockets(nowMs);
 
     const due = await this.ctx.storage.transaction(async (transaction) => {
       const loaded = loadStoredRoomEnvelope(
@@ -757,24 +1017,138 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       const pendingEffect = loadPendingRoomEffect(
         await transaction.get<unknown>(PENDING_ROOM_EFFECT_STORAGE_KEY)
       );
+      const turnDeadlineMs = turnDeadlineForRoom(loaded.room);
+      const pendingEffectDue = pendingEffect !== null && nowMs >= pendingEffect.notBeforeMs;
+      const turnDeadlineDue = turnDeadlineMs !== null && nowMs >= turnDeadlineMs;
 
-      if (pendingEffect === null || nowMs < pendingEffect.notBeforeMs) {
+      if (!pendingEffectDue && !turnDeadlineDue) {
         // The room's TTL hasn't actually expired (loadStoredRoomEnvelope
-        // would have reported that above), and no pending effect is due
-        // yet, so this tick is a no-op besides keeping the single alarm
-        // slot pointed at whichever deadline is now soonest.
-        await scheduleNextAlarm(transaction, loaded.room, pendingEffect);
+        // would have reported that above), and neither the pending settle
+        // effect nor the turn clock is due yet, so this tick is a no-op
+        // besides keeping the single alarm slot pointed at whichever
+        // deadline - including the liveness sweep's - is now soonest.
+        await this.scheduleNextAlarm(transaction, loaded.room, pendingEffect, nowMs);
         return null;
       }
 
-      return { room: loaded.room, pendingEffect };
+      return turnDeadlineDue
+        ? ({ kind: "turnExpiry", room: loaded.room } as const)
+        : ({ kind: "pendingEffect", room: loaded.room, pendingEffect: pendingEffect as PendingRoomEffect } as const);
     });
 
     if (due === null) {
       return;
     }
 
+    if (due.kind === "turnExpiry") {
+      await this.runDueTurnExpiry(due.room, nowMs);
+      return;
+    }
+
     await this.runDuePendingRoomEffect(due.room, due.pendingEffect, nowMs);
+  }
+
+  /**
+   * F-05 turn-clock resume: re-validates the room is still on the same
+   * outstanding deadline before dispatching TURN_EXPIRED, exactly like
+   * runDueSettleEffect re-checks phase/round_id before resuming settlement.
+   * This is what keeps a stale alarm wake - the round already advanced past
+   * the deadline that armed this wake, between alarm()'s outer transaction
+   * and this one - from forfeiting a round that has already moved on.
+   *
+   * F-06: when the expired deadline was choosingSide's, TURN_EXPIRED moves
+   * the room into "settling" instead of "roundForfeited" (see the reducer).
+   * That is the exact same "committed a transition into settling but the
+   * settlement effect might never run" shape EXECUTE_TRADE's own commit path
+   * guards against (see the F-02 comment on applyDecodedRoomCommand and
+   * pendingEffectForCommittedRoom), so it needs the identical treatment: a
+   * fresh pending-settle-effect marker written in the SAME transaction as
+   * the phase transition, and an immediate attempt at the settle effect
+   * afterward rather than waiting for the alarm's own next tick.
+   */
+  private async runDueTurnExpiry(room: RoomState, nowMs: UnixTimeMs): Promise<void> {
+    const outcome: TurnExpiryOutcome = await this.ctx.storage.transaction(async (transaction) => {
+      const loaded = loadStoredRoomEnvelope(
+        await transaction.get<unknown>(ROOM_STORAGE_KEY),
+        nowMs
+      );
+
+      if (!loaded.ok) {
+        // The room expired in the gap between alarm()'s outer transaction
+        // and this one. Purge fully rather than leaving an expired envelope
+        // and its private items behind with no alarm armed to clean them up.
+        await purgeExpiredRoomState(transaction);
+        return { kind: "unchanged" };
+      }
+
+      const pendingEffect = loadPendingRoomEffect(
+        await transaction.get<unknown>(PENDING_ROOM_EFFECT_STORAGE_KEY)
+      );
+      const turnDeadlineMs = turnDeadlineForRoom(loaded.room);
+
+      if (turnDeadlineMs === null || nowMs < turnDeadlineMs) {
+        // Stale wake: the round already advanced out of the turn-clocked
+        // phase (or a fresh deadline was stamped later than the one that
+        // armed this alarm) between this alarm firing and being processed.
+        // Reschedule against the freshly-loaded room instead of forfeiting
+        // a round that has already moved on.
+        await this.scheduleNextAlarm(transaction, loaded.room, pendingEffect, nowMs);
+        return { kind: "unchanged" };
+      }
+
+      const eventResult = dispatchSystemRoomEvent(loaded.room, {
+        type: "TURN_EXPIRED",
+        nowMs
+      });
+
+      if (!eventResult.ok) {
+        // The reducer rejected TURN_EXPIRED even though the phase/deadline
+        // check above passed (should not happen - this guard mirrors the
+        // reducer's own phase guard exactly). Reschedule rather than
+        // looping on an alarm that cannot make progress.
+        await this.scheduleNextAlarm(transaction, loaded.room, pendingEffect, nowMs);
+        return { kind: "unchanged" };
+      }
+
+      // Only an F-06 choosingSide timeout lands in "settling" here; a
+      // forfeit into "roundForfeited" carries no pending effect, same as
+      // before this case existed.
+      const enteredSettling =
+        eventResult.room.lifecycle === "active" && eventResult.room.game.phase === "settling";
+      const nextPendingEffect = enteredSettling
+        ? freshSettlePendingEffect(eventResult.room.game.item.round_id, nowMs)
+        : null;
+
+      await this.persistRoomEnvelope(transaction, eventResult.room, nextPendingEffect, nowMs);
+
+      return { kind: "committed", room: eventResult.room, enteredSettling };
+    });
+
+    if (outcome.kind === "unchanged") {
+      return;
+    }
+
+    // Connected clients only ever hear about a room mutation through an
+    // explicit broadcast - unlike every HTTP command handler, nothing here
+    // is a request/response the caller is waiting on, so without this call
+    // a genuinely expired clock would commit and persist correctly but
+    // never reach a client sitting on an open WebSocket watching it happen,
+    // which is exactly what the shot clock exists to do in real time.
+    this.broadcastRoomSnapshot(outcome.room);
+
+    if (!outcome.enteredSettling) {
+      return;
+    }
+
+    // Mirrors applyAutomaticRoomEffects' EXECUTE_TRADE handling: attempt the
+    // settle effect immediately instead of waiting for the alarm's own next
+    // tick. If this isolate is evicted mid-effect, the pending-effect marker
+    // just persisted above is the same F-02 trapdoor that resumes it later.
+    const settled = await this.receiveStoredSettlement(outcome.room, nowMs);
+
+    if (settled.ok) {
+      this.broadcastRoomSnapshot(settled.room);
+    }
   }
 
   private async runDuePendingRoomEffect(
@@ -833,7 +1207,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         }
 
         await writePendingRoomEffect(transaction, null);
-        await scheduleNextAlarm(transaction, loaded.room, null);
+        await this.scheduleNextAlarm(transaction, loaded.room, null, nowMs);
       });
       return;
     }
@@ -864,7 +1238,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         loaded.room.game.item.round_id !== pendingEffect.roundId
       ) {
         await writePendingRoomEffect(transaction, null);
-        await scheduleNextAlarm(transaction, loaded.room, null);
+        await this.scheduleNextAlarm(transaction, loaded.room, null, nowMs);
         return false;
       }
 
@@ -873,7 +1247,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       // alarm wake rather than retrying forever.
       const bumped = nextSettlePendingEffectAttempt(pendingEffect, nowMs);
       await writePendingRoomEffect(transaction, bumped);
-      await scheduleNextAlarm(transaction, loaded.room, bumped);
+      await this.scheduleNextAlarm(transaction, loaded.room, bumped, nowMs);
       return true;
     });
 
@@ -884,7 +1258,15 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
     const refreshed = await this.loadStoredRoom(nowMs);
 
     if (refreshed.ok) {
-      await this.receiveStoredSettlement(refreshed.room, nowMs);
+      const settled = await this.receiveStoredSettlement(refreshed.room, nowMs);
+
+      // See the identical comment on runDueTurnExpiry's own broadcast: this
+      // retry runs off the alarm, not a request a client is waiting on, so
+      // without this a successful auto-resumed settlement would persist but
+      // never reach a connected client until its next unrelated command.
+      if (settled.ok) {
+        this.broadcastRoomSnapshot(settled.room);
+      }
     }
   }
 
@@ -898,7 +1280,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
     roundId: string,
     nowMs: UnixTimeMs
   ): Promise<void> {
-    await this.ctx.storage.transaction(async (transaction) => {
+    const committed = await this.ctx.storage.transaction(async (transaction) => {
       const loaded = loadStoredRoomEnvelope(
         await transaction.get<unknown>(ROOM_STORAGE_KEY),
         nowMs
@@ -909,7 +1291,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         // fully rather than leaving an expired envelope and its private
         // items behind with no alarm armed to clean them up later.
         await purgeExpiredRoomState(transaction);
-        return;
+        return null;
       }
 
       if (
@@ -918,8 +1300,8 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         loaded.room.game.item.round_id !== roundId
       ) {
         await writePendingRoomEffect(transaction, null);
-        await scheduleNextAlarm(transaction, loaded.room, null);
-        return;
+        await this.scheduleNextAlarm(transaction, loaded.room, null, nowMs);
+        return null;
       }
 
       const eventResult = dispatchSystemRoomEvent(
@@ -938,12 +1320,21 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         // alarm against the room's TTL deadline so it isn't silently
         // dropped - the marker itself is no longer trustworthy either way.
         await writePendingRoomEffect(transaction, null);
-        await scheduleNextAlarm(transaction, loaded.room, null);
-        return;
+        await this.scheduleNextAlarm(transaction, loaded.room, null, nowMs);
+        return null;
       }
 
-      await persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
+      await this.persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
+
+      return eventResult.room;
     });
+
+    if (committed !== null) {
+      // Same reasoning as runDueTurnExpiry / runDueSettleEffect's own
+      // broadcasts: this fallback runs off the alarm's exhaustion path, not
+      // a request a client is waiting on.
+      this.broadcastRoomSnapshot(committed);
+    }
   }
 
   /**
@@ -969,6 +1360,13 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       );
 
       if (!loaded.ok) {
+        // B1: same self-heal as joinRoom above - see the comment there and
+        // on purgeExpiredRoomState. This is the hot path: every player
+        // command (SUBMIT_INITIAL_WIDTH, EXECUTE_TRADE, ...) routes through
+        // here, so without this a genuinely undecodable envelope would
+        // otherwise 500 on every single command from both players until
+        // this room's alarm happens to fire.
+        await purgeExpiredRoomState(transaction);
         return {
           ok: false,
           status: statusForStoredRoomLoadFailure(loaded),
@@ -1010,7 +1408,6 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         loaded.room,
         command,
         {
-          presence: this.currentRoomPresence(loaded.room),
           verifyToken
         }
       );
@@ -1046,7 +1443,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         );
       }
 
-      await persistRoomEnvelope(transaction, commandResult.room, pendingEffect, nowMs);
+      await this.persistRoomEnvelope(transaction, commandResult.room, pendingEffect, nowMs);
       await transaction.put(
         ROOM_COMMAND_DEDUPE_STORAGE_KEY,
         withCommandDedupeEntry(dedupeEntries, command, commandResult.room.revision)
@@ -1416,7 +1813,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         } as const;
       }
 
-      await persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
+      await this.persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
 
       return {
         ok: true,
@@ -1468,7 +1865,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         } as const;
       }
 
-      await persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
+      await this.persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
 
       return {
         ok: true,
@@ -1546,10 +1943,12 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         } as const;
       }
 
-      // dispatchSystemRoomEvent always moves settling -> settlement or
-      // settling -> choosingSide here (both branches above), so the room is
-      // guaranteed to have left settling: no pending settle effect remains.
-      await persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
+      // dispatchSystemRoomEvent always moves settling -> settlement,
+      // settling -> choosingSide, or (once SETTLEMENT_FAILED has failed
+      // SETTLEMENT_FAILURE_EPISODE_CAP times in a row for this round, F-07)
+      // settling -> error, so the room is guaranteed to have left settling:
+      // no pending settle effect remains.
+      await this.persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
 
       if (
         stored.ok &&
@@ -1604,6 +2003,232 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       excludeRecipient: socket,
       presence: this.currentRoomPresence(loaded.room, socket)
     });
+  }
+
+  /**
+   * F-08 mitigation: closes any room socket that has gone at least
+   * ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS without a fresh edge
+   * auto-response. This is the one gap the existing client-side heartbeat
+   * (room-socket-supervisor.ts) cannot cover: a dead TCP connection with no
+   * close frame does not make socket.send() throw on the client, it just
+   * queues, and because this DO registers a hibernation auto-response pair
+   * for "tt-ping" in the constructor, a live client's own pings never wake
+   * this object to notice the silence either. getWebSocketAutoResponseTimestamp
+   * is the one signal that updates without waking the DO, so this is only
+   * ever reached from alarm(), which scheduleNextAlarm() already arms for
+   * the earliest such deadline via nextLivenessSweepDeadline().
+   *
+   * Deliberately does not touch presence or persisted state directly:
+   * closing a hibernatable WebSocket always fires webSocketClose() once the
+   * handshake completes, regardless of who initiated the close, so the
+   * normal broadcastPresenceChangeForSocket() path rebroadcasts presence
+   * for a swept socket exactly as it would for an ordinary client-driven
+   * disconnect.
+   */
+  private sweepStaleSockets(nowMs: UnixTimeMs): void {
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = parseRoomSocketAttachment(socket.deserializeAttachment());
+
+      if (attachment === null) {
+        continue;
+      }
+
+      const lastSeenMs = this.socketLastSeenMs(socket, attachment, nowMs);
+
+      if (nowMs - lastSeenMs >= ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS) {
+        closeStaleRoomSocket(socket);
+      }
+    }
+  }
+
+  /**
+   * Earliest time at which some currently-connected room socket would go
+   * stale if it received no further auto-response before then, or `null`
+   * if there is nothing to watch (no live sockets right now). Recomputed
+   * from live socket state on every call rather than cached/persisted, so
+   * once the last socket disconnects this naturally stops contributing a
+   * deadline at all: scheduleNextAlarm() then arms only the TTL/pending-
+   * effect deadline, and the DO stops waking for liveness purposes until a
+   * new socket connects - this is how an idle (fully vacant) room settles
+   * back to quiescence instead of re-arming a liveness check forever.
+   */
+  private nextLivenessSweepDeadline(nowMs: UnixTimeMs): UnixTimeMs | null {
+    let earliest: UnixTimeMs | null = null;
+
+    for (const socket of this.ctx.getWebSockets()) {
+      const attachment = parseRoomSocketAttachment(socket.deserializeAttachment());
+
+      if (attachment === null) {
+        continue;
+      }
+
+      const deadline =
+        this.socketLastSeenMs(socket, attachment, nowMs) + ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS;
+
+      if (earliest === null || deadline < earliest) {
+        earliest = deadline;
+      }
+    }
+
+    return earliest;
+  }
+
+  /**
+   * A socket's last observed liveness signal: the edge auto-response
+   * timestamp if it has ever received one, otherwise the socket's
+   * acceptance time (getWebSocketAutoResponseTimestamp returns `null` until
+   * the first "tt-ping" has been auto-answered for this specific socket,
+   * which for a freshly-connected client can legitimately be true for up to
+   * one ping interval), otherwise a *memoized* first-observed time.
+   *
+   * The third fallback is the compatibility case: a socket accepted by
+   * pre-deploy code has no `acceptedAtMs` on its attachment at all (see
+   * RoomSocketAttachment). The first time that happens for a given socket,
+   * this writes `nowMs` back onto the attachment as `acceptedAtMs` via
+   * serializeAttachment before returning it, so the value becomes a fixed
+   * point in time rather than something recomputed as "now" on every call.
+   * Without that write-back, a socket that never completes a single
+   * ping-pong would read `nowMs - lastSeenMs === 0` on every sweep forever
+   * and could never age out. With it, a legacy socket gets exactly one full
+   * fresh threshold window from whichever moment this is first evaluated,
+   * and from then on is indistinguishable from any other socket for
+   * liveness purposes: its next real auto-response takes over (via the
+   * first branch above, which is preferred over the memoized value), or,
+   * absent one, it ages out and is swept like anything else once that
+   * window elapses.
+   *
+   * serializeAttachment always writes back the *whole* parsed attachment
+   * (spread first, `acceptedAtMs` added last) so the fields other paths
+   * depend on - `roomId`, `role`, `tokenHash` - are round-tripped unchanged;
+   * this only ever adds the missing timestamp, never touches anything else.
+   */
+  private socketLastSeenMs(
+    socket: WebSocket,
+    attachment: RoomSocketAttachment,
+    nowMs: UnixTimeMs
+  ): UnixTimeMs {
+    const autoResponseMs = this.readSocketAutoResponseTimestamp(socket)?.getTime();
+
+    if (autoResponseMs !== undefined) {
+      return autoResponseMs;
+    }
+
+    if (attachment.acceptedAtMs !== undefined) {
+      return attachment.acceptedAtMs;
+    }
+
+    socket.serializeAttachment({
+      ...attachment,
+      acceptedAtMs: nowMs
+    } satisfies RoomSocketAttachment);
+
+    return nowMs;
+  }
+
+  /**
+   * Thin indirection around ctx.getWebSocketAutoResponseTimestamp so tests
+   * can substitute a synthetic "last seen" clock for a specific socket
+   * without waiting out ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS in real
+   * time. The timestamp itself is produced entirely inside workerd's edge
+   * auto-responder in response to real "tt-ping" frames and cannot be set
+   * from test code any other way - see index.worker-test.ts.
+   */
+  private readSocketAutoResponseTimestamp(ws: WebSocket): Date | null {
+    return this.ctx.getWebSocketAutoResponseTimestamp(ws);
+  }
+
+  /**
+   * Folds a just-connected socket's liveness deadline into the single alarm
+   * slot immediately (called from acceptRoomSocket right after
+   * ctx.acceptWebSocket()). Connect does not mutate persisted room or
+   * pending-effect state, so this deliberately does not go through
+   * persistRoomEnvelope - it only needs to re-run the same min-of-deadlines
+   * computation scheduleNextAlarm() already owns, now that
+   * ctx.getWebSockets() includes the new socket. No-op if the room can no
+   * longer be loaded (a race with expiry/purge - nothing left to schedule
+   * against).
+   */
+  private async rearmAlarmForLiveSockets(nowMs: UnixTimeMs): Promise<void> {
+    const loaded = await this.loadStoredRoom(nowMs);
+
+    if (!loaded.ok) {
+      return;
+    }
+
+    const pendingEffect = loadPendingRoomEffect(
+      await this.ctx.storage.get<unknown>(PENDING_ROOM_EFFECT_STORAGE_KEY)
+    );
+
+    await this.ctx.storage.transaction(async (transaction) => {
+      await this.scheduleNextAlarm(transaction, loaded.room, pendingEffect, nowMs);
+    });
+  }
+
+  /**
+   * Persists a room state and its pending-effect marker (if any) together,
+   * then reschedules the single alarm slot to match. `pendingEffect` must be
+   * `null` whenever the caller knows no effect is outstanding for this room
+   * state (which self-heals any stale marker) - only applyDecodedRoomCommand's
+   * settling commit and its alarm-driven successors pass a non-null value.
+   */
+  private async persistRoomEnvelope(
+    transaction: DurableObjectTransaction,
+    room: RoomState,
+    pendingEffect: PendingRoomEffect | null,
+    nowMs: UnixTimeMs
+  ): Promise<void> {
+    await transaction.put(ROOM_STORAGE_KEY, persistenceEnvelopeForStorage(room, nowMs));
+    await writePendingRoomEffect(transaction, pendingEffect);
+    await this.scheduleNextAlarm(transaction, room, pendingEffect, nowMs);
+  }
+
+  /**
+   * The reusable alarm multiplexer. A Durable Object has exactly one alarm
+   * slot, so every transaction that can change any of the four deadlines
+   * this folds together - room TTL, a pending settle effect's next-attempt
+   * time, F-05's turn shot clock, and (F-08) the earliest liveness-sweep
+   * deadline among currently connected room sockets - must call this rather
+   * than setAlarm() directly, or the concerns will race to clobber each
+   * other's schedule.
+   *
+   * The turn deadline is not a PendingRoomEffect: unlike the settle effect
+   * (which needs its own retry count and backoff state), it is already
+   * durably part of the committed `room.game` for exactly the four phases
+   * where a specific player must act, so it is derived straight from `room`
+   * here via turnDeadlineForRoom() rather than threaded through as a
+   * separate parameter.
+   *
+   * The liveness term comes from nextLivenessSweepDeadline(), which reads
+   * live socket state (ctx.getWebSockets() /
+   * getWebSocketAutoResponseTimestamp()) rather than anything persisted, so
+   * it costs nothing extra in this already-open transaction and cannot itself
+   * fall out of sync the way a stored marker could.
+   */
+  private async scheduleNextAlarm(
+    transaction: DurableObjectTransaction,
+    room: RoomState,
+    pendingEffect: PendingRoomEffect | null,
+    nowMs: UnixTimeMs
+  ): Promise<void> {
+    const deadlines: UnixTimeMs[] = [roomExpiresAtMs(room)];
+
+    if (pendingEffect !== null) {
+      deadlines.push(pendingEffect.notBeforeMs);
+    }
+
+    const turnDeadline = turnDeadlineForRoom(room);
+
+    if (turnDeadline !== null) {
+      deadlines.push(turnDeadline);
+    }
+
+    const livenessDeadline = this.nextLivenessSweepDeadline(nowMs);
+
+    if (livenessDeadline !== null) {
+      deadlines.push(livenessDeadline);
+    }
+
+    await transaction.setAlarm(Math.min(...deadlines));
   }
 
   private publicRoomSnapshot(room: RoomState): PublicRoomSnapshot {
@@ -1675,7 +2300,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       nowMs
     });
 
-    await persistRoomEnvelope(transaction, room, null, nowMs);
+    await this.persistRoomEnvelope(transaction, room, null, nowMs);
     await deletePrivateGeneratedItems(transaction);
     // A prior room in this same Durable Object may have expired without its
     // alarm having fired yet, leaving its command-dedupe record behind.
@@ -1826,6 +2451,16 @@ function routePublicRoomRequest(
     }
 
     return forwardRoomRequest(request, env, parsedRoomId.roomId, ROOM_COMMAND_ENDPOINT);
+  }
+
+  if (routeParts.length === 2 && routeParts[1] === PUBLIC_TEST_EXPIRE_TURN_ROUTE && request.method === "POST") {
+    const originRejection = publicRoomOriginRejection(request);
+
+    if (originRejection !== null) {
+      return originRejection;
+    }
+
+    return forwardRoomRequest(request, env, parsedRoomId.roomId, ROOM_TEST_EXPIRE_TURN_ENDPOINT);
   }
 
   if (routeParts.length === 2 && routeParts[1] === PUBLIC_CUSTOM_AMAZON_ITEM_ROUTE && request.method === "POST") {
@@ -2113,10 +2748,19 @@ function parseRoomSocketAttachment(value: unknown): RoomSocketAttachment | null 
   const roomId = parseRoomId(value.roomId);
   const tokenHash = parseTokenHash(value.tokenHash);
 
+  // acceptedAtMs is intentionally NOT validated as required here: a socket
+  // accepted by pre-deploy code hibernates with an attachment that has no
+  // acceptedAtMs at all, and that attachment must keep parsing successfully
+  // for every path below (snapshot eligibility, presence, seat eviction) -
+  // none of which read this field. Only socketLastSeenMs cares about it, and
+  // it already treats a missing value as "unknown, not stale". A present but
+  // malformed value (wrong type, negative, non-finite) still fails parsing,
+  // exactly like a malformed roomId/tokenHash/role would.
   if (
     !roomId.ok ||
     !tokenHash.ok ||
-    (value.role !== "host" && value.role !== "guest")
+    (value.role !== "host" && value.role !== "guest") ||
+    (value.acceptedAtMs !== undefined && !isFiniteNonNegativeNumber(value.acceptedAtMs))
   ) {
     return null;
   }
@@ -2125,13 +2769,30 @@ function parseRoomSocketAttachment(value: unknown): RoomSocketAttachment | null 
     kind: "trader-titan.room-socket.v1",
     roomId: roomId.roomId,
     role: value.role,
-    tokenHash: tokenHash.tokenHash
+    tokenHash: tokenHash.tokenHash,
+    ...(value.acceptedAtMs !== undefined ? { acceptedAtMs: value.acceptedAtMs } : {})
   };
 }
 
 function closeSocketQuietly(socket: WebSocket, reason: string): void {
   try {
     socket.close(1008, reason);
+  } catch {
+    try {
+      socket.close();
+    } catch {}
+  }
+}
+
+/**
+ * F-08 liveness sweep's own close helper, kept separate from
+ * closeSocketQuietly (1008, terminal) because this close must land on the
+ * retryable side of isRetryableRoomSocketCloseCode - see
+ * ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE.
+ */
+function closeStaleRoomSocket(socket: WebSocket): void {
+  try {
+    socket.close(ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE, "No recent client activity.");
   } catch {
     try {
       socket.close();
@@ -2424,43 +3085,26 @@ function persistenceEnvelopeForStorage(room: RoomState, nowMs: UnixTimeMs): unkn
 }
 
 /**
- * Persists a room state and its pending-effect marker (if any) together,
- * then reschedules the single alarm slot to match. `pendingEffect` must be
- * `null` whenever the caller knows no effect is outstanding for this room
- * state (which self-heals any stale marker) - only applyDecodedRoomCommand's
- * settling commit and its alarm-driven successors pass a non-null value.
+ * The outstanding F-05 shot-clock deadline for a room, or null when the
+ * current phase has none. Only the four actionable phases
+ * (proposingWidth / negotiatingWidth / configuringMarket / choosingSide)
+ * carry `turnDeadlineMs` at all - see the GameState union in
+ * src/lib/game/types.ts. Kept as a module-level function (rather than an
+ * instance method) since it is a pure derivation from `room` alone - see
+ * DurableObjectRoom.scheduleNextAlarm(), which is the sole caller and folds
+ * this in alongside room TTL, the pending settle effect, and the F-08
+ * liveness deadline.
  */
-async function persistRoomEnvelope(
-  transaction: DurableObjectTransaction,
-  room: RoomState,
-  pendingEffect: PendingRoomEffect | null,
-  nowMs: UnixTimeMs
-): Promise<void> {
-  await transaction.put(ROOM_STORAGE_KEY, persistenceEnvelopeForStorage(room, nowMs));
-  await writePendingRoomEffect(transaction, pendingEffect);
-  await scheduleNextAlarm(transaction, room, pendingEffect);
-}
-
-/**
- * The reusable alarm multiplexer. A Durable Object has exactly one alarm
- * slot, so every transaction that can change either deadline (room TTL or a
- * pending effect's next-attempt time) must call this rather than setAlarm()
- * directly, or the two concerns will race to clobber each other's schedule.
- * F-05 (turn timers) is expected to reuse this by giving PendingRoomEffect a
- * second `kind` rather than introducing a second scheduler.
- */
-async function scheduleNextAlarm(
-  transaction: DurableObjectTransaction,
-  room: RoomState,
-  pendingEffect: PendingRoomEffect | null
-): Promise<void> {
-  const ttlDeadline = roomExpiresAtMs(room);
-  const deadline =
-    pendingEffect === null
-      ? ttlDeadline
-      : Math.min(ttlDeadline, pendingEffect.notBeforeMs);
-
-  await transaction.setAlarm(deadline);
+function turnDeadlineForRoom(room: RoomState): UnixTimeMs | null {
+  switch (room.game.phase) {
+    case "proposingWidth":
+    case "negotiatingWidth":
+    case "configuringMarket":
+    case "choosingSide":
+      return room.game.turnDeadlineMs;
+    default:
+      return null;
+  }
 }
 
 async function writePendingRoomEffect(
@@ -2826,8 +3470,8 @@ function statusForDomainError(error: RoomDomainError): number {
     case "guest_slot_full":
     case "guest_slot_empty":
     case "guest_required":
-    case "player_offline":
     case "invalid_game_phase":
+    case "round_settling":
       return 409;
     default:
       return assertNever(error.code);

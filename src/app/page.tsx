@@ -19,11 +19,13 @@ import {
   LiveAnnouncerProvider,
   MarketRangeForm,
   PhaseStepper,
+  RoundForfeitPanel,
   Scoreboard,
   SettlementPanel,
   SpreadWidthForm,
   TradeActionPanel,
   TurnBanner,
+  TurnCountdown,
   WidthNegotiationPanel,
   useAnnouncer,
   type PhaseStep,
@@ -31,7 +33,10 @@ import {
 import {
   GAME_MODES,
   MAX_ROUNDS,
+  SETTLEMENT_FAILURE_EPISODE_CAP,
+  formatGamePhase,
   formatSignedNumber,
+  formatTradeSide,
   parseNumericInput,
   validateStartGame,
   type GameMode,
@@ -101,6 +106,7 @@ function phaseToStepId(phase: string): string | null {
       return "trade";
     case "settling":
     case "settlement":
+    case "roundForfeited":
       return "settle";
     default:
       return null;
@@ -282,6 +288,16 @@ function HomeContent() {
           );
         } else {
           announce(`Round ${room?.game?.roundNumber ?? ""} settled`);
+        }
+        break;
+      }
+      case "roundForfeited": {
+        const g = room?.game;
+        if (g?.phase === "roundForfeited") {
+          const forfeitedName = g.players[g.forfeit.forfeitedBy].name;
+          announce(`Round ${g.roundNumber} forfeited: ${forfeitedName} ran out of time.`);
+        } else {
+          announce(`Round ${room?.game?.roundNumber ?? ""} forfeited`);
         }
         break;
       }
@@ -515,13 +531,18 @@ function HomeContent() {
     [pendingCommands],
   );
   const isAnyCommandPending = pendingCommands.size > 0;
+  // F-04: presence gating was dropped entirely (the shot clock now handles
+  // an absent opponent), so starting no longer requires Player B to be
+  // live - only that a guest has joined the seat at all.
   const canStartRoom =
     isHost &&
     room?.lifecycle === "lobby" &&
-    guestConnected &&
+    guestSeatOccupied &&
     !isCommandPending("START_ROOM");
-  const canResetLobby = isHost && room !== null && !isCommandPending("RESET_TO_LOBBY");
-  const canKickGuest = isHost && room !== null && !isCommandPending("KICK_GUEST");
+  const canResetLobby =
+    isHost && room !== null && !isCommandPending("RESET_TO_LOBBY") && canAbortRound(game);
+  const canKickGuest =
+    isHost && room !== null && !isCommandPending("KICK_GUEST") && canAbortRound(game);
 
   const runCommand = useCallback(
     async (input: ClientCommandInput) => {
@@ -697,7 +718,7 @@ function HomeContent() {
   const status = (
     <div className="status-strip">
       <span className={`phase-chip phase-chip--${game?.phase ?? "setup"}`}>
-        {phaseLabel(game?.phase ?? "setup")}
+        {formatGamePhase(game?.phase ?? "setup")}
       </span>
       <span>{roomStatusLabel(room, preview, connectionStatus)}</span>
     </div>
@@ -785,7 +806,6 @@ function HomeContent() {
           <RoomGameView
             actor={actor}
             game={game}
-            guestConnected={guestConnected}
             isCommandPending={isCommandPending}
             isGeneratingCustomItem={isGeneratingCustomItem}
             isHost={isHost}
@@ -1162,9 +1182,11 @@ function RoomControls({
   const playerBPresenceText = guestSeatOccupied
     ? `Player B: ${playerBPresenceLabel}`
     : "Player B: No guest";
-  const startHint = !guestSeatOccupied
-    ? "Waiting for player B to join"
-    : "Player B is disconnected";
+  // F-04: Start no longer needs Player B to be live (see canStartRoom) - a
+  // disconnected-but-seated guest is now a cosmetic presence badge only,
+  // not a reason Start is disabled. The only remaining blocking condition
+  // is an empty guest seat.
+  const startHint = "Waiting for player B to join";
 
   // Show a hint explaining why Start is disabled for stable guest states.
   // Do not mention the commanding state here; it is transient and not
@@ -1173,7 +1195,7 @@ function RoomControls({
     isHost &&
     room.lifecycle === "lobby" &&
     !canStartRoom &&
-    (!guestSeatOccupied || !guestConnected);
+    !guestSeatOccupied;
 
   // Room admin chrome (invite link, reset/kick/forget) is the primary task
   // in the lobby and on the game-over screen, so it starts expanded there.
@@ -1350,7 +1372,6 @@ function RoomControls({
 type RoomGameViewProps = Readonly<{
   actor: PlayerId | null;
   game: PublicRoomGameState;
-  guestConnected: boolean;
   /**
    * Reports whether any of the given command types is currently in
    * flight. Each phase below passes only the command type(s) its own
@@ -1375,7 +1396,6 @@ type RoomGameViewProps = Readonly<{
 function RoomGameView({
   actor,
   game,
-  guestConnected,
   isCommandPending,
   isGeneratingCustomItem,
   isHost,
@@ -1446,6 +1466,7 @@ function RoomGameView({
       <>
         {stepper}
         <TurnBanner isYourTurn={isYourTurn} waitingForName={waitingForName} />
+        <TurnCountdown turnDeadlineMs={game.turnDeadlineMs} />
         <div className="play-stack">
           <ItemPanel item={game.item} />
           <section className="phase-panel">
@@ -1476,6 +1497,7 @@ function RoomGameView({
       <>
         {stepper}
         <TurnBanner isYourTurn={isYourTurn} waitingForName={waitingForName} />
+        <TurnCountdown turnDeadlineMs={game.turnDeadlineMs} />
         <div className="play-stack">
           <ItemPanel item={game.item} />
           <WidthNegotiationPanel
@@ -1505,6 +1527,7 @@ function RoomGameView({
       <>
         {stepper}
         <TurnBanner isYourTurn={isYourTurn} waitingForName={waitingForName} />
+        <TurnCountdown turnDeadlineMs={game.turnDeadlineMs} />
         <div className="play-stack">
           <ItemPanel item={game.item} />
           <section className="phase-panel">
@@ -1535,11 +1558,79 @@ function RoomGameView({
     const waitingForName = !isYourTurn
       ? game.players[game.roles.trader].name
       : undefined;
+    const traderName = game.players[game.roles.trader].name;
+
+    // F-02/F-06: a settlement failure bounced this round back out of
+    // `settling` with a pendingTrade already locked in (see
+    // lockedPendingTrade's doc comment). Buy/Sell must not be shown as a
+    // live choice here - whichever button is clicked, the server ignores
+    // it and retries the same already-decided side, so presenting them as
+    // meaningfully different would be dishonest.
+    if (game.lockedPendingTrade) {
+      const lockedTrade = game.lockedPendingTrade;
+      // F-07: how many settling episodes have already failed for this
+      // round (see settlementFailureCount on ChoosingSideGameState). Always
+      // set alongside lockedPendingTrade - the `?? 0` is only a defensive
+      // fallback, not an expected case - and always strictly less than
+      // SETTLEMENT_FAILURE_EPISODE_CAP: reaching the cap routes to the
+      // terminal `error` phase instead, which renders a different panel
+      // entirely (see the fallback error-panel branch below).
+      const failureCount = game.settlementFailureCount ?? 0;
+
+      return (
+        <>
+          {stepper}
+          <TurnBanner isYourTurn={isYourTurn} waitingForName={waitingForName} />
+          <TurnCountdown turnDeadlineMs={game.turnDeadlineMs} />
+          <div className="play-stack">
+            <ItemPanel item={game.item} />
+            <section className="phase-panel" data-testid="settlement-retry-panel">
+              <p className="eyebrow">Settlement failed</p>
+              <h2>Retrying {traderName}&rsquo;s trade</h2>
+              <p
+                className="settlement-panel__forced-note"
+                data-testid="settlement-locked-note"
+              >
+                {lockedTrade.kind === "chosen"
+                  ? `${traderName}'s trade already went through, but settling it failed. `
+                  : `${traderName}'s clock ran out before choosing a side, and settling the forced side failed. `}
+                The decision is locked in - retrying will not let {traderName}{" "}
+                choose a different side, and the clock will retry
+                automatically if it runs out again. This round has failed to
+                settle {failureCount}{" "}
+                {failureCount === 1 ? "time" : "times"} so far; if it fails{" "}
+                {SETTLEMENT_FAILURE_EPISODE_CAP} times in a row it will stop
+                retrying and the host will need to reset the lobby.
+              </p>
+              <div className="room-actions">
+                {/* The side argument is a placeholder: the reducer ignores
+                    it entirely while lockedPendingTrade is set and re-uses
+                    the locked decision instead (see EXECUTE_TRADE in
+                    reducer.ts), so this button just triggers a retry
+                    attempt rather than making any real choice. */}
+                <button
+                  className="secondary-button"
+                  disabled={
+                    isCommandPending("EXECUTE_TRADE") || actor !== game.roles.trader
+                  }
+                  onClick={() => onExecuteTrade("BUY")}
+                  type="button"
+                >
+                  Retry settlement
+                </button>
+              </div>
+              <LastError game={game} />
+            </section>
+          </div>
+        </>
+      );
+    }
 
     return (
       <>
         {stepper}
         <TurnBanner isYourTurn={isYourTurn} waitingForName={waitingForName} />
+        <TurnCountdown turnDeadlineMs={game.turnDeadlineMs} />
         <div className="play-stack">
           <ItemPanel item={game.item} />
           <TradeActionPanel
@@ -1568,11 +1659,27 @@ function RoomGameView({
           <ItemPanel item={game.item} />
           <section className="phase-panel" data-testid="settling-panel">
             <p className="eyebrow">Settling trade</p>
-            <h2>
-              {game.players[game.roles.trader].name} chose{" "}
-              {game.pendingSide === "BUY" ? "Buy" : "Sell"}
-            </h2>
-            <p>The server is revealing the true value and computing PnL.</p>
+            {game.pendingTrade.kind === "chosen" ? (
+              <>
+                <h2>
+                  {game.players[game.roles.trader].name} chose{" "}
+                  {formatTradeSide(game.pendingTrade.side)}
+                </h2>
+                <p>The server is revealing the true value and computing PnL.</p>
+              </>
+            ) : (
+              <>
+                <h2>{game.players[game.roles.trader].name} ran out of time</h2>
+                <p
+                  className="settlement-panel__forced-note"
+                  data-testid="settling-forced-note"
+                >
+                  The clock expired before a side was chosen, so the round
+                  will settle against whichever side is worse for{" "}
+                  {game.players[game.roles.trader].name}.
+                </p>
+              </>
+            )}
             <div className="loading-line" aria-label="Loading" />
             {canRetry ? (
               <div className="room-actions">
@@ -1599,11 +1706,12 @@ function RoomGameView({
 
   if (game.phase === "settlement") {
     const isFinalRound = game.roundNumber >= game.totalRounds;
+    // F-04: presence gating was dropped entirely (the shot clock now
+    // handles an absent opponent), so a disconnected Player B no longer
+    // blocks advancing the round - only host authorization does.
     const settlementDisabledReason = !isHost
       ? "Only the host can advance rounds."
-      : !isFinalRound && !guestConnected
-        ? "Player B is disconnected. Waiting for Player B to reconnect before starting the next round."
-        : undefined;
+      : undefined;
 
     return (
       <>
@@ -1620,6 +1728,32 @@ function RoomGameView({
             onContinue={onAdvanceRound}
             players={game.players}
             settlement={game.settlement}
+          />
+        </div>
+      </>
+    );
+  }
+
+  if (game.phase === "roundForfeited") {
+    const isFinalRound = game.roundNumber >= game.totalRounds;
+    const forfeitDisabledReason = !isHost
+      ? "Only the host can advance rounds."
+      : undefined;
+
+    return (
+      <>
+        {stepper}
+        <div className="play-stack">
+          <RoundForfeitPanel
+            disabled={
+              isCommandPending("ADVANCE_ROUND") ||
+              forfeitDisabledReason !== undefined
+            }
+            disabledReason={forfeitDisabledReason}
+            forfeit={game.forfeit}
+            isFinalRound={isFinalRound}
+            onContinue={onAdvanceRound}
+            players={game.players}
           />
         </div>
       </>
@@ -1660,12 +1794,33 @@ function RoomGameView({
   }
 
   const canRetry = canRetryItemGeneration(game, isHost);
+  // F-07: a settlement that failed SETTLEMENT_FAILURE_EPISODE_CAP times in a
+  // row for the same round lands here with previousPhase "settling" instead
+  // of "generatingItem" - see the terminal branch of SETTLEMENT_FAILED in
+  // reducer.ts. Unlike an item-generation error (transient, and retryable
+  // via canRetry above), this is a permanent give-up: there is no
+  // RoundSettlement and no true_value to fall back on, so the copy must say
+  // so plainly instead of reusing the generic "Game error" wording that a
+  // host has already seen mean "retry and it'll probably work."
+  const isPermanentSettlementFailure = game.previousPhase === "settling";
 
   return (
     <section className="phase-panel" data-testid="error-panel">
-      <p className="eyebrow">Game error</p>
-      <h2>Round stopped</h2>
+      <p className="eyebrow">
+        {isPermanentSettlementFailure ? "Settlement failed permanently" : "Game error"}
+      </p>
+      <h2>
+        {isPermanentSettlementFailure
+          ? "This round could not be settled"
+          : "Round stopped"}
+      </h2>
       <p>{game.error}</p>
+      {isPermanentSettlementFailure ? (
+        <p data-testid="settlement-permanently-failed-note">
+          Automatic retries were exhausted for this round. It cannot be
+          resumed - the host can only reset the lobby.
+        </p>
+      ) : null}
       {isHost ? (
         <div className="room-actions">
           {canRetry ? (
@@ -1798,6 +1953,23 @@ function publicRoomStateWithoutPresenceJson(room: PublicRoomSnapshot): string {
  * just an item-generation failure. See retryRoomItemGeneration in
  * src/lib/room/commands.ts.
  */
+/**
+ * Server-side, `settlingRoundFailure` in src/lib/room/commands.ts already
+ * rejects RESET_TO_LOBBY/KICK_GUEST while the room is `settling`: the
+ * trade's outcome is already fixed at that point (true_value was set back
+ * when the item was generated) but not yet revealed or scored, so allowing
+ * either command there would let a host-as-trader duck a bad outcome by
+ * nuking the room before it resolves - and the guest would never even learn
+ * what it would have been. This predicate only keeps the controls from
+ * offering an action the server will reject; it must match that guard
+ * exactly; it does not add any additional restriction of its own; every
+ * other phase (including before a trade is executed, and after settlement
+ * has resolved) leaves the controls enabled.
+ */
+export function canAbortRound(game: PublicRoomGameState | null): boolean {
+  return game === null || game.phase !== "settling";
+}
+
 export function canRetryItemGeneration(
   game: PublicRoomGameState,
   isHost: boolean,
@@ -2023,25 +2195,6 @@ function connectionStatusLabel(status: ConnectionStatus): string {
       return "Disconnected";
     default:
       return "Offline";
-  }
-}
-
-function phaseLabel(phase: string): string {
-  switch (phase) {
-    case "generatingItem":
-      return "Generating";
-    case "proposingWidth":
-      return "Proposing width";
-    case "negotiatingWidth":
-      return "Negotiating width";
-    case "configuringMarket":
-      return "Setting market";
-    case "choosingSide":
-      return "Choosing side";
-    case "gameOver":
-      return "Game over";
-    default:
-      return phase.charAt(0).toUpperCase() + phase.slice(1);
   }
 }
 

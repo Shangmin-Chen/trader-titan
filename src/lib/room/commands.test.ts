@@ -1,10 +1,20 @@
-import type { GeneratedItem, SettledGeneratedItem } from "../game/types";
+import {
+  CHOOSING_SIDE_TURN_DURATION_MS,
+  CONFIGURING_MARKET_TURN_DURATION_MS,
+  NEGOTIATING_WIDTH_TURN_DURATION_MS,
+  PROPOSING_WIDTH_FORFEIT_PENALTY,
+  PROPOSING_WIDTH_TURN_DURATION_MS,
+  type GeneratedItem,
+  type SettledGeneratedItem,
+} from "../game/types";
 import {
   advanceRoomRound,
   configureRoom,
   createLobbyRoom,
   executeTrade,
+  expireRoomTurn,
   failRoomItem,
+  failRoomSettlement,
   joinRoom,
   kickGuest,
   parseCapabilityToken,
@@ -23,7 +33,6 @@ import {
   type RoomCapabilityToken,
   type RoomCommandResult,
   type RoomId,
-  type RoomPresence,
   type RoomState,
   type TokenHash,
   type TokenVerifier,
@@ -34,18 +43,6 @@ const ROOM_ID_VALUE = "room_commands_0001";
 const HOST_SECRET = "host_secret_100000000001";
 const GUEST_SECRET = "guest_secret_100000000001";
 const NEXT_GUEST_SECRET = "guest_secret_100000000002";
-const LIVE_PRESENCE = {
-  players: {
-    A: true,
-    B: true,
-  },
-} satisfies RoomPresence;
-const GUEST_OFFLINE_PRESENCE = {
-  players: {
-    A: true,
-    B: false,
-  },
-} satisfies RoomPresence;
 
 const item: GeneratedItem = {
   round_id: "round-commands-1",
@@ -68,7 +65,6 @@ describe("room commands", () => {
     const started = expectOk(
       startRoom(configured, {
         credential: present(hostToken),
-        presence: LIVE_PRESENCE,
         verifyToken,
         nowMs: NOW_MS + 3,
       }),
@@ -125,7 +121,6 @@ describe("room commands", () => {
     const finished = expectOk(
       advanceRoomRound(settled, {
         credential: present(hostToken),
-        presence: LIVE_PRESENCE,
         verifyToken,
         nowMs: NOW_MS + 11,
       }),
@@ -136,45 +131,47 @@ describe("room commands", () => {
     expect(finished.game.scores.A + finished.game.scores.B).toBe(0);
   });
 
-  it("rejects starting a joined room while Player B is offline", () => {
+  // F-04: presence gating was dropped entirely (the turn shot clock now
+  // handles an absent opponent instead). These pin the inverse of the old
+  // "rejects ... while Player B is offline" behavior so a regression that
+  // re-adds gating here is caught.
+  it("allows starting a joined room while Player B is offline", () => {
     const { room, hostToken } = joinedRoom();
     const result = startRoom(room, {
       credential: present(hostToken),
-      presence: GUEST_OFFLINE_PRESENCE,
       verifyToken,
       nowMs: NOW_MS + 2,
     });
 
-    expect(result).toEqual({
-      ok: false,
-      room,
-      error: {
-        code: "player_offline",
-        message: "Player B must be connected before the room can continue.",
-      },
-    });
+    expect(result.ok).toBe(true);
+
+    if (!result.ok) {
+      throw new Error(result.error.message);
+    }
+
+    expect(result.room.lifecycle).toBe("active");
+    expect(result.room.game.phase).toBe("generatingItem");
   });
 
-  it("rejects non-final round advance while Player B is offline", () => {
+  it("allows non-final round advance while Player B is offline", () => {
     const { room, hostToken } = settlingRoom();
     const settled = expectOk(
       receiveRoomSettlement(room, settledItemFor(room.game, 1_200), NOW_MS + 10),
     );
     const result = advanceRoomRound(settled, {
       credential: present(hostToken),
-      presence: GUEST_OFFLINE_PRESENCE,
       verifyToken,
       nowMs: NOW_MS + 11,
     });
 
-    expect(result).toEqual({
-      ok: false,
-      room: settled,
-      error: {
-        code: "player_offline",
-        message: "Player B must be connected before the room can continue.",
-      },
-    });
+    expect(result.ok).toBe(true);
+
+    if (!result.ok) {
+      throw new Error(result.error.message);
+    }
+
+    expect(result.room.game.phase).toBe("generatingItem");
+    expect(result.room.game.roundNumber).toBe(2);
   });
 
   it("allows final round advance to game over while Player B is offline", () => {
@@ -185,7 +182,6 @@ describe("room commands", () => {
     const finished = expectOk(
       advanceRoomRound(settled, {
         credential: present(hostToken),
-        presence: GUEST_OFFLINE_PRESENCE,
         verifyToken,
         nowMs: NOW_MS + 11,
       }),
@@ -195,7 +191,7 @@ describe("room commands", () => {
     expect(finished.game.phase).toBe("gameOver");
   });
 
-  it("keeps Player B as round 2 market maker when both players are live", () => {
+  it("keeps Player B as round 2 market maker after advancing", () => {
     const { room, hostToken } = settlingRoom();
     const settled = expectOk(
       receiveRoomSettlement(room, settledItemFor(room.game, 1_200), NOW_MS + 10),
@@ -203,7 +199,6 @@ describe("room commands", () => {
     const round2 = expectOk(
       advanceRoomRound(settled, {
         credential: present(hostToken),
-        presence: LIVE_PRESENCE,
         verifyToken,
         nowMs: NOW_MS + 11,
       }),
@@ -252,7 +247,6 @@ describe("room commands", () => {
     );
     const earlyAdvance = advanceRoomRound(room, {
       credential: present(hostToken),
-      presence: LIVE_PRESENCE,
       verifyToken,
       nowMs: NOW_MS + 11,
     });
@@ -270,7 +264,7 @@ describe("room commands", () => {
       room,
       error: {
         code: "invalid_game_phase",
-        message: "Rounds can only advance after settlement.",
+        message: "Rounds can only advance after settlement or a round forfeit.",
       },
     });
   });
@@ -352,7 +346,7 @@ describe("room commands", () => {
   it("lets the host retry a stuck settlement without mutating the room or the private item", () => {
     // The room command layer does not resolve the settlement itself; it
     // leaves the room exactly as EXECUTE_TRADE committed it (same item,
-    // quote, pendingSide) and reports success so the Worker layer can
+    // quote, pendingTrade) and reports success so the Worker layer can
     // re-run the settlement effect for the current round. See the
     // worker-level F-02 recovery test for the full end-to-end path.
     const { room, hostToken } = settlingRoom();
@@ -438,6 +432,97 @@ describe("room commands", () => {
     expect(reset.game.roundNumber).toBe(0);
   });
 
+  it("rejects RESET_TO_LOBBY while a trade is settling, without mutating the room", () => {
+    // The trade's outcome is already fixed the instant EXECUTE_TRADE lands
+    // (true_value was fixed back when the item was generated); only the
+    // reveal and score update are still pending. Letting a host-as-trader
+    // nuke the room here would let them duck a bad outcome, and the guest
+    // would never even learn what it would have been.
+    const { room, hostToken } = settlingRoom();
+    const result = resetRoomToLobby(room, {
+      credential: present(hostToken),
+      verifyToken,
+      nowMs: NOW_MS + 9,
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      room,
+      error: {
+        code: "round_settling",
+        message:
+          "This round's trade is locked in and settling. Wait for it to resolve, or use Retry if it's stuck, before resetting or kicking.",
+      },
+    });
+  });
+
+  it("rejects KICK_GUEST while a trade is settling, without mutating the room", () => {
+    const { room, hostToken } = settlingRoom();
+    const result = kickGuest(room, {
+      credential: present(hostToken),
+      verifyToken,
+      nowMs: NOW_MS + 9,
+    });
+
+    expect(result).toEqual({
+      ok: false,
+      room,
+      error: {
+        code: "round_settling",
+        message:
+          "This round's trade is locked in and settling. Wait for it to resolve, or use Retry if it's stuck, before resetting or kicking.",
+      },
+    });
+  });
+
+  it("allows RESET_TO_LOBBY and KICK_GUEST again once settlement resolves", () => {
+    const { room, hostToken } = settlingRoom();
+    const settled = expectOk(
+      receiveRoomSettlement(room, settledItemFor(room.game, 1_200), NOW_MS + 10),
+    );
+
+    const reset = expectOk(
+      resetRoomToLobby(settled, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 11,
+      }),
+    );
+    expect(reset.lifecycle).toBe("lobby");
+
+    const kicked = expectOk(
+      kickGuest(settled, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 11,
+      }),
+    );
+    expect(kicked.lifecycle).toBe("lobby");
+    expect(kicked.guest).toBeNull();
+  });
+
+  it("still allows RESET_TO_LOBBY and KICK_GUEST before a trade is executed (choosingSide)", () => {
+    // Only the determined-but-unrevealed window (`settling`) is restricted.
+    // A host must still be able to abandon a round that hasn't committed to
+    // an outcome yet - e.g. an abandoned guest before either player has
+    // acted on the quote.
+    const { room, hostToken } = settlingRoom();
+    const choosingSide = expectOk(
+      failRoomSettlement(room, "forced back to choosingSide", NOW_MS + 9),
+    );
+
+    expect(choosingSide.game.phase).toBe("choosingSide");
+
+    const reset = expectOk(
+      resetRoomToLobby(choosingSide, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 10,
+      }),
+    );
+    expect(reset.lifecycle).toBe("lobby");
+  });
+
   it("denies unauthorized commands without mutating the room", () => {
     const { room, hostToken, guestToken } = joinedRoom();
     const guestConfigure = configureRoom(room, {
@@ -449,7 +534,6 @@ describe("room commands", () => {
     const started = expectOk(
       startRoom(room, {
         credential: present(hostToken),
-        presence: LIVE_PRESENCE,
         verifyToken,
         nowMs: NOW_MS + 3,
       }),
@@ -485,6 +569,274 @@ describe("room commands", () => {
       },
     });
   });
+
+  it("stamps a server-authoritative absolute deadline on each actionable phase, never a client-supplied one", () => {
+    const { room, hostToken, guestToken } = activeRoom();
+    const withItem = expectOk(receiveRoomItem(room, item, NOW_MS + 4));
+
+    if (withItem.game.phase !== "proposingWidth") {
+      throw new Error("Expected proposingWidth phase.");
+    }
+    expect(withItem.game.turnDeadlineMs).toBe(NOW_MS + 4 + PROPOSING_WIDTH_TURN_DURATION_MS);
+
+    const opened = expectOk(
+      submitInitialWidth(withItem, 500, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 5,
+      }),
+    );
+    if (opened.game.phase !== "negotiatingWidth") {
+      throw new Error("Expected negotiatingWidth phase.");
+    }
+    expect(opened.game.turnDeadlineMs).toBe(NOW_MS + 5 + NEGOTIATING_WIDTH_TURN_DURATION_MS);
+
+    const tightened = expectOk(
+      tightenWidth(opened, 200, {
+        credential: present(guestToken),
+        verifyToken,
+        nowMs: NOW_MS + 6,
+      }),
+    );
+    if (tightened.game.phase !== "negotiatingWidth") {
+      throw new Error("Expected negotiatingWidth phase.");
+    }
+    // Each successful TIGHTEN_WIDTH hands the decision to a (possibly new)
+    // active trader, so the clock refreshes rather than counting down from
+    // the original proposal.
+    expect(tightened.game.turnDeadlineMs).toBe(NOW_MS + 6 + NEGOTIATING_WIDTH_TURN_DURATION_MS);
+
+    const configuring = expectOk(
+      tradeOnWidth(tightened, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 7,
+      }),
+    );
+    if (configuring.game.phase !== "configuringMarket") {
+      throw new Error("Expected configuringMarket phase.");
+    }
+    expect(configuring.game.turnDeadlineMs).toBe(NOW_MS + 7 + CONFIGURING_MARKET_TURN_DURATION_MS);
+
+    const choosing = expectOk(
+      submitMarketQuote(configuring, { bid: 900, ask: 1100 }, {
+        credential: present(guestToken),
+        verifyToken,
+        nowMs: NOW_MS + 8,
+      }),
+    );
+    if (choosing.game.phase !== "choosingSide") {
+      throw new Error("Expected choosingSide phase.");
+    }
+    expect(choosing.game.turnDeadlineMs).toBe(NOW_MS + 8 + CHOOSING_SIDE_TURN_DURATION_MS);
+  });
+
+  it("forfeits the round and applies the zero-sum penalty when the turn clock expires", () => {
+    const { room, hostToken } = activeRoom();
+    const withItem = expectOk(receiveRoomItem(room, item, NOW_MS + 4));
+    const opened = expectOk(
+      submitInitialWidth(withItem, 500, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 5,
+      }),
+    );
+    // SUBMIT_INITIAL_WIDTH does not swap roles, so round 1's default trader
+    // (B) is the one negotiatingWidth is waiting on here.
+    expect(opened.game.roles).toEqual({ marketMaker: "A", trader: "B" });
+
+    const expired = expireRoomTurn(opened, NOW_MS + 6);
+
+    expect(expired.ok).toBe(true);
+
+    if (!expired.ok) {
+      throw new Error(expired.error.message);
+    }
+    expect(expired.room.game.phase).toBe("roundForfeited");
+
+    if (expired.room.game.phase !== "roundForfeited") {
+      throw new Error("Expected roundForfeited phase.");
+    }
+    expect(expired.room.game.forfeit).toMatchObject({
+      roundNumber: 1,
+      phase: "negotiatingWidth",
+      forfeitedBy: "B",
+      awardedTo: "A",
+      penalty: 500,
+    });
+    expect(expired.room.game.scores).toEqual({ A: 500, B: -500 });
+  });
+
+  it("forfeits proposingWidth using the named fallback penalty (no spread width exists yet)", () => {
+    const { room } = activeRoom();
+    const withItem = expectOk(receiveRoomItem(room, item, NOW_MS + 4));
+
+    expect(withItem.game.phase).toBe("proposingWidth");
+    expect(withItem.game.roles).toEqual({ marketMaker: "A", trader: "B" });
+
+    const expired = expireRoomTurn(withItem, NOW_MS + 5);
+
+    expect(expired.ok).toBe(true);
+
+    if (!expired.ok) {
+      throw new Error(expired.error.message);
+    }
+    expect(expired.room.game.phase).toBe("roundForfeited");
+
+    if (expired.room.game.phase !== "roundForfeited") {
+      throw new Error("Expected roundForfeited phase.");
+    }
+    expect(expired.room.game.forfeit).toMatchObject({
+      phase: "proposingWidth",
+      forfeitedBy: "A",
+      awardedTo: "B",
+      penalty: PROPOSING_WIDTH_FORFEIT_PENALTY,
+    });
+    expect(expired.room.game.scores).toEqual({
+      A: -PROPOSING_WIDTH_FORFEIT_PENALTY,
+      B: PROPOSING_WIDTH_FORFEIT_PENALTY,
+    });
+  });
+
+  it("moves a choosingSide timeout to settling with an unresolved pendingTrade instead of forfeiting (F-06)", () => {
+    const { room, hostToken, guestToken } = activeRoom();
+    const withItem = expectOk(receiveRoomItem(room, item, NOW_MS + 4));
+    const opened = expectOk(
+      submitInitialWidth(withItem, 200, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 5,
+      }),
+    );
+    const configuring = expectOk(
+      tradeOnWidth(opened, {
+        credential: present(guestToken),
+        verifyToken,
+        nowMs: NOW_MS + 6,
+      }),
+    );
+    const choosing = expectOk(
+      submitMarketQuote(configuring, { bid: 900, ask: 1100 }, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 7,
+      }),
+    );
+
+    expect(choosing.game.phase).toBe("choosingSide");
+
+    const expired = expireRoomTurn(choosing, NOW_MS + 8);
+
+    expect(expired.ok).toBe(true);
+
+    if (!expired.ok) {
+      throw new Error(expired.error.message);
+    }
+    expect(expired.room.game.phase).toBe("settling");
+
+    if (expired.room.game.phase !== "settling") {
+      throw new Error("Expected settling phase.");
+    }
+    expect(expired.room.game.pendingTrade).toEqual({ kind: "timeoutForcedWorstSide" });
+    // Unlike a forfeit, no penalty is applied at this point - the round is
+    // not over yet, it is still waiting on the private true_value.
+    expect(expired.room.game.scores).toEqual(choosing.game.scores);
+  });
+
+  it("resolves a choosingSide timeout's forced settlement against whichever side is worse for the trader", () => {
+    const { room, hostToken, guestToken } = activeRoom();
+    const withItem = expectOk(receiveRoomItem(room, item, NOW_MS + 4));
+    const opened = expectOk(
+      submitInitialWidth(withItem, 200, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 5,
+      }),
+    );
+    const configuring = expectOk(
+      tradeOnWidth(opened, {
+        credential: present(guestToken),
+        verifyToken,
+        nowMs: NOW_MS + 6,
+      }),
+    );
+    // Default round-1 roles: trader is B. Quote 3600/3800 against a true
+    // value of 3600 makes BUY (traderPnL -200) worse than SELL (0).
+    const choosing = expectOk(
+      submitMarketQuote(configuring, { bid: 3600, ask: 3800 }, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 7,
+      }),
+    );
+    const settling = expectOk(expireRoomTurn(choosing, NOW_MS + 8));
+
+    if (settling.game.phase !== "settling") {
+      throw new Error("Expected settling phase.");
+    }
+
+    const settled = expectOk(
+      receiveRoomSettlement(
+        settling,
+        { ...settling.game.item, true_value: 3600 },
+        NOW_MS + 9,
+      ),
+    );
+
+    expect(settled.game.phase).toBe("settlement");
+
+    if (settled.game.phase !== "settlement") {
+      throw new Error("Expected settlement phase.");
+    }
+    expect(settled.game.settlement.side).toBe("BUY");
+    expect(settled.game.settlement.forcedByTimeout).toBe(true);
+    expect(settled.game.settlement.traderPnL).toBe(-200);
+    expect(settled.game.scores).toEqual({ A: 200, B: -200 });
+  });
+
+  it("rejects turn expiry outside the four actionable phases without mutating the room", () => {
+    const { room } = activeRoom();
+    const { room: settling } = settlingRoom();
+
+    const rejectedInGeneratingItem = expireRoomTurn(room, NOW_MS + 4);
+    const rejectedInSettling = expireRoomTurn(settling, NOW_MS + 9);
+
+    expect(rejectedInGeneratingItem).toEqual({
+      ok: false,
+      room,
+      error: {
+        code: "invalid_game_phase",
+        message: "Turn expiry can only apply while a player is on the clock.",
+      },
+    });
+    expect(rejectedInSettling).toEqual({
+      ok: false,
+      room: settling,
+      error: {
+        code: "invalid_game_phase",
+        message: "Turn expiry can only apply while a player is on the clock.",
+      },
+    });
+  });
+
+  it("advances from a round forfeit exactly like advancing from settlement", () => {
+    const { room, hostToken } = activeRoom(1);
+    const withItem = expectOk(receiveRoomItem(room, item, NOW_MS + 4));
+    const expired = expectOk(expireRoomTurn(withItem, NOW_MS + 5));
+
+    expect(expired.game.phase).toBe("roundForfeited");
+
+    const finished = expectOk(
+      advanceRoomRound(expired, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 6,
+      }),
+    );
+
+    expect(finished.lifecycle).toBe("finished");
+    expect(finished.game.phase).toBe("gameOver");
+  });
 });
 
 function activeRoom(totalRounds?: number): {
@@ -509,7 +861,6 @@ function activeRoom(totalRounds?: number): {
     room: expectOk(
       startRoom(configured, {
         credential: present(hostToken),
-        presence: LIVE_PRESENCE,
         verifyToken,
         nowMs: NOW_MS + 2,
       }),

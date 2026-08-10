@@ -3,15 +3,20 @@ import {
   gameReducer,
   startGame as startGameReducer,
 } from "../game/reducer";
-import { calculateSettlement } from "../game/settlement";
-import type {
-  GameAction,
-  GameState,
-  GeneratedItem,
-  PlayerId,
-  Quote,
-  SettledGeneratedItem,
-  TradeSide,
+import { calculateSettlement, resolvePendingTradeSide } from "../game/settlement";
+import {
+  CHOOSING_SIDE_TURN_DURATION_MS,
+  CONFIGURING_MARKET_TURN_DURATION_MS,
+  NEGOTIATING_WIDTH_TURN_DURATION_MS,
+  PROPOSING_WIDTH_TURN_DURATION_MS,
+  type GameAction,
+  type GamePhase,
+  type GameState,
+  type GeneratedItem,
+  type PlayerId,
+  type Quote,
+  type SettledGeneratedItem,
+  type TradeSide,
 } from "../game/types";
 import { validateStartGame } from "../game/validation";
 import { authorizeRoomAction } from "./authorization";
@@ -32,7 +37,6 @@ import {
   type RoomCommandResult,
   type RoomDomainErrorCode,
   type RoomGameConfig,
-  type RoomPresence,
   type RoomState,
   type UnixTimeMs,
 } from "./types";
@@ -56,11 +60,6 @@ export type AuthorizedCommandInput = Readonly<{
   verifyToken: TokenVerifier;
   nowMs: UnixTimeMs;
 }>;
-
-export type PresenceAwareCommandInput = AuthorizedCommandInput &
-  Readonly<{
-    presence: RoomPresence;
-  }>;
 
 export type ConfigureRoomInput = AuthorizedCommandInput &
   Readonly<{
@@ -177,7 +176,7 @@ export function configureRoom(
 
 export function startRoom(
   room: RoomState,
-  input: PresenceAwareCommandInput,
+  input: AuthorizedCommandInput,
 ): RoomCommandResult {
   const authorized = authorizeRoomAction(
     room,
@@ -196,10 +195,6 @@ export function startRoom(
 
   if (room.guest === null) {
     return commandFailure(room, "guest_required", "A guest must join before the room can start.");
-  }
-
-  if (!isPlayerLive(input.presence, GUEST_PLAYER_ID)) {
-    return playerOfflineFailure(room);
   }
 
   const payload = startPayloadForRoom(room);
@@ -233,6 +228,11 @@ export function resetRoomToLobby(
 
   if (!authorized.ok) {
     return { ok: false, room, error: authorized.error };
+  }
+
+  const settling = settlingRoundFailure(room);
+  if (settling !== null) {
+    return settling;
   }
 
   return {
@@ -271,6 +271,11 @@ export function kickGuest(
     return commandFailure(room, "guest_slot_empty", "There is no guest to kick.");
   }
 
+  const settling = settlingRoundFailure(room);
+  if (settling !== null) {
+    return settling;
+  }
+
   return {
     ok: true,
     room: {
@@ -297,7 +302,11 @@ export function receiveRoomItem(
     return commandFailure(room, "invalid_game_phase", "Items can only be received while the room is generating an item.");
   }
 
-  return applySystemGameAction(room, { type: "ITEM_RECEIVED", item }, nowMs);
+  return applySystemGameAction(
+    room,
+    { type: "ITEM_RECEIVED", item, turnDeadlineMs: nowMs + PROPOSING_WIDTH_TURN_DURATION_MS },
+    nowMs,
+  );
 }
 
 export function failRoomItem(
@@ -328,11 +337,14 @@ export function failRoomItem(
  * unchanged; see specs/room-protocol.md.
  *
  * The settling branch intentionally does not touch the reducer: the room
- * is left exactly as EXECUTE_TRADE committed it (same item, quote, and
- * pendingSide), and the caller re-runs the settlement effect
- * (Worker `applyAutomaticRoomEffects` -> `receiveStoredSettlement`) against
- * that unchanged state. Settlement is a pure function of
- * (item, quote, side), so retrying cannot change or re-roll the outcome.
+ * is left exactly as EXECUTE_TRADE (or an F-06 choosingSide timeout)
+ * committed it (same item, quote, and pendingTrade), and the caller re-runs
+ * the settlement effect (Worker `applyAutomaticRoomEffects` ->
+ * `receiveStoredSettlement`) against that unchanged state. Settlement is a
+ * pure function of (item, quote, side), so retrying cannot change or re-roll
+ * the outcome - including which side a forced timeout resolves to, since
+ * that is itself a pure function of (quote, true_value) via
+ * resolvePendingTradeSide.
  */
 export function retryRoomItemGeneration(
   room: RoomState,
@@ -380,7 +392,11 @@ export function submitInitialWidth(
     room,
     input,
     expectedPlayer(room.game, "SUBMIT_INITIAL_WIDTH"),
-    { type: "SUBMIT_INITIAL_WIDTH", width },
+    {
+      type: "SUBMIT_INITIAL_WIDTH",
+      width,
+      turnDeadlineMs: input.nowMs + NEGOTIATING_WIDTH_TURN_DURATION_MS,
+    },
   );
 }
 
@@ -393,7 +409,11 @@ export function tightenWidth(
     room,
     input,
     expectedPlayer(room.game, "TIGHTEN_WIDTH"),
-    { type: "TIGHTEN_WIDTH", width },
+    {
+      type: "TIGHTEN_WIDTH",
+      width,
+      turnDeadlineMs: input.nowMs + NEGOTIATING_WIDTH_TURN_DURATION_MS,
+    },
   );
 }
 
@@ -405,7 +425,10 @@ export function tradeOnWidth(
     room,
     input,
     expectedPlayer(room.game, "TRADE_ON_WIDTH"),
-    { type: "TRADE_ON_WIDTH" },
+    {
+      type: "TRADE_ON_WIDTH",
+      turnDeadlineMs: input.nowMs + CONFIGURING_MARKET_TURN_DURATION_MS,
+    },
   );
 }
 
@@ -418,7 +441,11 @@ export function submitMarketQuote(
     room,
     input,
     expectedPlayer(room.game, "SUBMIT_MARKET_QUOTE"),
-    { type: "SUBMIT_MARKET_QUOTE", quote },
+    {
+      type: "SUBMIT_MARKET_QUOTE",
+      quote,
+      turnDeadlineMs: input.nowMs + CHOOSING_SIDE_TURN_DURATION_MS,
+    },
   );
 }
 
@@ -448,13 +475,20 @@ export function receiveRoomSettlement(
     return commandFailure(room, "invalid_game_phase", "Settlements can only be received while the room is settling.");
   }
 
+  // F-06: pendingTrade is either a trader's own EXECUTE_TRADE choice or a
+  // choosingSide clock expiry deferred here specifically because this is the
+  // one place the private true_value (from `item`) and the pending decision
+  // are both in scope at once - see resolvePendingTradeSide and
+  // PendingTradeDecision.
+  const side = resolvePendingTradeSide(room.game.pendingTrade, room.game.quote, item.true_value);
   const settlement = calculateSettlement({
     roundNumber: room.game.roundNumber,
     itemTitle: room.game.item.item_title,
     trueValue: item.true_value,
     quote: room.game.quote,
-    side: room.game.pendingSide,
+    side,
     roles: room.game.roles,
+    forcedByTimeout: room.game.pendingTrade.kind === "timeoutForcedWorstSide",
   });
 
   return applySystemGameAction(
@@ -477,12 +511,49 @@ export function failRoomSettlement(
     return commandFailure(room, "invalid_game_phase", "Settlement failures can only be received while the room is settling.");
   }
 
-  return applySystemGameAction(room, { type: "SETTLEMENT_FAILED", error }, nowMs);
+  return applySystemGameAction(
+    room,
+    {
+      type: "SETTLEMENT_FAILED",
+      error,
+      turnDeadlineMs: nowMs + CHOOSING_SIDE_TURN_DURATION_MS,
+    },
+    nowMs,
+  );
+}
+
+/**
+ * F-05: the Worker alarm dispatches this when a phase's turnDeadlineMs
+ * elapses (see scheduleNextAlarm / alarm() in src/worker/index.ts). Routed
+ * through the reducer exactly like receiveRoomSettlement routes
+ * SETTLEMENT_RECEIVED, so the FSM stays the single source of truth: a
+ * late-arriving player command against a room already moved on - to
+ * roundForfeited for proposingWidth/negotiatingWidth/configuringMarket, or
+ * to settling for an F-06 choosingSide timeout - is a harmless no-op via the
+ * same phase guard every other command already relies on.
+ */
+export function expireRoomTurn(
+  room: RoomState,
+  nowMs: UnixTimeMs,
+): RoomCommandResult {
+  if (room.lifecycle !== "active") {
+    return commandFailure(room, "room_not_active", "Turn expiry can only apply to active rooms.");
+  }
+
+  if (!isTurnClockedPhase(room.game.phase)) {
+    return commandFailure(
+      room,
+      "invalid_game_phase",
+      "Turn expiry can only apply while a player is on the clock.",
+    );
+  }
+
+  return applySystemGameAction(room, { type: "TURN_EXPIRED" }, nowMs);
 }
 
 export function advanceRoomRound(
   room: RoomState,
-  input: PresenceAwareCommandInput,
+  input: AuthorizedCommandInput,
 ): RoomCommandResult {
   const authorized = authorizeRoomAction(
     room,
@@ -499,15 +570,12 @@ export function advanceRoomRound(
     return commandFailure(room, "room_not_active", "Only active rooms can advance rounds.");
   }
 
-  if (room.game.phase !== "settlement") {
-    return commandFailure(room, "invalid_game_phase", "Rounds can only advance after settlement.");
-  }
-
-  if (
-    !isFinalRoundSettlement(room.game) &&
-    !isPlayerLive(input.presence, GUEST_PLAYER_ID)
-  ) {
-    return playerOfflineFailure(room);
+  if (room.game.phase !== "settlement" && room.game.phase !== "roundForfeited") {
+    return commandFailure(
+      room,
+      "invalid_game_phase",
+      "Rounds can only advance after settlement or a round forfeit.",
+    );
   }
 
   return applySystemGameAction(room, { type: "NEXT_ROUND" }, input.nowMs);
@@ -593,12 +661,13 @@ function lifecycleForGame(game: GameState): RoomState["lifecycle"] {
   return game.phase === "gameOver" ? "finished" : "active";
 }
 
-function isFinalRoundSettlement(game: GameState): boolean {
-  return game.phase === "settlement" && game.roundNumber >= game.totalRounds;
-}
-
-function isPlayerLive(presence: RoomPresence, playerId: PlayerId): boolean {
-  return presence.players[playerId] === true;
+function isTurnClockedPhase(phase: GamePhase): boolean {
+  return (
+    phase === "proposingWidth" ||
+    phase === "negotiatingWidth" ||
+    phase === "configuringMarket" ||
+    phase === "choosingSide"
+  );
 }
 
 function buildLobbyGame(
@@ -684,10 +753,60 @@ function commandFailure(
   };
 }
 
-function playerOfflineFailure(room: RoomState): RoomCommandFailure {
+/**
+ * Closes a competitive-integrity hole: RESET_TO_LOBBY and KICK_GUEST are
+ * host-control commands with no other phase restriction, and both discard
+ * the entire match (including this round's private true_value, deleted by
+ * the Worker right after either command commits - see
+ * `shouldDeletePrivateGeneratedItemsAfterCommand`). A host who is also the
+ * trader this round has already locked in an outcome the instant
+ * EXECUTE_TRADE lands (the true value was fixed back when the item was
+ * generated; only the reveal and score update are still pending), so
+ * without this guard the host could always duck a trade going against them
+ * by nuking the room before settlement resolves - and the guest would never
+ * even learn what the outcome would have been.
+ *
+ * This intentionally targets only `settling`: every other active phase
+ * (including `choosingSide`, before a side is chosen, and `settlement`,
+ * after the outcome is revealed and scored) has no determined-but-hidden
+ * outcome to protect, so the host's reset/kick tools stay fully available
+ * there - including for a genuinely abandoned guest or a room the host
+ * wants to abandon before committing to a trade.
+ *
+ * This does not strand a stuck room: `retryRoomItemGeneration` is already
+ * authorized for hostControl and already accepts `settling` (see F-02
+ * above) as a signal to re-run the settlement effect, or, after enough
+ * failed attempts, to force the round out of `settling` via
+ * SETTLEMENT_FAILED - back to `choosingSide`, or, once
+ * SETTLEMENT_FAILURE_EPISODE_CAP consecutive episodes have failed for the
+ * same round, on to the terminal `error` phase (F-07). Every one of those
+ * outcomes leaves `settling`, whether by that command or by the Worker's
+ * own alarm-driven retry, after which RESET_TO_LOBBY/KICK_GUEST are
+ * available again - including from `error`, which is what makes the F-07
+ * terminal state recoverable rather than a dead end.
+ *
+ * The gate below checks `game.phase` only, not `room.lifecycle`. That is
+ * deliberate, not an oversight: `lifecycle` is derived from `phase` by
+ * `lifecycleForGame`, which only ever produces a non-"active" lifecycle once
+ * `phase === "gameOver"` - and `gameOver` can never be `settling`. Every
+ * `RoomState` reachable through the exported command API therefore already
+ * satisfies `phase === "settling" implies lifecycle === "active"`, so a
+ * `lifecycle !== "active"` check here can never be false when the phase
+ * check is true. Adding it back would just re-check the same fact through a
+ * second, derived representation - untestable through this module's public
+ * surface, and a trap for a future reader who might assume it is
+ * load-bearing. If a future phase/lifecycle change ever breaks that
+ * invariant, fix it at the source (`lifecycleForGame`), not by resurrecting
+ * a redundant check here.
+ */
+function settlingRoundFailure(room: RoomState): RoomCommandFailure | null {
+  if (room.game.phase !== "settling") {
+    return null;
+  }
+
   return commandFailure(
     room,
-    "player_offline",
-    "Player B must be connected before the room can continue.",
+    "round_settling",
+    "This round's trade is locked in and settling. Wait for it to resolve, or use Retry if it's stuck, before resetting or kicking.",
   );
 }

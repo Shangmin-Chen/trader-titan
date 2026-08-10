@@ -63,22 +63,165 @@ export const DEFAULT_RECONNECT_BACKOFF: BackoffConfig = {
 };
 
 /**
- * 20s ping interval stays under the ~60s idle timeout common to proxies and
- * mobile NAT. 10s pong deadline and a 2-miss threshold mean a truly dead
- * socket is caught within ~40s of going silent, without waiting on the
- * browser to notice a zombie TCP connection (which can take minutes, or
- * never, on some networks).
+ * 5s ping interval, 2s pong deadline, 2-miss threshold. Still comfortably
+ * under the ~60s idle timeout common to proxies and mobile NAT (that
+ * headroom was the old 20s interval's whole justification, and 5s only
+ * widens it), while keeping the client's own worst-case dead-socket
+ * detection window short enough to self-heal inside the shortest turn
+ * clock — see `DEAD_SOCKET_RECOVERY_BUDGET_MS` below for the arithmetic
+ * this is sized against, and F-06 in specs/room-domain.md for why
+ * choosingSide (30s, the shortest phase) makes that budget urgent: a
+ * disconnected trader who cannot detect and recover from their own dead
+ * socket before that clock expires settles at whichever side is worse for
+ * them, with PnL bounded only by the item's true value, not a flat
+ * forfeit.
+ *
+ * A truly dead socket is caught within `intervalMs +
+ * missedPongThreshold * pongTimeoutMs` of going silent (see
+ * `handleMissedPong` below, which retries the very next ping immediately
+ * on a miss rather than waiting out another full interval — the previous
+ * implementation did the latter, which quietly doubled the advertised ~40s
+ * worst case to ~60s; the retry-cadence fix is what makes this comment's
+ * arithmetic and the code agree).
+ *
+ * This does not wait on the browser to notice a zombie TCP connection
+ * (which can take minutes, or never, on some networks).
  */
 export const DEFAULT_ROOM_SOCKET_HEARTBEAT: HeartbeatConfig = {
-  intervalMs: 20_000,
-  pongTimeoutMs: 10_000,
+  intervalMs: 5_000,
+  pongTimeoutMs: 2_000,
   missedPongThreshold: 2,
   pingMessage: ROOM_SOCKET_PING_MESSAGE,
   pongMessage: ROOM_SOCKET_PONG_MESSAGE,
 };
 
+/**
+ * Worst-case time for the watchdog to notice an already-open socket has
+ * gone silent (dead Wi-Fi radio, closed laptop lid, network black hole —
+ * anything that never delivers a close frame), measured from the instant
+ * the connection actually dies:
+ *
+ *   - Up to a full `intervalMs` can elapse before the next ping is even
+ *     attempted, if the connection dies right after the previous
+ *     successful pong reset the schedule.
+ *   - Each of the `missedPongThreshold` ping attempts that follow then
+ *     waits the full `pongTimeoutMs` before being counted as missed and
+ *     (below the threshold) retried immediately — see the retry-cadence
+ *     note on `DEFAULT_ROOM_SOCKET_HEARTBEAT` above.
+ *
+ *   worst-case detection = intervalMs + missedPongThreshold * pongTimeoutMs
+ *                         = 5_000 + 2 * 2_000 = 9_000ms
+ */
+export const HEARTBEAT_WORST_CASE_DETECTION_MS =
+  DEFAULT_ROOM_SOCKET_HEARTBEAT.intervalMs +
+  DEFAULT_ROOM_SOCKET_HEARTBEAT.missedPongThreshold * DEFAULT_ROOM_SOCKET_HEARTBEAT.pongTimeoutMs;
+
+/**
+ * Once the watchdog declares the socket dead, `scheduleReconnect` waits a
+ * backed-off delay before opening the replacement — see
+ * `computeReconnectDelayMs`. For the very first retry (attempt 0) that
+ * delay is `random() * min(baseDelayMs, maxDelayMs)`, i.e. strictly less
+ * than `baseDelayMs`; used here as the (inclusive) worst-case bound.
+ */
+export const RECONNECT_BACKOFF_WORST_CASE_MS = DEFAULT_RECONNECT_BACKOFF.baseDelayMs;
+
+/**
+ * Not derived from any constant in this module: there is no enforced
+ * timeout on the WebSocket handshake itself (browsers do not expose one,
+ * and this supervisor does not currently impose its own — see the "remaining
+ * risk" note in the PR that added this budget). This is a documented
+ * *assumption*, not a guarantee: a generous upper bound on how long a
+ * healthy reconnect's TLS + WebSocket upgrade should take, plus the
+ * snapshot resync that rides along with it for free (the Durable Object
+ * sends the full `ROOM_SNAPSHOT` synchronously as part of accepting the
+ * socket — see `server.send(roomSnapshotSocketMessage(...))` in
+ * src/worker/index.ts — so resync is not a separate round trip to budget
+ * for). If a real-world connect ever hangs well past this on a live-but-
+ * degraded network, this budget under-counts that specific case; it does
+ * not cover a hung handshake, only a socket that was open and went silent.
+ */
+export const ASSUMED_SOCKET_OPEN_MS = 3_000;
+
+/**
+ * Total worst-case time for a player whose already-open socket just died
+ * to self-heal — detect it, back off, reopen, and be resynced — without
+ * any user action. This is the number that must fit inside
+ * `MIN_TURN_DURATION_MS` (src/lib/game/types.ts) with real margin, not
+ * just barely: see turn-clock-recovery-budget.test.ts, which pins the
+ * inequality so shortening a turn phase or loosening the heartbeat above
+ * fails a named test instead of reaching production silently.
+ *
+ *   9_000 (detection) + 500 (backoff) + 3_000 (assumed open) = 12_500ms
+ */
+export const DEAD_SOCKET_RECOVERY_BUDGET_MS =
+  HEARTBEAT_WORST_CASE_DETECTION_MS + RECONNECT_BACKOFF_WORST_CASE_MS + ASSUMED_SOCKET_OPEN_MS;
+
+/**
+ * A separate, DELIBERATELY-not-derived-from-`intervalMs` constant for a
+ * server-side liveness sweep (an open branch's F-08) to consume instead of
+ * computing its own threshold as a multiple of the client's ping cadence.
+ *
+ * Why this exists: F-08 (not in this worktree) currently defines its
+ * eviction threshold as `3 × DEFAULT_ROOM_SOCKET_HEARTBEAT.intervalMs`.
+ * That was a reasonable derivation when intervalMs was 20s (a 60s
+ * threshold) — comfortably above the ~60s a backgrounded tab's timers can
+ * go throttled by the browser (Chrome and others cap background timers to
+ * roughly one firing per minute), so a merely-backgrounded-but-alive tab
+ * would not get evicted. Tightening intervalMs to 5s to close the
+ * dead-socket-detection gap this file's `DEAD_SOCKET_RECOVERY_BUDGET_MS`
+ * exists to close would, under that `3×` formula, shrink the server's
+ * eviction threshold to 15s — well inside a single throttled background
+ * interval — and start evicting live-but-backgrounded tabs, converting an
+ * accidental disconnect into a *guaranteed* one on every tab switch.
+ *
+ * The two concerns are sized for different jobs (how fast can *this*
+ * client notice its *own* socket died, vs. how long should the server
+ * tolerate silence from a tab it cannot ask to hurry up) and should not
+ * share one constant. This value keeps the previous, already-reasoned-
+ * about 60s server-side tolerance; F-08 should read this constant instead
+ * of deriving `3 × intervalMs`.
+ */
+export const SERVER_PRESENCE_LIVENESS_TIMEOUT_MS = 60_000;
+
 /** Close code the watchdog uses when it force-closes a non-responsive socket. */
 export const HEARTBEAT_TIMEOUT_CLOSE_CODE = 4000;
+
+/**
+ * F-08: a socket is declared stale once this long has passed with no fresh
+ * edge auto-response observed for it (see the Worker's sweepStaleSockets,
+ * src/worker/index.ts). A socket survives jitter, a backgrounded tab
+ * throttling its timers, and brief edge hiccups, and is closed only once a
+ * full window has passed with no signal at all - which a live,
+ * hibernation-auto-responding TCP connection should never do.
+ *
+ * This is an ABSOLUTE value, deliberately NOT derived from
+ * DEFAULT_ROOM_SOCKET_HEARTBEAT.intervalMs, even though 60s happens to
+ * equal 3x today's 20s interval. The two numbers answer opposite questions
+ * and must move independently:
+ *
+ *   - intervalMs is tuned DOWN, so a client notices its own dead socket
+ *     fast enough to reconnect inside the shortest turn clock. PR #18's
+ *     turn shot clock takes it to 5s for exactly that reason.
+ *   - This threshold must stay UP, because a backgrounded browser tab has
+ *     its timers throttled to roughly one firing per minute. A tab the user
+ *     merely switched away from is alive and must not be swept.
+ *
+ * Deriving one from the other couples them backwards: shrinking the ping
+ * interval to help a disconnected player would drag this down to 15s and
+ * start evicting perfectly healthy backgrounded tabs. That is a verified
+ * hazard between this branch and #18, not a hypothetical - which is why
+ * this is a literal, and why room-socket-supervisor.test.ts asserts a floor
+ * against the background-tab throttle window rather than trusting the
+ * comment.
+ *
+ * Lives here (not in the Worker entrypoint module) because
+ * workerd treats every named export of an entrypoint module as a handler or
+ * exported class, so a plain value export there fails the service at boot
+ * (`Incorrect type for map entry ...: the provided value is not of type
+ * 'function or ExportedHandler'`) - see src/worker/index.ts's module-level
+ * comment before adding anything here back to that file.
+ */
+export const ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS = 60_000;
 
 /**
  * Deliberate, non-retryable close codes:
@@ -97,6 +240,24 @@ export const HEARTBEAT_TIMEOUT_CLOSE_CODE = 4000;
 export function isRetryableRoomSocketCloseCode(code: number): boolean {
   return code !== 1000 && code !== 1008;
 }
+
+/**
+ * Close code the server's own liveness sweep uses when it, rather than the
+ * client, decides a socket is dead (see the Worker's sweepStaleSockets,
+ * src/worker/index.ts). Deliberately not 1000 or 1008 - both are terminal
+ * per isRetryableRoomSocketCloseCode above and would stop the client from
+ * ever reconnecting, which is exactly wrong here: the client behind a stale
+ * socket is not being evicted for a policy reason, it is presumed still
+ * alive and expected to reconnect. Distinct from the client watchdog's own
+ * HEARTBEAT_TIMEOUT_CLOSE_CODE (4000) purely so a close code in logs/
+ * telemetry unambiguously identifies which side (client watchdog vs. server
+ * sweep) decided the connection was dead; both land on the same retryable
+ * side of isRetryableRoomSocketCloseCode.
+ *
+ * Lives here rather than in the Worker entrypoint module for the same
+ * boot-safety reason as ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS above.
+ */
+export const ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE = 4001;
 
 /**
  * attempt=0 is the first retry. Delay is `random() * min(maxDelayMs, base * 2^attempt)`
@@ -400,7 +561,18 @@ export class RoomSocketSupervisor {
       return;
     }
 
-    this.schedulePing(generation);
+    // Retry immediately, not after another full `intervalMs` wait: this is
+    // what makes worst-case detection `intervalMs + missedPongThreshold *
+    // pongTimeoutMs` (see `HEARTBEAT_WORST_CASE_DETECTION_MS`) rather than
+    // `missedPongThreshold * (intervalMs + pongTimeoutMs)`. Going through
+    // `schedulePing` here (as an earlier version of this method did) would
+    // add a full extra `intervalMs` of silence per miss before this retry
+    // even attempted a ping — for the old 20s/10s config that quietly
+    // doubled the ~40s worst case documented on
+    // `DEFAULT_ROOM_SOCKET_HEARTBEAT` to ~60s.
+    if (this.socket !== null) {
+      this.sendPing(generation);
+    }
   }
 
   /**

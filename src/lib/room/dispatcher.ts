@@ -2,6 +2,7 @@ import {
   advanceRoomRound,
   configureRoom,
   executeTrade,
+  expireRoomTurn,
   failRoomItem,
   failRoomSettlement,
   joinRoom,
@@ -18,10 +19,9 @@ import {
 } from "./commands";
 import type { ClientRoomCommand, SystemRoomEvent } from "./protocol";
 import type { TokenVerifier } from "./tokens";
-import type { RoomCommandResult, RoomPresence, RoomState } from "./types";
+import type { RoomCommandResult, RoomState } from "./types";
 
 export type RoomCommandDispatchContext = Readonly<{
-  presence: RoomPresence;
   verifyToken: TokenVerifier;
 }>;
 
@@ -51,7 +51,6 @@ export function dispatchRoomCommand(
     case "START_ROOM":
       return startRoom(room, {
         credential: command.credential,
-        presence: context.presence,
         verifyToken: context.verifyToken,
         nowMs: command.nowMs,
       });
@@ -70,7 +69,6 @@ export function dispatchRoomCommand(
     case "ADVANCE_ROUND":
       return advanceRoomRound(room, {
         credential: command.credential,
-        presence: context.presence,
         verifyToken: context.verifyToken,
         nowMs: command.nowMs,
       });
@@ -132,6 +130,8 @@ export function dispatchSystemRoomEvent(
       return receiveRoomSettlement(room, event.item, event.nowMs);
     case "SETTLEMENT_FAILED":
       return failRoomSettlement(room, event.error, event.nowMs);
+    case "TURN_EXPIRED":
+      return expireRoomTurn(room, event.nowMs);
     default:
       return assertNever(event);
   }

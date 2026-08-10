@@ -1,8 +1,18 @@
 name: CI
 
+# `pull_request` is deliberately unfiltered by base branch. It used to be
+# `branches: [main]`, which silently gave *no* CI at all to a stacked PR -
+# one opened against another feature branch rather than main. This PR was
+# itself the first to hit that: it targets `feat/turn-timers`, so the only
+# check that reported was Cloudflare's own build, and the review-critical
+# jobs never ran. A PR that cannot be gated is worse than one with no
+# workflow, because the empty check list reads as "nothing to worry about".
+#
+# `push` stays pinned to main: those runs exist to record a result per merge
+# commit for a future bisect, and feature-branch pushes are already covered
+# by their pull request.
 on:
   pull_request:
-    branches: [main]
   push:
     branches: [main]
 
