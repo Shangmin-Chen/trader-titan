@@ -1,6 +1,6 @@
 # Titan Trader
 
-Titan Trader is a local two-player Next.js trading game. Players take turns narrowing a proposed spread width around AI-generated quantitative items, then one player trades on the accepted width and the other fixes the bid/ask market for settlement.
+Titan Trader is a local two-player Next.js trading game. Players take turns narrowing a proposed spread width around quantitative items drawn from a built-in static deck, then one player trades on the accepted width and the other fixes the bid/ask market for settlement.
 
 ## Setup
 

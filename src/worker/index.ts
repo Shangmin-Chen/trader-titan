@@ -1491,58 +1491,6 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
     });
   }
 
-  private async recordRoomItemFailure(
-    target: PendingItemGeneration,
-    message: string,
-    nowMs: UnixTimeMs
-  ): Promise<StoredRoomCommandResult> {
-    return this.ctx.storage.transaction(async (transaction) => {
-      const loaded = loadStoredRoomEnvelope(
-        await transaction.get<unknown>(ROOM_STORAGE_KEY),
-        nowMs
-      );
-
-      if (!loaded.ok) {
-        return {
-          ok: false,
-          status: statusForStoredRoomLoadFailure(loaded),
-          error: loaded.error
-        } as const;
-      }
-
-      if (!samePendingGeneration(loaded.room, target)) {
-        return {
-          ok: true,
-          room: loaded.room
-        } as const;
-      }
-
-      const eventResult = dispatchSystemRoomEvent(
-        loaded.room,
-        {
-          type: "ITEM_FAILED",
-          error: message,
-          nowMs
-        }
-      );
-
-      if (!eventResult.ok) {
-        return {
-          ok: false,
-          status: statusForDomainError(eventResult.error),
-          error: eventResult.error
-        } as const;
-      }
-
-      await this.persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
-
-      return {
-        ok: true,
-        room: eventResult.room
-      } as const;
-    });
-  }
-
   private async receiveStoredSettlement(
     room: RoomState,
     nowMs: UnixTimeMs
