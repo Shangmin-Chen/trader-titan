@@ -14,16 +14,11 @@ Open the local Wrangler URL printed by the dev server. The multiplayer room
 flow depends on Worker routes and Durable Objects, so `npm run dev` is useful
 for isolated Next.js UI work but not for the full invite-room game.
 
-## Gemini Item Generation & Config
+## Item Generation
 
-Worker item generation uses `@google/genai/web` from the Durable Object room lifecycle, with shared provider code under `src/api/item-generation`. The Gemini API key is read from the server-only `GEMINI_API_KEY` Worker secret and should not be exposed to client-side code. For local Wrangler preview without Gemini, keep `WORKER_ITEM_PROVIDER=deterministic` in `.dev.vars`.
+Items are drawn from a static deck ([config/static-markets.json](config/static-markets.json)); no external AI provider or secrets are used.
 
-`WORKER_TEST_MODE` is a separate, narrower var: it gates only the test-only `POST /api/rooms/:id/test-expire-turn` route (see `testExpireTurnSoon` in `src/worker/index.ts`), which lets a caller fast-forward a room's turn clock. It has no other meaning anywhere in this codebase and is never read outside that one gate, unlike `WORKER_ITEM_PROVIDER` (a real provider-selection override with legitimate uses on a real deploy). Only `npm run test:e2e`'s own `wrangler dev` invocation (see `playwright.config.ts`) sets it - do not add it to `.dev.vars` or `wrangler.toml`.
-
-- **Amazon Market Config**: In [gemini-markets.json](config/gemini-markets.json), the guidance instructs Gemini to vary the types of items generated for the Amazon mode, including:
-  - Normal consumer electronics (e.g. iPad, PlayStation)
-  - Luxury/premium products (e.g. Herman Miller Aeron, Tumi suitcase)
-  - Funny and unhinged real Amazon items (e.g. Nicolas Cage mermaid pillow, Yodelling pickled cucumber)
+`WORKER_TEST_MODE` is a separate, narrower var: it gates only the test-only `POST /api/rooms/:id/test-expire-turn` route (see `testExpireTurnSoon` in `src/worker/index.ts`), which lets a caller fast-forward a room's turn clock. It has no other meaning anywhere in this codebase and is never read outside that one gate. Only `npm run test:e2e`'s own `wrangler dev` invocation (see `playwright.config.ts`) sets it - do not add it to `.dev.vars` or `wrangler.toml`.
 
 Generated true values live in `GameRoomDurableObject` private storage. The browser receives only a `round_id`, title, category, and clue until settlement. The Worker blocks legacy process-local game API routes in Cloudflare, and the UI sends gameplay commands through `/api/rooms`.
 

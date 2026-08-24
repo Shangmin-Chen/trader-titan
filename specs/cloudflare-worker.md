@@ -7,7 +7,7 @@ The Cloudflare target uses OpenNext for the existing Next app and a Durable Obje
 - Wrangler `main` points to `src/worker/index.ts`.
 - The Worker delegates normal app requests to the generated OpenNext worker at `.open-next/worker.js`.
 - Worker tests alias that generated worker to a smoke implementation before the OpenNext build artifact exists.
-- Legacy process-local game routes (`/api/generate-item`, `/api/generate-custom-amazon-item`, `/api/commit-market`, and `/api/settle-round`) are rejected by the Worker with `410` before OpenNext can serve them.
+- Legacy process-local game routes (`/api/generate-item`, `/api/commit-market`, and `/api/settle-round`) are rejected by the Worker with `410` before OpenNext can serve them.
 
 ## Public Room Routes
 
@@ -18,7 +18,6 @@ The Worker exposes room routes before delegating unmatched requests to OpenNext:
 - `POST /api/rooms/:roomId/access`: validates `roomId` and forwards to `POST /room/access`, which requires a host or current guest capability token and returns the full public room snapshot.
 - `POST /api/rooms/:roomId/join`: validates `roomId` and forwards to `POST /room/join`.
 - `POST /api/rooms/:roomId/command`: validates `roomId` and forwards to `POST /room/command`.
-- `POST /api/rooms/:roomId/custom-amazon-item`: validates `roomId` and forwards to `POST /room/custom-amazon-item`.
 - `GET /api/rooms/:roomId/socket` with `Upgrade: websocket`: validates `roomId` and forwards to the room object's WebSocket endpoint. Socket auth is carried in `Sec-WebSocket-Protocol`, not the URL.
 
 Room ids are validated with the room-domain parser before `idFromName` is called. Non-room routes continue to delegate to OpenNext unchanged.
@@ -29,7 +28,7 @@ Public room POST routes and public WebSocket upgrades reject browser requests wh
 { "ok": false, "error": { "code": "origin_not_allowed", "message": "Request origin is not allowed." } }
 ```
 
-`POST /api/rooms` and `POST /api/rooms/:roomId/custom-amazon-item` also apply bounded in-memory per-Cloudflare-client-IP rate limiting before forwarding. Normal room joins, access, command gameplay, and socket messages are not broadly rate-limited by this guard. Limit rejections use Worker-style JSON with `429`:
+`POST /api/rooms` also applies a bounded in-memory per-Cloudflare-client-IP rate limit before forwarding. Normal room joins, access, command gameplay, and socket messages are not broadly rate-limited by this guard. Limit rejections use Worker-style JSON with `429`:
 
 ```json
 { "ok": false, "error": { "code": "rate_limited", "message": "Room request rate limit exceeded." } }
@@ -50,7 +49,6 @@ Implemented HTTP endpoints on the Durable Object stub:
 - `POST /room/access`: accepts `{ credential }`, authorizes access for the host or current guest, and returns the full public room snapshot.
 - `POST /room/join`: joins one guest through the room command layer and returns the guest capability token only for the successful join.
 - `POST /room/command`: decodes known host/player protocol commands and dispatches to the pure room command functions.
-- `POST /room/custom-amazon-item`: accepts `{ credential, query }`, authorizes the credential as the current trader while the active room is in `generatingItem` with `customAmazonQuery: true` (the default for every mode unless the room opted into `aiGenerated`), generates the item from the query, stores the private item, dispatches `ITEM_RECEIVED`, and returns the public snapshot.
 - `GET /room/socket` with `Upgrade: websocket`: validates the capability token from `Sec-WebSocket-Protocol`, authorizes room access, and upgrades to a hibernatable Durable Object WebSocket using `acceptWebSocket`.
 
 Both `POST /room/join` and `POST /room/command` purge a missing, expired, or invalid stored envelope (private generated items, the room envelope, any pending-effect marker, and the alarm) in the same storage transaction as the error they return, mirroring the cleanup-alarm behavior below. Without this, an envelope that fails to decode would return the same error on every subsequent request against that room object until its already-scheduled alarm eventually fired - up to `ABANDONED_ROOM_TTL_MS` later for a room with no sooner turn-clock or pending-settlement deadline armed. The next request against the same room object instead sees `room_not_found` (missing), not a repeat of the original error.
@@ -77,9 +75,8 @@ Presence does not gate any room command (F-04). `START_ROOM` and `ADVANCE_ROUND`
 The Durable Object is the gameplay authority for generated item values and settlement:
 
 - Private generated items are stored separately from the room envelope under keys derived from `round_id`.
-- The stored private item includes `true_value` plus optional Amazon scrape metadata. The public room state receives only `round_id`, `item_title`, `category`, and `context_clue` until settlement.
-- After a successful `START_ROOM`, `ADVANCE_ROUND`, or `RETRY_ITEM_GENERATION` command leaves the room in `active/generatingItem`, the Durable Object automatically invokes the Worker item provider, stores the private item, dispatches `ITEM_RECEIVED`, persists the updated room envelope, and broadcasts only the final public snapshot.
-- Automatic generation is skipped for rooms with `customAmazonQuery: true` (any mode); those rooms wait for `POST /room/custom-amazon-item` or the equivalent public route, including after `RETRY_ITEM_GENERATION` returns a failed custom-query room to `generatingItem`.
+- The stored private item includes `true_value`. The public room state receives only `round_id`, `item_title`, `category`, and `context_clue` until settlement.
+- After a successful `START_ROOM` or `ADVANCE_ROUND` command leaves the room in `active/generatingItem`, the Durable Object derives the round's item from the static deck (`itemForRound` in `src/worker/static-deck.ts`) and synchronously stores the private item, dispatches `ITEM_RECEIVED`, persists the updated room envelope, and broadcasts only the final public snapshot - all inside the same storage transaction as the command itself. The deck pick cannot fail, so there is no provider error path.
 - After a successful `EXECUTE_TRADE` command leaves the room in `settling`, the Durable Object loads the private item by the active `round_id`, dispatches `SETTLEMENT_RECEIVED`, persists the room envelope, deletes that round's private item key in the same storage transaction after the room envelope write, and broadcasts the final settlement snapshot. Settlement is computed by the room command layer from the stored private item and active quote; clients never supply settlement fields.
 - If provider generation fails, including after a retry command, the Durable Object dispatches `ITEM_FAILED` and persists the room error snapshot without resetting scores, roles, lifecycle, or prior log entries. If the private settlement item is missing, it dispatches `SETTLEMENT_FAILED` rather than accepting client-provided values. Below `SETTLEMENT_FAILURE_EPISODE_CAP` consecutive `SETTLEMENT_FAILED`s for the same round this bounces the room back to `choosingSide(locked)` (F-06); at the cap it lands in the terminal `error` phase instead (F-07) - the reducer in the room command layer decides this, not the Worker, so the Worker's own per-episode attempt/backoff bound on the settle effect (item 2 below) is unaffected and orthogonal to it.
 - Successful `RESET_TO_LOBBY` and `KICK_GUEST` commands persist the lobby replacement and delete all `room:private-generated-item:v1:*` keys for the room object in the same storage transaction.
@@ -118,7 +115,6 @@ Successful WebSocket commands are dispatched through the same room command layer
 ## Environment
 
 - `ASSETS` serves OpenNext assets.
-- `GEMINI_API_KEY` is available as a secret for provider-backed generation.
 - `NEXT_PUBLIC_APP_ENV` may distinguish local, preview, and production deployments.
 
 ## Gates
