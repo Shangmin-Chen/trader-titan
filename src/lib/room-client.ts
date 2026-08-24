@@ -26,38 +26,28 @@ export const ROOM_SOCKET_PONG_MESSAGE = "tt-pong";
  * Default abort timeout for every room HTTP call (both reads and command
  * POSTs), used whenever a caller does not supply its own `signal`.
  *
- * Room commands are not uniformly cheap: `START_ROOM` (round 1) and
- * `RETRY_ITEM_GENERATION` synchronously pregenerate every round's item
- * before the worker responds (see `applyAutomaticRoomEffects` /
- * `pregenerateAllItems` in `src/worker/index.ts`). When AI generation is
- * enabled that path makes a single batched Gemini call and then, in Amazon
- * mode, an additional sequential price-lookup fetch per round — real
- * network latency stacked on top of an LLM call, not a fixed-cost request.
- * 30s comfortably covers that common case while still turning a truly
- * hung connection (which would otherwise hang forever, see F-06) into a
- * bounded, recoverable failure.
+ * Room commands are local and synchronous — the worker derives items from
+ * the static deck and settles trades inside one storage transaction, with
+ * no external I/O anywhere in the round loop — so 30s is generous headroom
+ * for any real response while still turning a truly hung connection
+ * (which would otherwise hang forever, see F-06) into a bounded,
+ * recoverable failure.
  */
 const DEFAULT_ROOM_REQUEST_TIMEOUT_MS = 30_000;
 
 /**
- * Longer timeout bound for the two commands whose synchronous worker-side
- * work is not a fixed cost: `START_ROOM` (round 1) and
- * `RETRY_ITEM_GENERATION`. In AI-generated Amazon mode, `pregenerateAllItems`
- * (`src/worker/index.ts`) makes one batched Gemini call and then, still
- * inside the same request, an *uncapped, sequential* Amazon price-lookup
- * fetch per round — up to `MAX_ROUNDS` (99) of them, each with no
- * server-side timeout of its own. A host who legitimately picks a
- * double-digit round count in that mode can genuinely take well past 30s
- * to get a real (non-hung) response; `DEFAULT_ROOM_REQUEST_TIMEOUT_MS`
- * would report that as a client-side timeout even though the server is
- * still working, which is a false positive, not a recovered hang.
+ * Longer timeout bound for `START_ROOM` (round 1) and
+ * `RETRY_ITEM_GENERATION`, kept separate from the default so callers can
+ * pass a wider `options.signal` for exactly those two command types.
  *
- * 120s is not a guarantee for every possible round count — nothing short
- * of bounding each Amazon lookup server-side (or moving generation off the
- * synchronous request path) fully closes that gap, and both are out of
- * scope for a client-side timeout fix — but it comfortably covers the
- * common multi-round case instead of the same 30s budget as a
- * single-field command like `TIGHTEN_WIDTH`.
+ * It dates from when those commands could run real external network calls
+ * synchronously in the request path. Item receipt is now a synchronous
+ * static-deck pick and settlement is derived locally, so every command's
+ * round-trip is local worker work and this bound no longer needs to
+ * exceed `DEFAULT_ROOM_REQUEST_TIMEOUT_MS`; it simply bounds command
+ * round-trips at 120s. It is slated for removal together with the rest of
+ * the item-generation plumbing (cleanup plan Phase 3), after which every
+ * command uses the default budget.
  */
 export const ITEM_GENERATION_REQUEST_TIMEOUT_MS = 120_000;
 

@@ -226,10 +226,11 @@ describe("room client", () => {
   });
 
   it("exposes a longer timeout budget for item-generation commands than the default", async () => {
-    // START_ROOM / RETRY_ITEM_GENERATION can run a batched Gemini call plus
-    // up to MAX_ROUNDS sequential, uncapped Amazon lookups synchronously in
-    // the worker request path (see the constant's doc comment). Callers are
-    // expected to pass this via `options.signal` for those two command
+    // START_ROOM / RETRY_ITEM_GENERATION get this dedicated budget instead
+    // of the default. The budget itself is legacy — item receipt is now a
+    // synchronous static-deck pick with no external I/O (see the constant's
+    // doc comment) and it is slated for removal in cleanup plan Phase 3 —
+    // but callers still pass this via `options.signal` for those two command
     // types specifically, not for every room HTTP call.
     expect(ITEM_GENERATION_REQUEST_TIMEOUT_MS).toBeGreaterThan(30_000);
 

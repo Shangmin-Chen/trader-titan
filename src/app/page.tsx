@@ -144,12 +144,13 @@ type ClientCommandInput =
 // silently never gets gated.
 type ClientCommandType = ClientCommandInput["type"];
 
-// START_ROOM (round 1) and RETRY_ITEM_GENERATION are the only commands
-// whose worker-side handling can run real, uncapped network calls
-// (batched Gemini + sequential per-round Amazon lookups) synchronously in
-// the request path — see ITEM_GENERATION_REQUEST_TIMEOUT_MS in
-// room-client.ts for why they get a longer timeout than every other
-// command here.
+// START_ROOM (round 1) and RETRY_ITEM_GENERATION historically needed a
+// longer client-side timeout because their worker-side handling could run
+// real external network calls synchronously in the request path. Item
+// receipt is now a synchronous static-deck pick with no external I/O, so
+// this special-casing — and ITEM_GENERATION_REQUEST_TIMEOUT_MS in
+// room-client.ts — remains only until cleanup plan Phase 3 removes the
+// leftover item-generation plumbing.
 const ITEM_GENERATION_COMMAND_TYPES: ReadonlySet<ClientCommandType> = new Set([
   "START_ROOM",
   "RETRY_ITEM_GENERATION",
