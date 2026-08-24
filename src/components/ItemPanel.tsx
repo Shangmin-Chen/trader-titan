@@ -3,7 +3,6 @@ import {
   type PublicGeneratedItem,
   type SettledGeneratedItem,
 } from "../lib/game";
-import styles from "./ItemPanel.module.css";
 
 export type ItemPanelProps = {
   item: PublicGeneratedItem | SettledGeneratedItem;
@@ -14,16 +13,6 @@ export function ItemPanel({ item, revealTrueValue = false }: ItemPanelProps) {
   const trueValue =
     revealTrueValue && "true_value" in item && typeof item.true_value === "number"
       ? item.true_value
-      : null;
-
-  const scrapedItems =
-    revealTrueValue && "scraped_items" in item && Array.isArray(item.scraped_items)
-      ? item.scraped_items
-      : null;
-
-  const amazonUrl =
-    revealTrueValue && "amazon_url" in item && typeof item.amazon_url === "string"
-      ? item.amazon_url
       : null;
 
   return (
@@ -43,52 +32,6 @@ export function ItemPanel({ item, revealTrueValue = false }: ItemPanelProps) {
           <div className="item-panel__detail">
             <dt>True value</dt>
             <dd>{formatPreciseNumber(trueValue)}</dd>
-          </div>
-        ) : null}
-
-        {amazonUrl ? (
-          <div className="item-panel__detail">
-            <dt>Amazon Source Link</dt>
-            <dd>
-              <a
-                href={amazonUrl}
-                target="_blank"
-                rel="noopener noreferrer"
-                className="amazon-link"
-                aria-label="View Amazon search for this item (opens in a new tab)"
-              >
-                View Search on Amazon
-              </a>
-            </dd>
-          </div>
-        ) : null}
-
-        {scrapedItems && scrapedItems.length > 0 ? (
-          <div className={`item-panel__detail ${styles.scrapedDetail}`}>
-            <dt>Scraped Listings (First Is Source Of Truth)</dt>
-            <dd>
-              <ul
-                className="scraped-items-list"
-                aria-label="Scraped Amazon listings, first item is the source of truth"
-              >
-                {scrapedItems.map((scraped, i) => (
-                  <li
-                    key={i}
-                    className={`${styles.scrapedItem} ${i === 0 ? "source-of-truth" : ""}`}
-                  >
-                    <span className="scraped-item-title" title={scraped.title}>
-                      {scraped.title}
-                    </span>
-                    <span className={styles.priceGroup}>
-                      <span className="scraped-item-price">
-                        ${formatPreciseNumber(scraped.price)}
-                      </span>
-                      {i === 0 && <span className="source-badge">Source of Truth</span>}
-                    </span>
-                  </li>
-                ))}
-              </ul>
-            </dd>
           </div>
         ) : null}
       </dl>

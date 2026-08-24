@@ -85,11 +85,6 @@ export type AccessRoomRequest = Readonly<{
   credential: PresentedCapabilityToken;
 }>;
 
-export type CustomAmazonItemRequest = Readonly<{
-  credential: PresentedCapabilityToken;
-  query: string;
-}>;
-
 export type CreateRoomResponse =
   | Readonly<{
       ok: true;
@@ -230,14 +225,6 @@ export async function sendRoomCommand(
   options: RoomClientOptions = {},
 ): Promise<CommandRoomResponse> {
   return postRoomJson(`${roomPath(roomId)}/command`, command, options);
-}
-
-export async function submitCustomAmazonItem(
-  roomId: string,
-  request: CustomAmazonItemRequest,
-  options: RoomClientOptions = {},
-): Promise<CommandRoomResponse> {
-  return postRoomJson(`${roomPath(roomId)}/custom-amazon-item`, request, options);
 }
 
 export function openRoomSocket(
