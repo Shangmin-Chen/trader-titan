@@ -691,8 +691,7 @@ describe("game reducer", () => {
     const customPayload: StartGamePayload = {
       playerAName: "Ada",
       playerBName: "Grace",
-      mode: "Amazon",
-      customAmazonQuery: true,
+      mode: "Cosmic Scale",
       totalRounds: 2,
     };
     const generating = {
@@ -713,8 +712,7 @@ describe("game reducer", () => {
     const retried = retryItemGeneration(failed);
 
     expect(retried.phase).toBe("generatingItem");
-    expect(retried.mode).toBe("Amazon");
-    expect(retried.customAmazonQuery).toBe(true);
+    expect(retried.mode).toBe("Cosmic Scale");
     expect(retried.players).toEqual(generating.players);
     expect(retried.scores).toEqual({ A: 125, B: -125 });
     expect(retried.roles).toEqual(generating.roles);
@@ -841,21 +839,18 @@ describe("game reducer", () => {
     expect(over.winner).toBe("B");
   });
 
-  it("swaps roles for Amazon custom query mode at game start and round transitions", () => {
-    const customPayload: StartGamePayload = {
+  it("keeps the rolesForRound calendar uniform at game start and round transitions (D5)", () => {
+    const payload: StartGamePayload = {
       playerAName: "Ada",
       playerBName: "Grace",
-      mode: "Amazon",
-      customAmazonQuery: true,
+      mode: "Cosmic Scale",
       totalRounds: 2,
     };
 
-    // Start Game
-    const state = startGame(createInitialGameState(), customPayload);
+    // Start Game: Player A proposes width in odd rounds.
+    const state = startGame(createInitialGameState(), payload);
     expect(state.phase).toBe("generatingItem");
-    // Roles are swapped from DEFAULT_ROLES ({ marketMaker: "A", trader: "B" })
-    // to { marketMaker: "B", trader: "A" }
-    expect(state.roles).toEqual({ marketMaker: "B", trader: "A" });
+    expect(state.roles).toEqual({ marketMaker: "A", trader: "B" });
 
     // Simulate transitioning to Round 2
     const readyForSettle = submitMarketQuote(
@@ -872,9 +867,9 @@ describe("game reducer", () => {
 
     expect(round2State.phase).toBe("generatingItem");
     expect(round2State.roundNumber).toBe(2);
-    // Roles for Round 2 normally are { marketMaker: "B", trader: "A" }
-    // For Amazon Custom Query, it should be swapped to { marketMaker: "A", trader: "B" }
-    expect(round2State.roles).toEqual({ marketMaker: "A", trader: "B" });
+    // Roles for Round 2 are { marketMaker: "B", trader: "A" }: the uniform
+    // rolesForRound calendar, with no per-mode role swap.
+    expect(round2State.roles).toEqual({ marketMaker: "B", trader: "A" });
   });
 
   describe("F-05 turn shot clock", () => {

@@ -61,6 +61,17 @@ describe("room protocol", () => {
         code: "config_invalid",
       },
       {
+        // Retired flag (P1+2): CONFIG_KEYS no longer carries it, so an old
+        // client POSTing it gets a decode error rather than a silent ignore.
+        value: {
+          type: "CONFIGURE_ROOM",
+          credential,
+          commandId: "command-configure-room-retired-flag",
+          config: { customAmazonQuery: true },
+        },
+        code: "config_invalid",
+      },
+      {
         value: {
           type: "SUBMIT_INITIAL_WIDTH",
           credential,

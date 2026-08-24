@@ -1,7 +1,6 @@
 import {
   createBoundedRateLimiter,
   createRoomCreationRateLimiter,
-  createRoomCustomAmazonRateLimiter,
   isAllowedOrigin,
 } from "./request-guards";
 
@@ -75,16 +74,8 @@ describe("request guards", () => {
       maxBuckets: 2,
       now: () => 1_000,
     });
-    const customAmazonLimiter = createRoomCustomAmazonRateLimiter({
-      windowMs: 60_000,
-      maxRequests: 1,
-      maxBuckets: 2,
-      now: () => 1_000,
-    });
 
     expect(creationLimiter(request({ "cf-connecting-ip": "203.0.113.1" }))).toBe(true);
     expect(creationLimiter(request({ "cf-connecting-ip": "203.0.113.1" }))).toBe(false);
-    expect(customAmazonLimiter(request({ "cf-connecting-ip": "203.0.113.1" }))).toBe(true);
-    expect(customAmazonLimiter(request({ "cf-connecting-ip": "203.0.113.1" }))).toBe(false);
   });
 });

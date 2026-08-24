@@ -109,10 +109,9 @@ jobs:
 
       # playwright.config.ts starts its own server via `webServer`
       # (`npm run build:cloudflare && wrangler dev ... --port 8787`) and passes
-      # `--var WORKER_ITEM_PROVIDER:deterministic`, so no live Gemini or Amazon
-      # calls are made and no API key is required. scripts/build-cloudflare.mjs
-      # blanks GEMINI_API_KEY for the build and then fails if any secret value
-      # reaches the emitted artifacts.
+      # `--var WORKER_TEST_MODE:1`, so the test-only clock route is reachable.
+      # Items come from config/static-markets.json, so no external API key is
+      # required and no secret blanking/scanning step is needed for the build.
       #
       # Only chromium runs here. The mobile-chrome project uses the same engine
       # and only changes viewport, so it doubles the wall clock for very little

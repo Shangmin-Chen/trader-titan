@@ -1,6 +1,5 @@
 import type {
   GeneratedItem,
-  ScrapedAmazonItem,
   SettledGeneratedItem,
 } from "../lib/game";
 import { validateProviderItem } from "../lib/game";
@@ -20,10 +19,7 @@ const SETTLED_ITEM_KEYS = [
   "category",
   "context_clue",
   "true_value",
-  "scraped_items",
-  "amazon_url",
 ] as const;
-const SCRAPED_ITEM_KEYS = ["title", "price"] as const;
 
 export type PrivateGeneratedItemEnvelope = Readonly<{
   kind: typeof PRIVATE_GENERATED_ITEM_KIND;
@@ -58,8 +54,6 @@ export function createSettledGeneratedItem(
     category: item.category,
     context_clue: item.context_clue,
     true_value: item.true_value,
-    ...(item.scraped_items === undefined ? {} : { scraped_items: item.scraped_items }),
-    ...(item.amazon_url === undefined ? {} : { amazon_url: item.amazon_url }),
   };
 }
 
@@ -126,60 +120,15 @@ function decodeSettledGeneratedItem(value: unknown): SettledGeneratedItem | null
     return null;
   }
 
-  let scrapedItems: ScrapedAmazonItem[] | undefined;
-
-  if (value.scraped_items !== undefined) {
-    const decodedScrapedItems = decodeScrapedItems(value.scraped_items);
-
-    if (decodedScrapedItems === null) {
-      return null;
-    }
-
-    scrapedItems = decodedScrapedItems;
-  }
-
-  if (value.amazon_url !== undefined && typeof value.amazon_url !== "string") {
-    return null;
-  }
-
   const item: SettledGeneratedItem = {
     round_id: value.round_id,
     item_title: value.item_title,
     category: value.category,
     context_clue: value.context_clue,
     true_value: value.true_value,
-    ...(scrapedItems === undefined ? {} : { scraped_items: scrapedItems }),
-    ...(typeof value.amazon_url === "string" ? { amazon_url: value.amazon_url } : {}),
   };
 
   return validateProviderItem(item).ok ? item : null;
-}
-
-function decodeScrapedItems(value: unknown): ScrapedAmazonItem[] | null {
-  if (!Array.isArray(value)) {
-    return null;
-  }
-
-  const items: ScrapedAmazonItem[] = [];
-
-  for (const item of value) {
-    if (
-      !isRecord(item) ||
-      !hasOnlyKeys(item, SCRAPED_ITEM_KEYS) ||
-      typeof item.title !== "string" ||
-      typeof item.price !== "number" ||
-      !Number.isFinite(item.price)
-    ) {
-      return null;
-    }
-
-    items.push({
-      title: item.title,
-      price: item.price,
-    });
-  }
-
-  return items;
 }
 
 function hasOnlyKeys(
