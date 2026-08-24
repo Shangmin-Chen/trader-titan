@@ -27,17 +27,6 @@ Worker item generation uses `@google/genai/web` from the Durable Object room lif
 
 Generated true values live in `GameRoomDurableObject` private storage. The browser receives only a `round_id`, title, category, and clue until settlement. The Worker blocks legacy process-local game API routes in Cloudflare, and the UI sends gameplay commands through `/api/rooms`.
 
-## Amazon Organic Scraper & Custom Query Toggle
-
-- **Organic Price Parsing**: The Amazon scraper parses organic search results (filtering out sponsored ads) to find the first result's price as the source of truth (`true_value`).
-- **Post-Settlement Scraper Breakdown**: Upon round settlement, a premium UI panel displays:
-  - An **Amazon Source Link** to view the live search results on Amazon.
-  - A stylized list of **Scraped Listings** with prices from the search grid, clearly indicating which listing was used as the source of truth.
-- **Custom Query Toggle**: The game setup form provides a checkbox toggle: **"Player-entered Amazon product query"**. When enabled:
-  - In Round 1, **Player A** enters their own Amazon search term/query (while Player B looks away), and **Player B** proposes the spread width.
-  - In Round 2, **Player B** enters the query, and **Player A** proposes the width.
-  - The scraper fetches the price and lists the results live, making it a player-driven guessing game.
-
 ## Gameplay Flow
 
 1. The host creates a room, shares the invite link, and waits for player B.
