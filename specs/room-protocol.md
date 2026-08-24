@@ -12,8 +12,8 @@ The room protocol is the boundary between client transports and the pure room do
 - Presence-only broadcasts are not room state mutations, so they can carry the same room revision as the previous public room snapshot.
 - Every rejected command returns a typed room-domain error and preserves the previous room state.
 - Public room snapshots include live presence booleans and never include capability secrets, token hashes, persistence envelopes, or pre-settlement private values.
-- Pre-settlement public item snapshots expose only `round_id`, `item_title`, `category`, and `context_clue`; they must redact `true_value`, `scraped_items`, and `amazon_url` even if those fields are present on an internal object.
-- Post-settlement public item snapshots expose `true_value` and may expose Amazon `scraped_items` and `amazon_url` when those fields are present on the settled generated item.
+- Pre-settlement public item snapshots expose only `round_id`, `item_title`, `category`, and `context_clue`; they must redact `true_value` even if that field is present on an internal object.
+- Post-settlement public item snapshots expose `true_value`; no scrape metadata fields exist on the settled generated item.
 - Public room snapshots expose `turnDeadlineMs` on the `proposingWidth`, `negotiatingWidth`, `configuringMarket`, and `choosingSide` game phases: an absolute, server-stamped Unix millisecond deadline for the F-05 turn shot clock, never a client-computed or remaining-seconds value.
 - A `choosingSide` snapshot may additionally carry `lockedPendingTrade` (see F-06's settlement-failure bounce-back in room-domain.md) when this `choosingSide` was re-entered after `SETTLEMENT_FAILED` rather than reached normally. It is forwarded from internal state as-is, never derived from private data. Clients must treat its presence as "the decision is locked - do not present Buy/Sell as a live choice", not merely as extra display data.
 
