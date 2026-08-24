@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Trader Titan — MVP Cleanup Plan</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --panel2: #1c2333;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --green: #3fb950;
+    --red: #f85149;
+    --amber: #d29922;
+    --blue: #58a6ff;
+    --purple: #bc8cff;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    line-height: 1.55;
+    padding: 2rem;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  header { border-bottom: 1px solid var(--border); padding-bottom: 1.5rem; margin-bottom: 2rem; }
+  h1 { font-size: 1.9rem; letter-spacing: -0.02em; }
+  h1 span { color: var(--blue); }
+  .meta { display: flex; flex-wrap: wrap; gap: .5rem; margin-top: .75rem; }
+  .pill {
+    font-size: .75rem; padding: .18rem .65rem; border-radius: 999px;
+    border: 1px solid var(--border); color: var(--muted);
+  }
+  .pill.ok { color: var(--green); border-color: rgba(63,185,80,.4); }
+  .pill.warn { color: var(--amber); border-color: rgba(210,153,34,.4); }
+  h2 { font-size: 1.15rem; margin: 2.25rem 0 .9rem; color: var(--blue); text-transform: uppercase; letter-spacing: .06em; }
+  h3 { font-size: .95rem; margin: 1.1rem 0 .5rem; }
+  p.sub { color: var(--muted); max-width: 70ch; }
+
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 1rem; }
+  .card {
+    background: var(--panel); border: 1px solid var(--border);
+    border-radius: 10px; padding: 1rem 1.15rem;
+  }
+  .card h4 { font-size: .8rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin-bottom: .5rem; }
+  .big { font-size: 1.7rem; font-weight: 700; }
+  .big.red { color: var(--red); }
+  .big.green { color: var(--green); }
+
+  ul.clean { list-style: none; }
+  ul.clean li { padding: .35rem 0 .35rem 1.4rem; position: relative; }
+  ul.clean li::before { content: "▸"; position: absolute; left: .35rem; color: var(--muted); }
+  ul.keep li::before { content: "✔"; color: var(--green); }
+  ul.cut li::before { content: "✕"; color: var(--red); }
+  code {
+    background: var(--panel2); border: 1px solid var(--border);
+    border-radius: 5px; padding: .08rem .38rem; font-size: .84em;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  /* Phase timeline */
+  .timeline { position: relative; margin-left: 8px; padding-left: 1.6rem; border-left: 2px solid var(--border); }
+  .phase { position: relative; margin-bottom: 1.1rem; }
+  .phase::before {
+    content: ""; position: absolute; left: -1.99rem; top: .45rem;
+    width: 12px; height: 12px; border-radius: 50%;
+    background: var(--bg); border: 2px solid var(--blue);
+  }
+  .phase.pcut::before { border-color: var(--red); }
+  .phase-card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: .85rem 1.1rem; }
+  .phase-title { display: flex; align-items: baseline; gap: .6rem; flex-wrap: wrap; }
+  .phase-name { font-weight: 700; }
+  .tag { font-size: .68rem; padding: .12rem .55rem; border-radius: 999px; letter-spacing: .04em; text-transform: uppercase; }
+  .tag.safe { background: rgba(63,185,80,.15); color: var(--green); }
+  .tag.big { background: rgba(88,166,255,.15); color: var(--blue); }
+  .tag.settle { background: rgba(188,140,255,.15); color: var(--purple); }
+  .tag.clock { background: rgba(248,81,73,.15); color: var(--red); }
+  .tag.docs { background: rgba(210,153,34,.15); color: var(--amber); }
+  .phase p { color: var(--muted); font-size: .88rem; margin-top: .3rem; }
+
+  table { width: 100%; border-collapse: collapse; margin-top: .75rem; font-size: .87rem; }
+  th, td { text-align: left; padding: .5rem .7rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; font-size: .74rem; text-transform: uppercase; letter-spacing: .05em; }
+  tr:last-child td { border-bottom: none; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .delta-neg { color: var(--red); font-weight: 600; }
+
+  .decision { border-left: 3px solid var(--amber); padding: .6rem .95rem; background: var(--panel); border-radius: 0 8px 8px 0; margin-bottom: .7rem; }
+  .decision.forced { border-left-color: var(--purple); }
+  .decision .d-head { font-weight: 700; }
+  .decision .d-state { float: right; font-size: .72rem; text-transform: uppercase; letter-spacing: .05em; padding: .1rem .55rem; border-radius: 999px; }
+  .d-state.open { background: rgba(210,153,34,.15); color: var(--amber); }
+  .d-state.forced { background: rgba(188,140,255,.15); color: var(--purple); }
+  .decision p { color: var(--muted); font-size: .86rem; margin-top: .25rem; }
+
+  .risk-high { color: var(--red); font-weight: 600; }
+  .risk-med { color: var(--amber); font-weight: 600; }
+  .risk-low { color: var(--green); font-weight: 600; }
+
+  footer { margin-top: 3rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--muted); font-size: .8rem; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>Trader Titan <span>·</span> MVP Cleanup Plan</h1>
+  <p class="sub">Cut the AI layer (Gemini) and search layer (Amazon scraper). Keep the turn-based multiplayer core on a static item deck. Settlement becomes synchronous; the async-retry architecture dies.</p>
+  <div class="meta">
+    <span class="pill">Plan v3 · 2026-08-23</span>
+    <span class="pill">specs/cleanup/MVP_CLEANUP_PLAN.md</span>
+    <span class="pill ok">Review loop converged · 0 blockers / 0 majors</span>
+    <span class="pill ok">Decisions locked 2026-08-24: D1 cut · D3 modulo+cap · D4 delete</span>
+  </div>
+</header>
+
+<h2>At a glance</h2>
+<div class="grid">
+  <div class="card"><h4>Net tracked-code deletion</h4><div class="big red">−8,300 to −10,000 lines</div></div>
+  <div class="card"><h4>Files deleted outright</h4><div class="big red">~24 files · ~2,900 lines</div></div>
+  <div class="card"><h4>Runtime dependencies cut</h4><div class="big green">@google/genai</div></div>
+  <div class="card"><h4>Secrets eliminated</h4><div class="big green">GEMINI_API_KEY</div><p style="color:var(--muted);font-size:.82rem">+ WORKER_ITEM_PROVIDER, WORKER_TEST_MODE env surface</p></div>
+  <div class="card"><h4>Persistence envelope</h4><div class="big">v3 → v4 → v5 → v6</div><p style="color:var(--muted);font-size:.82rem">Hard cutover per phase, no migrations</p></div>
+  <div class="card"><h4>PR train</h4><div class="big">P0 → P1+2 → P3 → P4 → P5</div><p style="color:var(--muted);font-size:.82rem">Stacked · main never red</p></div>
+</div>
+
+<h2>The load-bearing insight</h2>
+<div class="card" style="border-color:rgba(88,166,255,.4)">
+  <p>Once items come from <code>config/static-markets.json</code> (already in repo — 5 modes × 10 items with true values) via a pure function <code>itemForRound(mode, roomId, hostTokenHash, roundNumber)</code>, <strong>nothing async can fail mid-round</strong>. The entire F-02 pending-effect retry/backoff machinery (~400 alarm lines), F-07 bounce caps, private item storage, and the <code>error</code> phase have no failure class left to handle — they are deleted, not patched.</p>
+</div>
+
+<h2>Cut vs Keep</h2>
+<div class="grid">
+  <div class="card">
+    <h4 style="color:var(--green)">Keep — this is the game</h4>
+    <ul class="clean keep">
+      <li><code>src/lib/game/</code> state machine — propose → negotiate → quote → choose side → settle zero-sum PnL</li>
+      <li><code>src/lib/room/</code> protocol core — tokens, commands, snapshots, persistence</li>
+      <li>Worker DO skeleton — routes, WebSocket fanout, storage transactions, dedupe</li>
+      <li>All core UI — GameShell, forms, scoreboard, action log</li>
+      <li>F-08 socket liveness sweep + TTL alarms</li>
+    </ul>
+  </div>
+  <div class="card">
+    <h4 style="color:var(--red)">Cut</h4>
+    <ul class="clean cut">
+      <li>Gemini AI generation — dep, providers, prompts, secrets plumbing</li>
+      <li>Amazon scraper + custom-query flow (route, form, flags, fields, mode)</li>
+      <li>Provider-failure machinery — F-02 retries, F-07 bounce cap, error phase</li>
+      <li>Shot clocks F-05/F-06 (default) + test-expire-turn route</li>
+      <li>Junk: <code>persephone/</code>, <code>PR_BODY.md</code>, dead constants</li>
+    </ul>
+  </div>
+</div>
+
+<h2>Execution phases</h2>
+<div class="timeline">
+  <div class="phase">
+    <div class="phase-card">
+      <div class="phase-title"><span class="phase-name">P0 — Eject junk &amp; dead code</span><span class="tag safe">trivially safe</span></div>
+      <p><code>rm -rf persephone/</code> (untracked), <code>git rm PR_BODY.md</code> (440 lines), delete dead <code>SERVER_PRESENCE_LIVENESS_TIMEOUT_MS</code>. Gates: lint + typecheck.</p>
+    </div>
+  </div>
+  <div class="phase pcut">
+    <div class="phase-card">
+      <div class="phase-title"><span class="phase-name">P1+2 — Static deck replaces Gemini+Amazon &amp; strips custom-query flow</span><span class="tag big">ONE changeset</span><span class="tag big">v4 cutover</span></div>
+      <p>New <code>src/worker/static-deck.ts</code> (~60 lines) replaces ~1,400 lines of provider code. Delete <code>src/api/item-generation/</code> (9 files), custom-amazon route/form/flags end-to-end, scrape UI, secret scanning. Persistence v4 hard cutover; invalidated-room client handler ("room ended" CTA). Merged because <code>normalizeRoomConfig</code> defaults <code>customAmazonQuery:true</code> — a provider-only phase would ship a form pointing at a dead route.</p>
+    </div>
+  </div>
+  <div class="phase settle">
+    <div class="phase-card">
+      <div class="phase-title"><span class="phase-name">P3 — Synchronous settlement</span><span class="tag settle">~400 alarm lines die</span><span class="tag settle">v5 cutover</span></div>
+      <p><code>EXECUTE_TRADE</code> commits through settlement in one transaction. Delete PendingRoomEffect marker/retry/backoff, forceFailStuckSettlement, F-07 episode cap, RETRY_ITEM_GENERATION, SETTLEMENT_FAILED, ITEM_FAILED, error phase, private item storage. Load-bearing rule: settled item reuses <code>room.game.item.round_id</code>; negative test proves no <code>settling</code> envelope persists.</p>
+    </div>
+  </div>
+  <div class="phase pcut">
+    <div class="phase-card">
+      <div class="phase-title"><span class="phase-name">P4 — Shot clocks (default CUT)</span><span class="tag clock">D1 default</span><span class="tag clock">v6 cutover</span></div>
+      <p>Delete TURN_EXPIRED, forfeit machinery, turnDeadlineMs, test-expire-turn route + WORKER_TEST_MODE, RoundForfeitPanel, TurnCountdown (forced by D1a). Alarm reduces to TTL + liveness only. KEEP variant sketched (~100-line delta instead of ~900-line deletion).</p>
+    </div>
+  </div>
+  <div class="phase">
+    <div class="phase-card">
+      <div class="phase-title"><span class="phase-name">P5 — Docs/specs coherence + full gates</span><span class="tag docs">final sweep</span></div>
+      <p>Rewrite worker/protocol/domain specs + README, delete item-generation specs, staging deploy matrix, per-phase symbol greps prove zero residual references.</p>
+    </div>
+  </div>
+</div>
+
+<h2>Decisions — locked 2026-08-24</h2>
+<div class="decision forced">
+  <span class="d-state forced">LOCKED — D1</span>
+  <div class="d-head">Shot clocks: CUT</div>
+  <p>TURN_EXPIRED, forfeits, test-expire route and WORKER_TEST_MODE all die in P4 (v6 cutover). Alarm reduces to TTL + liveness only. Idle opponents are handled with RESET_TO_LOBBY / KICK_GUEST.</p>
+</div>
+<div class="decision forced">
+  <span class="d-state forced">LOCKED — D3</span>
+  <div class="d-head">Deck pick: plain modulo + rounds cap</div>
+  <p><code>staticMarkets[mode][(round−1) % len]</code>, with config validation capping <code>totalRounds</code> at the deck length so a match can never repeat an item in-match. Cross-match repetition is an accepted MVP tradeoff — the remedy is more deck rows, not cryptography.</p>
+</div>
+<div class="decision forced">
+  <span class="d-state forced">LOCKED — D4</span>
+  <div class="d-head">Amazon deck section: DELETE</div>
+  <p>The deck's "Amazon" section (~83 lines) is removed alongside the mode entry. Deck validation stays scoped to surviving GAME_MODES members.</p>
+</div>
+
+<h2>Scope reduction detail</h2>
+<table>
+  <tr><th>Target</th><th>Now</th><th>After (D1=CUT)</th><th style="text-align:right">Δ</th></tr>
+  <tr><td><code>src/worker/index.ts</code></td><td class="num">3,520</td><td class="num">~1,850</td><td class="num delta-neg">−1,650</td></tr>
+  <tr><td><code>index.worker-test.ts</code></td><td class="num">6,213</td><td class="num">~3,200</td><td class="num delta-neg">−3,000</td></tr>
+  <tr><td><code>room/persistence.ts</code></td><td class="num">918</td><td class="num">~480</td><td class="num delta-neg">−440</td></tr>
+  <tr><td><code>game/reducer.ts</code></td><td class="num">896</td><td class="num">~580</td><td class="num delta-neg">−320</td></tr>
+  <tr><td><code>app/page.tsx</code></td><td class="num">2,244</td><td class="num">~1,800</td><td class="num delta-neg">−440</td></tr>
+  <tr><td>Files deleted outright (providers, forms, panels, specs, e2e clock spec…)</td><td class="num">~24 files</td><td class="num">—</td><td class="num delta-neg">−~2,900</td></tr>
+  <tr><td>Other tests + protocol/commands/snapshot/types/scripts</td><td class="num"></td><td class="num"></td><td class="num delta-neg">−~2,200</td></tr>
+</table>
+
+<h2>Top risks</h2>
+<table>
+  <tr><th>#</th><th>Risk</th><th>Mitigation</th></tr>
+  <tr><td class="risk-med">R1/R2</td><td>Live rooms invalidated at each cutover deploy (≤2h TTL window); stale tabs freeze at "Live"</td><td>Per-phase version bumps; self-heal purge tested; client "room ended" CTA; release notes</td></tr>
+  <tr><td class="risk-med">R3/R4</td><td>Same items recur across matches; proposer calendar flips for all matches</td><td>Accepted MVP tradeoff: modulo pick + totalRounds ≤ deck cap makes in-match repeats impossible; document D5 calendar change; add deck rows if repetition bores playtesters</td></tr>
+  <tr><td class="risk-med">R5/R6</td><td>E2E coverage loss; surgery on single 6,213-line describe breaks suites</td><td>Rewrites land in same PR as deletions; delete-and-regrow + declared KEEP-surface regression net</td></tr>
+  <tr><td class="risk-high">R7</td><td>round_id drift silently purges rooms post-P3</td><td>Continuation rule + identity assert + dedicated negative test</td></tr>
+  <tr><td class="risk-low">R10</td><td>Deploy-readiness script drift blocks deploys</td><td>Needles rewritten + contract test updated same commit (was a review blocker)</td></tr>
+</table>
+
+<footer>
+  Full plan: <code>specs/cleanup/MVP_CLEANUP_PLAN.md</code> (execution-ready v4) · Produced from a planner → adversarial-review → revision loop · All owner decisions locked 2026-08-24.
+</footer>
+
+</div>
+</body>
+</html>
