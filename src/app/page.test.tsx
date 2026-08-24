@@ -42,7 +42,6 @@ vi.mock("../lib/room-client", async (importOriginal) => {
     loadRoomSession: vi.fn(),
     openRoomSocket: vi.fn(),
     sendRoomCommand: vi.fn(),
-    submitCustomAmazonItem: vi.fn(),
   };
 });
 
