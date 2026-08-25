@@ -546,8 +546,7 @@ a:focus-visible,
   color: var(--buy);
 }
 
-.phase-chip--error,
-.phase-chip--roundForfeited {
+.phase-chip--error {
   background: var(--sell-dim);
   border-color: var(--sell-border);
   color: var(--sell);
@@ -1459,23 +1458,6 @@ select.form-field__control {
   line-height: 1.45;
 }
 
-/* F-06: flags a settlement (or an in-progress settling round) that was
-   forced by a choosingSide clock expiry rather than chosen by the trader. */
-.settlement-panel__forced-note {
-  display: flex;
-  align-items: center;
-  gap: var(--space-2xs);
-  margin: 0;
-  padding: 6px 10px;
-  border-radius: var(--radius-sm);
-  background: var(--warn-dim);
-  border: 1px solid var(--warn-border);
-  color: var(--warn);
-  font-size: var(--text-sm);
-  font-weight: 500;
-  line-height: 1.45;
-}
-
 /* PnL row colors — player A / player B */
 .settlement-panel__details .settlement-panel__detail:nth-child(4) dd {
   color: var(--player-a);
@@ -1634,32 +1616,6 @@ select.form-field__control {
 }
 
 .turn-banner--sell {
-  background: var(--sell-dim);
-  border-color: var(--sell-border);
-  color: var(--sell);
-}
-
-/* ============================================================
-   TURN COUNTDOWN — F-05 shot clock
-   ============================================================ */
-.turn-countdown {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: var(--space-2xs);
-  margin: calc(var(--space-2xs) * -1) auto 0;
-  padding: 2px 10px;
-  border-radius: var(--radius-sm);
-  background: var(--bg-surface);
-  border: 1px solid var(--border-default);
-  color: var(--text-muted);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  font-weight: 600;
-  letter-spacing: 0.04em;
-}
-
-.turn-countdown[data-urgent="true"] {
   background: var(--sell-dim);
   border-color: var(--sell-border);
   color: var(--sell);

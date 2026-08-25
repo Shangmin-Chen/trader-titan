@@ -1,4 +1,4 @@
-import { applyForfeitToScores, applySettlementToScores } from "./settlement";
+import { applySettlementToScores } from "./settlement";
 import type {
   GameAction,
   GameMode,
@@ -6,25 +6,17 @@ import type {
   GameState,
   GeneratedItem,
   InitialGameStateOptions,
-  PendingTradeDecision,
   Player,
   PlayerId,
   PublicGeneratedItem,
   Roles,
-  RoundForfeit,
   RoundLogEntry,
   Scores,
   SettledGeneratedItem,
-  SettlingGameState,
   StartGamePayload,
   TradeSide,
-  UnixTimeMs,
 } from "./types";
-import {
-  GAME_MODES,
-  MAX_ROUNDS,
-  PROPOSING_WIDTH_FORFEIT_PENALTY,
-} from "./types";
+import { GAME_MODES, MAX_ROUNDS } from "./types";
 import {
   validateQuoteForWidth,
   validateSpreadWidth,
@@ -49,13 +41,6 @@ const DEFAULT_ROLES: Roles = {
 
 const DEFAULT_TOTAL_ROUNDS = 3;
 const DEFAULT_MODE: GameMode = "Chaos Quant";
-
-// Wrapper helpers below default `turnDeadlineMs` to this placeholder when a
-// caller does not care about the shot clock (most reducer tests exercise
-// game-flow logic that has nothing to do with timing). Room commands
-// (src/lib/room/commands.ts) never rely on this default - they always
-// compute and pass a real server-stamped deadline.
-const UNSET_TURN_DEADLINE_MS = 0;
 
 function normalizeRoles(roles: Roles): Roles {
   return roles.marketMaker === roles.trader ? DEFAULT_ROLES : roles;
@@ -153,72 +138,6 @@ function roleName(state: GameState, playerId: PlayerId): string {
   return state.players[playerId].name;
 }
 
-/**
- * The player whose action the clock is currently running against, mirroring
- * which role each of these three phases waits on (see the
- * SUBMIT_INITIAL_WIDTH / TIGHTEN_WIDTH / TRADE_ON_WIDTH / SUBMIT_MARKET_QUOTE
- * cases above and expectedPlayer() in src/lib/room/commands.ts, which
- * authorizes those same commands against the same roles). choosingSide is
- * deliberately excluded: F-06 routes its clock expiry through settling
- * instead of the flat-penalty forfeit this function backs - see TURN_EXPIRED.
- */
-function turnOwnerForPhase(
-  state: Extract<
-    GameState,
-    { phase: "proposingWidth" | "negotiatingWidth" | "configuringMarket" }
-  >,
-): PlayerId {
-  switch (state.phase) {
-    case "proposingWidth":
-    case "configuringMarket":
-      return state.roles.marketMaker;
-    case "negotiatingWidth":
-      return state.roles.trader;
-    default:
-      return assertNeverPhase(state);
-  }
-}
-
-function assertNeverPhase(value: never): never {
-  throw new Error(`Unhandled turn-clocked phase: ${JSON.stringify(value)}`);
-}
-
-/**
- * Builds the settling state a choosingSide clock expiry transitions into
- * (F-06). Deliberately not `...state`, for the exact same reason EXECUTE_TRADE
- * spells out: choosingSide carries turnDeadlineMs (F-05), but settling is not
- * a turn-clocked phase - it must not inherit the stray field, or the
- * persistence decoder's per-phase key allowlist (src/lib/room/persistence.ts)
- * would reject it.
- *
- * `pendingTrade` is supplied by the caller rather than decided here: a plain
- * expiry has no true_value to decide which side is worse for the trader with
- * - only the Worker, once it has composed settlement from the deck item,
- * does (see receiveRoomSettlement in src/lib/room/commands.ts) - so the
- * caller passes the sentinel `{ kind: "timeoutForcedWorstSide" }` for that
- * case.
- */
-function settlingStateFromChoosingSideTimeout(
-  state: Extract<GameState, { phase: "choosingSide" }>,
-  pendingTrade: PendingTradeDecision,
-): SettlingGameState {
-  return {
-    phase: "settling",
-    mode: state.mode,
-    players: state.players,
-    scores: state.scores,
-    roles: state.roles,
-    roundNumber: state.roundNumber,
-    totalRounds: state.totalRounds,
-    log: state.log,
-    item: state.item,
-    spreadWidth: state.spreadWidth,
-    quote: state.quote,
-    pendingTrade,
-    lastError: undefined,
-  };
-}
-
 function winnerFromScores(scores: Scores): PlayerId | "Tie" {
   if (scores.A === scores.B) {
     return "Tie";
@@ -305,7 +224,6 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         ...state,
         phase: "proposingWidth",
         item: action.item,
-        turnDeadlineMs: action.turnDeadlineMs,
         lastError: undefined,
       };
 
@@ -330,7 +248,6 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         ...state,
         phase: "negotiatingWidth",
         spreadWidth: action.width,
-        turnDeadlineMs: action.turnDeadlineMs,
         lastError: undefined,
       };
 
@@ -358,7 +275,6 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         phase: "negotiatingWidth",
         roles: nextRoles,
         spreadWidth: action.width,
-        turnDeadlineMs: action.turnDeadlineMs,
         lastError: undefined,
       };
 
@@ -377,7 +293,6 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
       const nextState: GameState = {
         ...state,
         phase: "configuringMarket",
-        turnDeadlineMs: action.turnDeadlineMs,
         lastError: undefined,
       };
 
@@ -402,7 +317,6 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         ...state,
         phase: "choosingSide",
         quote: action.quote,
-        turnDeadlineMs: action.turnDeadlineMs,
         lastError: undefined,
       };
 
@@ -426,11 +340,9 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         return state;
       }
 
-      // Deliberately not `...state`: choosingSide carries turnDeadlineMs
-      // (F-05), but settling is not a turn-clocked phase - the persisted
-      // state must not inherit a stray deadline. Since Phase 3 this settling
-      // value is also transient-only: the Worker composes straight through
-      // it into "settlement" within one storage transaction.
+      // Since Phase 3 this settling value is transient-only: the Worker
+      // composes straight through it into "settlement" within one storage
+      // transaction.
       const nextState: GameState = {
         phase: "settling",
         mode: state.mode,
@@ -443,7 +355,7 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         item: state.item,
         spreadWidth: state.spreadWidth,
         quote: state.quote,
-        pendingTrade: { kind: "chosen", side: action.side },
+        pendingTrade: action.side,
         lastError: undefined,
       };
 
@@ -486,72 +398,8 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
       );
     }
 
-    case "TURN_EXPIRED": {
-      // F-06: choosingSide's clock expiring does NOT forfeit like the other
-      // three turn-clocked phases (see PROPOSING_WIDTH_FORFEIT_PENALTY's and
-      // RoundForfeit's doc comments for why: by choosingSide the trader has
-      // already seen the quote, so a flat penalty would cap a bad settlement
-      // loss instead of the trader having to take it). Route it through
-      // settling exactly like EXECUTE_TRADE, but with the actual side left
-      // unresolved - the reducer has no true_value to decide "worse for the
-      // trader" with here; see resolvePendingTradeSide in settlement.ts for
-      // where that happens once true_value is known server-side.
-      if (state.phase === "choosingSide") {
-        const message = `${roleName(state, state.roles.trader)} ran out of time. Settling the round against ${roleName(state, state.roles.trader)}'s worse side.`;
-
-        return withLog(
-          settlingStateFromChoosingSideTimeout(state, { kind: "timeoutForcedWorstSide" }),
-          "settling",
-          message,
-        );
-      }
-
-      if (
-        state.phase !== "proposingWidth" &&
-        state.phase !== "negotiatingWidth" &&
-        state.phase !== "configuringMarket"
-      ) {
-        return state;
-      }
-
-      const forfeitedBy = turnOwnerForPhase(state);
-      const awardedTo: PlayerId = forfeitedBy === "A" ? "B" : "A";
-      const penalty =
-        state.phase === "proposingWidth"
-          ? PROPOSING_WIDTH_FORFEIT_PENALTY
-          : state.spreadWidth;
-
-      const forfeit: RoundForfeit = {
-        roundNumber: state.roundNumber,
-        itemTitle: state.item.item_title,
-        phase: state.phase,
-        forfeitedBy,
-        awardedTo,
-        penalty,
-      };
-
-      const nextState: GameState = {
-        phase: "roundForfeited",
-        mode: state.mode,
-        players: state.players,
-        scores: applyForfeitToScores(state.scores, forfeit),
-        roles: state.roles,
-        roundNumber: state.roundNumber,
-        totalRounds: state.totalRounds,
-        log: state.log,
-        forfeit,
-        lastError: undefined,
-      };
-
-      return withLog(
-        nextState,
-        "roundForfeited",
-        `${roleName(state, forfeitedBy)} ran out of time in ${state.phase}. ${roleName(state, awardedTo)} is awarded ${penalty}.`,
-      );
-    }
-
     case "NEXT_ROUND": {
-      if (state.phase !== "settlement" && state.phase !== "roundForfeited") {
+      if (state.phase !== "settlement") {
         return state;
       }
 
@@ -604,13 +452,8 @@ function settlementLogMessage(state: Extract<GameState, { phase: "settlement" }>
   const verb = side === "BUY" ? "bought" : "sold";
   const traderName = roleName(state, state.settlement.trader);
   const mmName = roleName(state, state.settlement.marketMaker);
-  // F-06: a forced settlement was never a choice the trader made, so the log
-  // says so instead of phrasing it like one - see RoundSettlement.forcedByTimeout.
-  const action = state.settlement.forcedByTimeout
-    ? `ran out of time and was settled as if they ${verb}`
-    : verb;
 
-  return `${traderName} ${action} at ${state.settlement.transactionPrice}. True value was ${state.settlement.trueValue}. ${traderName} PnL ${state.settlement.traderPnL}; ${mmName} PnL ${state.settlement.marketMakerPnL}.`;
+  return `${traderName} ${verb} at ${state.settlement.transactionPrice}. True value was ${state.settlement.trueValue}. ${traderName} PnL ${state.settlement.traderPnL}; ${mmName} PnL ${state.settlement.marketMakerPnL}.`;
 }
 
 export function startGame(
@@ -623,40 +466,35 @@ export function startGame(
 export function receiveItem(
   state: GameState,
   item: GeneratedItem,
-  turnDeadlineMs: UnixTimeMs = UNSET_TURN_DEADLINE_MS,
 ): GameState {
-  return gameReducer(state, { type: "ITEM_RECEIVED", item, turnDeadlineMs });
+  return gameReducer(state, { type: "ITEM_RECEIVED", item });
 }
 
 export function submitInitialWidth(
   state: GameState,
   width: number,
-  turnDeadlineMs: UnixTimeMs = UNSET_TURN_DEADLINE_MS,
 ): GameState {
-  return gameReducer(state, { type: "SUBMIT_INITIAL_WIDTH", width, turnDeadlineMs });
+  return gameReducer(state, { type: "SUBMIT_INITIAL_WIDTH", width });
 }
 
 export function tightenWidth(
   state: GameState,
   width: number,
-  turnDeadlineMs: UnixTimeMs = UNSET_TURN_DEADLINE_MS,
 ): GameState {
-  return gameReducer(state, { type: "TIGHTEN_WIDTH", width, turnDeadlineMs });
+  return gameReducer(state, { type: "TIGHTEN_WIDTH", width });
 }
 
 export function tradeOnWidth(
   state: GameState,
-  turnDeadlineMs: UnixTimeMs = UNSET_TURN_DEADLINE_MS,
 ): GameState {
-  return gameReducer(state, { type: "TRADE_ON_WIDTH", turnDeadlineMs });
+  return gameReducer(state, { type: "TRADE_ON_WIDTH" });
 }
 
 export function submitMarketQuote(
   state: GameState,
   quote: Extract<GameAction, { type: "SUBMIT_MARKET_QUOTE" }>["quote"],
-  turnDeadlineMs: UnixTimeMs = UNSET_TURN_DEADLINE_MS,
 ): GameState {
-  return gameReducer(state, { type: "SUBMIT_MARKET_QUOTE", quote, turnDeadlineMs });
+  return gameReducer(state, { type: "SUBMIT_MARKET_QUOTE", quote });
 }
 
 export function executeTrade(
@@ -672,10 +510,6 @@ export function receiveSettlement(
   settlement: Extract<GameAction, { type: "SETTLEMENT_RECEIVED" }>["settlement"],
 ): GameState {
   return gameReducer(state, { type: "SETTLEMENT_RECEIVED", item, settlement });
-}
-
-export function expireTurn(state: GameState): GameState {
-  return gameReducer(state, { type: "TURN_EXPIRED" });
 }
 
 export function nextRound(state: GameState): GameState {

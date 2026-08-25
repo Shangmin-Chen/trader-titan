@@ -78,24 +78,7 @@ const ROOM_ACCESS_ENDPOINT = "/room/access";
 const ROOM_JOIN_ENDPOINT = "/room/join";
 const ROOM_COMMAND_ENDPOINT = "/room/command";
 const ROOM_SOCKET_ENDPOINT = "/room/socket";
-const ROOM_TEST_EXPIRE_TURN_ENDPOINT = "/room/test-expire-turn";
 const PUBLIC_ROOMS_ENDPOINT = "/api/rooms";
-const PUBLIC_TEST_EXPIRE_TURN_ROUTE = "test-expire-turn";
-/**
- * Test-only affordance for e2e coverage of the F-05 shot clock (PR #18,
- * "Add e2e coverage of the shot clock"). Real turn durations are 30-60s
- * (see *_TURN_DURATION_MS in src/lib/game/types.ts) - too slow for
- * Playwright to honestly sleep out. Rather than mocking the countdown or
- * the expiry logic, testExpireTurnSoon (below) fast-forwards a room's
- * already-armed, server-authoritative turnDeadlineMs to this many ms from
- * now and re-arms the *real* Durable Object alarm against it, so the
- * production alarm handler, reducer transition, persistence, and
- * WebSocket broadcast all still run for real - only the wait is
- * shortened. It is only reachable when this.env.WORKER_TEST_MODE is set
- * (see testExpireTurnSoon's own comment for why that is the gate), which is
- * never the case in a real deploy.
- */
-const E2E_FAST_FORWARD_TURN_OFFSET_MS = 3_000;
 const LEGACY_NEXT_GAME_API_PATHS = new Set([
   "/api/commit-market",
   "/api/generate-custom-amazon-item",
@@ -220,19 +203,6 @@ type CreateOrLoadRoomResult =
   | Readonly<{ ok: true; created: false; room: RoomState }>
   | Readonly<{ ok: false; status: number; error: RoomHttpError | RoomDomainError }>;
 
-/**
- * runDueTurnExpiry's own transaction result: distinguishes "nothing about
- * the room actually changed" (a stale wake, a rejected event, or the room
- * having already expired) from "TURN_EXPIRED genuinely committed", since
- * only the latter needs a broadcast afterward. A committed F-06
- * choosingSide timeout settles in the SAME transaction (see
- * settledDeckItemForRoom), so the caller only ever broadcasts the final,
- * already-settled room.
- */
-type TurnExpiryOutcome =
-  | Readonly<{ kind: "unchanged" }>
-  | Readonly<{ kind: "committed"; room: RoomState }>;
-
 type RoomSocketAttachment = Readonly<{
   kind: "trader-titan.room-socket.v1";
   roomId: RoomId;
@@ -334,17 +304,12 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       return this.applyRoomCommand(request);
     }
 
-    if (pathname === ROOM_TEST_EXPIRE_TURN_ENDPOINT && request.method === "POST") {
-      return this.testExpireTurnSoon(request);
-    }
-
     if (
       pathname === ROOM_ENDPOINT ||
       pathname === ROOM_ACCESS_ENDPOINT ||
       pathname === ROOM_JOIN_ENDPOINT ||
       pathname === ROOM_COMMAND_ENDPOINT ||
-      pathname === ROOM_SOCKET_ENDPOINT ||
-      pathname === ROOM_TEST_EXPIRE_TURN_ENDPOINT
+      pathname === ROOM_SOCKET_ENDPOINT
     ) {
       return errorResponse(
         { code: "method_not_allowed", message: "HTTP method is not supported for this room endpoint." },
@@ -558,118 +523,6 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
     });
   }
 
-  /**
-   * Test-only (see E2E_FAST_FORWARD_TURN_OFFSET_MS above): fast-forwards
-   * the room's currently-armed F-05 turn deadline to a few seconds from
-   * now and re-arms the real Durable Object alarm against it, instead of
-   * requiring a Playwright test to sleep out the genuine 30-60s duration.
-   * Everything downstream of the deadline - the alarm firing, TURN_EXPIRED
-   * dispatch, the settling/roundForfeited transition, persistence, and the
-   * WebSocket broadcast - still runs through the exact same production
-   * code path a real deadline would trigger; only the wait is shortened.
-   *
-   * Gated on this.env.WORKER_TEST_MODE being set - a dedicated var with no
-   * meaning anywhere else in this codebase and no legitimate reason to be
-   * set on a real deploy. It deliberately does not double as any other
-   * operational override: nothing else in this file reads it, so setting it
-   * can only ever be a deliberate, test-specific choice (see
-   * playwright.config.ts and vitest.worker.config.ts).
-   *
-   * Authorization below is intentionally `{ type: "access" }` rather than
-   * `{ type: "activePlayer" }`: this lets *either* seated player expire the
-   * *other* player's active turn, not just their own. That is load-bearing
-   * for the e2e helper (e2e/helpers.ts's fastForwardTurnClock), which forces
-   * the guest's turn from the host's page. This is safe specifically
-   * because it is unreachable outside test/dev once the gate above holds -
-   * it does not, and must not, ship as a general "either player can expire
-   * either player's clock" affordance in production; do not loosen it
-   * without also reconsidering this gate.
-   */
-  private async testExpireTurnSoon(request: Request): Promise<Response> {
-    if (this.env.WORKER_TEST_MODE === undefined) {
-      return errorResponse(
-        { code: "not_found", message: "Room endpoint was not found." },
-        404
-      );
-    }
-
-    const decoded = await decodeAccessRoomBody(request);
-
-    if (!decoded.ok) {
-      return decoded.response;
-    }
-
-    const verifyToken = await buildTokenVerifier(decoded.value.credential);
-    const nowMs = currentUnixTimeMs();
-
-    const result = await this.ctx.storage.transaction(async (transaction) => {
-      const loaded = loadStoredRoomEnvelope(
-        await transaction.get<unknown>(ROOM_STORAGE_KEY),
-        nowMs
-      );
-
-      if (!loaded.ok) {
-        return {
-          ok: false,
-          status: statusForStoredRoomLoadFailure(loaded),
-          error: loaded.error
-        } as const;
-      }
-
-      const authorized = authorizeRoomAction(
-        loaded.room,
-        decoded.value.credential,
-        { type: "access" },
-        verifyToken
-      );
-
-      if (!authorized.ok) {
-        return {
-          ok: false,
-          status: statusForDomainError(authorized.error),
-          error: authorized.error
-        } as const;
-      }
-
-      if (
-        loaded.room.game.phase !== "proposingWidth" &&
-        loaded.room.game.phase !== "negotiatingWidth" &&
-        loaded.room.game.phase !== "configuringMarket" &&
-        loaded.room.game.phase !== "choosingSide"
-      ) {
-        return {
-          ok: false,
-          status: 409,
-          error: {
-            code: "invalid_game_phase",
-            message: "Room has no active turn clock to fast-forward."
-          }
-        } as const;
-      }
-
-      const patchedRoom: RoomState = {
-        ...loaded.room,
-        game: { ...loaded.room.game, turnDeadlineMs: nowMs + E2E_FAST_FORWARD_TURN_OFFSET_MS },
-        revision: loaded.room.revision + 1
-      };
-
-      await this.persistRoomEnvelope(transaction, patchedRoom, nowMs);
-
-      return { ok: true, room: patchedRoom } as const;
-    });
-
-    if (!result.ok) {
-      return errorResponse(result.error, result.status);
-    }
-
-    this.broadcastRoomSnapshot(result.room);
-
-    return jsonResponse<CommandRoomResponse>({
-      ok: true,
-      room: this.publicRoomSnapshot(result.room)
-    });
-  }
-
   private async acceptRoomSocket(request: Request): Promise<Response> {
     if (request.method !== "GET") {
       return errorResponse(
@@ -833,39 +686,33 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
-   * Multiplexes the Durable Object's single alarm slot between three
-   * concerns: room TTL housekeeping, F-05's turn shot clock, and the F-08
-   * liveness sweep (closing room sockets the client-side heartbeat cannot
-   * itself detect as dead - see sweepStaleSockets). Synchronous settlement
-   * (Phase 3) removed the fourth: a pending settle-effect marker and its
-   * retry/backoff machinery no longer exist, because EXECUTE_TRADE now
-   * settles inside its own single storage transaction.
+   * Multiplexes the Durable Object's single alarm slot between two
+   * concerns: room TTL housekeeping and the F-08 liveness sweep (closing
+   * room sockets the client-side heartbeat cannot itself detect as dead -
+   * see sweepStaleSockets). Synchronous settlement (Phase 3) removed the
+   * pending settle-effect marker and its retry/backoff machinery, and the
+   * shot-clock cut (Phase 4) removed the turn deadline, because EXECUTE_TRADE
+   * now settles inside its own single storage transaction and nothing else
+   * needs a timed wake.
    *
    * Each alarm invocation runs the liveness sweep unconditionally first (it
    * is cheap - a scan of this room's live sockets plus timestamp
-   * comparisons, no storage I/O) and then figures out which *stored*
-   * deadline - TTL or turn clock - actually fired, handling only that one.
-   * Every write path that follows reschedules via scheduleNextAlarm() so
-   * the slot never falls out of sync with whichever deadline is now
-   * soonest. scheduleNextAlarm() recomputes the liveness deadline from live
-   * sockets on every call (it is never persisted), so once the sweep above
-   * has closed every stale socket (or there were none to begin with), a
-   * room with no remaining sockets naturally drops the liveness term and
-   * this alarm settles back to firing only for TTL/turn-clock purposes -
-   * it does not re-arm itself forever.
-   *
-   * The liveness sweep is independent of the turn clock: it acts directly
-   * on live sockets rather than on stored room state, so it can fire
-   * alongside either (or neither) of them on the same tick. While idle
-   * (no turn-clocked phase, no live sockets), the only armed deadline left
-   * is the room's TTL.
+   * comparisons, no storage I/O) and then reschedules against whichever
+   * stored deadline - always the TTL now - is next. Every write path that
+   * follows reschedules via scheduleNextAlarm() so the slot never falls out
+   * of sync with the soonest deadline. scheduleNextAlarm() recomputes the
+   * liveness deadline from live sockets on every call (it is never
+   * persisted), so once the sweep above has closed every stale socket (or
+   * there were none to begin with), a room with no remaining sockets
+   * naturally drops the liveness term and this alarm settles back to firing
+   * only for TTL purposes - it does not re-arm itself forever.
    */
   async alarm(): Promise<void> {
     const nowMs = currentUnixTimeMs();
 
     this.sweepStaleSockets(nowMs);
 
-    const due = await this.ctx.storage.transaction(async (transaction) => {
+    await this.ctx.storage.transaction(async (transaction) => {
       const loaded = loadStoredRoomEnvelope(
         await transaction.get<unknown>(ROOM_STORAGE_KEY),
         nowMs
@@ -873,131 +720,11 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
 
       if (!loaded.ok) {
         await purgeExpiredRoomState(transaction);
-        return null;
+        return;
       }
 
-      const turnDeadlineMs = turnDeadlineForRoom(loaded.room);
-
-      if (turnDeadlineMs === null || nowMs < turnDeadlineMs) {
-        // The room's TTL hasn't actually expired (loadStoredRoomEnvelope
-        // would have reported that above), and the turn clock is not due,
-        // so this tick is a no-op besides keeping the single alarm slot
-        // pointed at whichever deadline - including the liveness sweep's -
-        // is now soonest.
-        await this.scheduleNextAlarm(transaction, loaded.room, nowMs);
-        return null;
-      }
-
-      return { kind: "turnExpiry", room: loaded.room } as const;
+      await this.scheduleNextAlarm(transaction, loaded.room, nowMs);
     });
-
-    if (due === null) {
-      return;
-    }
-
-    await this.runDueTurnExpiry(due.room, nowMs);
-  }
-
-  /**
-   * F-05 turn-clock resume: re-validates the room is still on the same
-   * outstanding deadline before dispatching TURN_EXPIRED, exactly like the
-   * old runDueSettleEffect re-checked phase/round_id before resuming
-   * settlement. This is what keeps a stale alarm wake - the round already
-   * advanced past the deadline that armed this wake, between alarm()'s outer
-   * transaction and this one - from forfeiting a round that has already
-   * moved on.
-   *
-   * F-06: when the expired deadline was choosingSide's, TURN_EXPIRED moves
-   * the room into "settling". Since synchronous settlement (Phase 3) there
-   * is no pending-effect marker to persist for it: the SETTLEMENT_RECEIVED
-   * that resolves settling is composed in THIS SAME transaction (see
-   * settledDeckItemForRoom), so the room is persisted and broadcast exactly
-   * once, already in its final settlement state.
-   */
-  private async runDueTurnExpiry(room: RoomState, nowMs: UnixTimeMs): Promise<void> {
-    const outcome: TurnExpiryOutcome = await this.ctx.storage.transaction(async (transaction) => {
-      const loaded = loadStoredRoomEnvelope(
-        await transaction.get<unknown>(ROOM_STORAGE_KEY),
-        nowMs
-      );
-
-      if (!loaded.ok) {
-        // The room expired in the gap between alarm()'s outer transaction
-        // and this one. Purge fully rather than leaving an expired envelope
-        // behind with no alarm armed to clean it up.
-        await purgeExpiredRoomState(transaction);
-        return { kind: "unchanged" };
-      }
-
-      const turnDeadlineMs = turnDeadlineForRoom(loaded.room);
-
-      if (turnDeadlineMs === null || nowMs < turnDeadlineMs) {
-        // Stale wake: the round already advanced out of the turn-clocked
-        // phase (or a fresh deadline was stamped later than the one that
-        // armed this alarm) between this alarm firing and being processed.
-        // Reschedule against the freshly-loaded room instead of forfeiting
-        // a round that has already moved on.
-        await this.scheduleNextAlarm(transaction, loaded.room, nowMs);
-        return { kind: "unchanged" };
-      }
-
-      const eventResult = dispatchSystemRoomEvent(loaded.room, {
-        type: "TURN_EXPIRED",
-        nowMs
-      });
-
-      if (!eventResult.ok) {
-        // The reducer rejected TURN_EXPIRED even though the phase/deadline
-        // check above passed (should not happen - this guard mirrors the
-        // reducer's own phase guard exactly). Reschedule rather than
-        // looping on an alarm that cannot make progress.
-        await this.scheduleNextAlarm(transaction, loaded.room, nowMs);
-        return { kind: "unchanged" };
-      }
-
-      // Only an F-06 choosingSide timeout lands in "settling" here; a
-      // forfeit into "roundForfeited" carries nothing further to compose,
-      // same as before synchronous settlement existed. Settling is transient:
-      // resolve it in this same transaction so no un-decodable `settling`
-      // envelope is ever persisted (the persistence decoder rejects the
-      // phase outright as of v5).
-      let committed = eventResult.room;
-
-      if (isSettlingActiveRoom(committed)) {
-        const settledResult = dispatchSystemRoomEvent(committed, {
-          type: "SETTLEMENT_RECEIVED",
-          item: settledDeckItemForRound(committed),
-          nowMs
-        });
-
-        if (!settledResult.ok) {
-          // Structurally unreachable right after TURN_EXPIRED succeeded
-          // (settling -> settlement always mutates), but never loop on an
-          // alarm that cannot make progress: leave the pre-expiry room
-          // untouched and reschedule.
-          await this.scheduleNextAlarm(transaction, loaded.room, nowMs);
-          return { kind: "unchanged" };
-        }
-
-        committed = settledResult.room;
-      }
-
-      await this.persistRoomEnvelope(transaction, committed, nowMs);
-
-      return { kind: "committed", room: committed };
-    });
-
-    if (outcome.kind === "unchanged") {
-      return;
-    }
-
-    // Connected clients only ever hear about a room mutation through an
-    // explicit broadcast - unlike every HTTP command handler, nothing here
-    // is a request/response the caller is waiting on, so without this call
-    // a genuinely expired clock would commit and persist correctly but
-    // never reach a client sitting on an open WebSocket watching it happen,
-    // which is exactly what the shot clock exists to do in real time.
-    this.broadcastRoomSnapshot(outcome.room);
   }
 
   /**
@@ -1093,9 +820,8 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
 
       if (isSettlingActiveRoom(committed)) {
         if (command.type !== "EXECUTE_TRADE") {
-          // Only EXECUTE_TRADE can commit into settling (the reducer's
-          // TURN_EXPIRED path is composed separately on the alarm). Treat
-          // anything else as an invariant violation rather than guessing.
+          // Only EXECUTE_TRADE can commit into settling. Treat anything
+          // else as an invariant violation rather than guessing.
           return {
             ok: false,
             status: 500,
@@ -1253,8 +979,8 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
    * if there is nothing to watch (no live sockets right now). Recomputed
     * from live socket state on every call rather than cached/persisted, so
     * once the last socket disconnects this naturally stops contributing a
-    * deadline at all: scheduleNextAlarm() then arms only the TTL/turn-
-    * clock deadline, and the DO stops waking for liveness purposes until a
+    * deadline at all: scheduleNextAlarm() then arms only the TTL deadline,
+    * and the DO stops waking for liveness purposes until a
     * new socket connects - this is how an idle (fully vacant) room settles
     * back to quiescence instead of re-arming a liveness check forever.
     */
@@ -1379,16 +1105,11 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
 
   /**
    * The reusable alarm multiplexer. A Durable Object has exactly one alarm
-   * slot, so every transaction that can change any of the three deadlines
-   * this folds together - room TTL, F-05's turn shot clock, and (F-08) the
-   * earliest liveness-sweep deadline among currently connected room sockets -
-   * must call this rather than setAlarm() directly, or the concerns will
-   * race to clobber each other's schedule.
-   *
-   * The turn deadline is not persisted separately from the room: it is
-   * already durably part of the committed `room.game` for exactly the four
-   * phases where a specific player must act, so it is derived straight from
-   * `room` here via turnDeadlineForRoom().
+   * slot, so every transaction that can change either deadline this folds
+   * together - room TTL and (F-08) the earliest liveness-sweep deadline
+   * among currently connected room sockets - must call this rather than
+   * setAlarm() directly, or the concerns will race to clobber each other's
+   * schedule.
    *
    * The liveness term comes from nextLivenessSweepDeadline(), which reads
    * live socket state (ctx.getWebSockets() /
@@ -1402,12 +1123,6 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
     nowMs: UnixTimeMs
   ): Promise<void> {
     const deadlines: UnixTimeMs[] = [roomExpiresAtMs(room)];
-
-    const turnDeadline = turnDeadlineForRoom(room);
-
-    if (turnDeadline !== null) {
-      deadlines.push(turnDeadline);
-    }
 
     const livenessDeadline = this.nextLivenessSweepDeadline(nowMs);
 
@@ -1637,16 +1352,6 @@ function routePublicRoomRequest(
     }
 
     return forwardRoomRequest(request, env, parsedRoomId.roomId, ROOM_COMMAND_ENDPOINT);
-  }
-
-  if (routeParts.length === 2 && routeParts[1] === PUBLIC_TEST_EXPIRE_TURN_ROUTE && request.method === "POST") {
-    const originRejection = publicRoomOriginRejection(request);
-
-    if (originRejection !== null) {
-      return originRejection;
-    }
-
-    return forwardRoomRequest(request, env, parsedRoomId.roomId, ROOM_TEST_EXPIRE_TURN_ENDPOINT);
   }
 
   if (routeParts.length === 2 && routeParts[1] === "socket") {
@@ -2155,29 +1860,6 @@ function loadStoredRoomEnvelope(
 
 function persistenceEnvelopeForStorage(room: RoomState, nowMs: UnixTimeMs): unknown {
   return JSON.parse(JSON.stringify(toPersistenceEnvelope(room, nowMs))) as unknown;
-}
-
-/**
- * The outstanding F-05 shot-clock deadline for a room, or null when the
- * current phase has none. Only the four actionable phases
- * (proposingWidth / negotiatingWidth / configuringMarket / choosingSide)
- * carry `turnDeadlineMs` at all - see the GameState union in
- * src/lib/game/types.ts. Kept as a module-level function (rather than an
- * instance method) since it is a pure derivation from `room` alone - see
- * DurableObjectRoom.scheduleNextAlarm(), which is the sole caller and folds
- * this in alongside room TTL, the pending settle effect, and the F-08
- * liveness deadline.
- */
-function turnDeadlineForRoom(room: RoomState): UnixTimeMs | null {
-  switch (room.game.phase) {
-    case "proposingWidth":
-    case "negotiatingWidth":
-    case "configuringMarket":
-    case "choosingSide":
-      return room.game.turnDeadlineMs;
-    default:
-      return null;
-  }
 }
 
 function isGeneratingActiveRoom(

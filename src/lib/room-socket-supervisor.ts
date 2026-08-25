@@ -145,13 +145,9 @@ export const ASSUMED_SOCKET_OPEN_MS = 3_000;
 /**
  * Total worst-case time for a player whose already-open socket just died
  * to self-heal — detect it, back off, reopen, and be resynced — without
- * any user action. This is the number that must fit inside
- * `MIN_TURN_DURATION_MS` (src/lib/game/types.ts) with real margin, not
- * just barely: see turn-clock-recovery-budget.test.ts, which pins the
- * inequality so shortening a turn phase or loosening the heartbeat above
- * fails a named test instead of reaching production silently.
+ * any user action.
  *
- *   9_000 (detection) + 500 (backoff) + 3_000 (assumed open) = 12_500ms
+ *   9_000 (detection) + 500 (backoff) + 3_000 (assumed open) = 12,500ms
  */
 export const DEAD_SOCKET_RECOVERY_BUDGET_MS =
   HEARTBEAT_WORST_CASE_DETECTION_MS + RECONNECT_BACKOFF_WORST_CASE_MS + ASSUMED_SOCKET_OPEN_MS;

@@ -68,16 +68,6 @@ export function SettlementPanel({
         <h2 className="settlement-panel__title">Settlement</h2>
       </header>
 
-      {settlement.forcedByTimeout ? (
-        <p
-          className="settlement-panel__forced-note"
-          data-testid="settlement-forced-note"
-        >
-          {trader.name}&rsquo;s clock ran out before choosing a side - settled
-          automatically against {trader.name}&rsquo;s worse side.
-        </p>
-      ) : null}
-
       <div
         className={styles.result}
         data-outcome={traderOutcome}

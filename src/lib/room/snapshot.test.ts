@@ -2,7 +2,6 @@ import type { GameState, GeneratedItem, SettledGeneratedItem } from "../game/typ
 import {
   createLobbyRoom,
   executeTrade,
-  expireRoomTurn,
   joinRoom,
   parseCapabilityToken,
   parseRoomId,
@@ -168,41 +167,6 @@ describe("room snapshots", () => {
 
     expect(snapshot.game.item.true_value).toBe(1_250);
     expect(JSON.stringify(snapshot)).not.toContain("amazon");
-  });
-
-  it("exposes the absolute turnDeadlineMs on actionable phases", () => {
-    const { room } = startedRoom();
-    const withItem = expectOk(receiveRoomItem(room, item, NOW_MS + 3));
-    const snapshot = toPublicRoomSnapshot(withItem, LIVE_PRESENCE);
-
-    expect(snapshot.game.phase).toBe("proposingWidth");
-
-    if (snapshot.game.phase !== "proposingWidth") {
-      throw new Error("Expected proposingWidth snapshot.");
-    }
-    if (withItem.game.phase !== "proposingWidth") {
-      throw new Error("Expected proposingWidth room state.");
-    }
-    expect(snapshot.game.turnDeadlineMs).toBe(withItem.game.turnDeadlineMs);
-    expect(typeof snapshot.game.turnDeadlineMs).toBe("number");
-  });
-
-  it("exposes forfeit details on a roundForfeited snapshot", () => {
-    const { room } = startedRoom();
-    const withItem = expectOk(receiveRoomItem(room, item, NOW_MS + 3));
-    const expired = expectOk(expireRoomTurn(withItem, NOW_MS + 4));
-    const snapshot = toPublicRoomSnapshot(expired, LIVE_PRESENCE);
-
-    expect(snapshot.game.phase).toBe("roundForfeited");
-
-    if (snapshot.game.phase !== "roundForfeited") {
-      throw new Error("Expected roundForfeited snapshot.");
-    }
-    expect(snapshot.game.forfeit).toMatchObject({
-      phase: "proposingWidth",
-      forfeitedBy: "A",
-      awardedTo: "B",
-    });
   });
 });
 

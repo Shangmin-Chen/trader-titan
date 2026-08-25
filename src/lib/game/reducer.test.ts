@@ -1,8 +1,7 @@
-import { calculateSettlement, resolvePendingTradeSide } from "./settlement";
+import { calculateSettlement } from "./settlement";
 import {
   createInitialGameState,
   executeTrade,
-  expireTurn,
   gameReducer,
   nextRound,
   receiveItem,
@@ -15,7 +14,6 @@ import {
   tradeOnWidth,
 } from "./index";
 import {
-  PROPOSING_WIDTH_FORFEIT_PENALTY,
   type GameAction,
   type GameState,
   type GeneratedItem,
@@ -60,8 +58,6 @@ function serverSettlement(
   item: SettledGeneratedItem;
   settlement: RoundSettlement;
 } {
-  const side = resolvePendingTradeSide(state.pendingTrade, state.quote, trueValue);
-
   return {
     item: {
       ...state.item,
@@ -72,9 +68,8 @@ function serverSettlement(
       itemTitle: state.item.item_title,
       trueValue,
       quote: state.quote,
-      side,
+      side: state.pendingTrade,
       roles: state.roles,
-      forcedByTimeout: state.pendingTrade.kind === "timeoutForcedWorstSide",
     }),
   };
 }
@@ -117,27 +112,6 @@ describe("game reducer", () => {
     expect(nextState).toBe(state);
   });
 
-  it("EXECUTE_TRADE's own settling transition drops turnDeadlineMs, just like the F-06 timeout path does", () => {
-    // Mirrors the F-06 "drops turnDeadlineMs" assertion below for the
-    // timeout-forced transition into settling: that test alone left this
-    // ordinary (trader actually chose a side) transition unguarded, and
-    // reintroducing `...state` on EXECUTE_TRADE's own case (see the
-    // reducer's "Deliberately not `...state`" comment) typechecks clean and
-    // passes every other unit test, since TS does not flag excess
-    // properties introduced via spread.
-    const choosing = readyForSideChoice({ bid: 200, ask: 400 });
-    const settling = executeTrade(choosing, "BUY");
-
-    expect(settling.phase).toBe("settling");
-
-    if (settling.phase !== "settling") {
-      throw new Error("Expected settling state.");
-    }
-
-    expect(settling.pendingTrade).toEqual({ kind: "chosen", side: "BUY" });
-    expect("turnDeadlineMs" in settling).toBe(false);
-  });
-
   it("guards non-reset actions outside their valid phases", () => {
     const setup = createInitialGameState();
     const generating = startGame(setup, startPayload);
@@ -157,13 +131,13 @@ describe("game reducer", () => {
 
     const invalidCases: Array<{ action: GameAction; state: GameState }> = [
       { state: generating, action: { type: "START_GAME", payload: startPayload } },
-      { state: setup, action: { type: "ITEM_RECEIVED", item, turnDeadlineMs: 0 } },
-      { state: setup, action: { type: "SUBMIT_INITIAL_WIDTH", width: 500, turnDeadlineMs: 0 } },
-      { state: setup, action: { type: "TIGHTEN_WIDTH", width: 200, turnDeadlineMs: 0 } },
-      { state: setup, action: { type: "TRADE_ON_WIDTH", turnDeadlineMs: 0 } },
+      { state: setup, action: { type: "ITEM_RECEIVED", item } },
+      { state: setup, action: { type: "SUBMIT_INITIAL_WIDTH", width: 500 } },
+      { state: setup, action: { type: "TIGHTEN_WIDTH", width: 200 } },
+      { state: setup, action: { type: "TRADE_ON_WIDTH" } },
       {
         state: setup,
-        action: { type: "SUBMIT_MARKET_QUOTE", quote: { bid: 1, ask: 2 }, turnDeadlineMs: 0 },
+        action: { type: "SUBMIT_MARKET_QUOTE", quote: { bid: 1, ask: 2 } },
       },
       { state: setup, action: { type: "MARKET_COMMIT_FAILED", error: "failed" } },
       { state: setup, action: { type: "EXECUTE_TRADE", side: "SELL" } },
@@ -175,8 +149,6 @@ describe("game reducer", () => {
           settlement: settlementPayload.settlement,
         },
       },
-      { state: setup, action: { type: "TURN_EXPIRED" } },
-      { state: settling, action: { type: "TURN_EXPIRED" } },
       { state: setup, action: { type: "NEXT_ROUND" } },
       { state: gameOver, action: { type: "EXECUTE_TRADE", side: "BUY" } },
     ];
@@ -390,227 +362,4 @@ describe("game reducer", () => {
     expect(round2State.roles).toEqual({ marketMaker: "B", trader: "A" });
   });
 
-  describe("F-05 turn shot clock", () => {
-    it("forfeits the round on turn expiry and applies the zero-sum penalty against the width in play", () => {
-      // negotiatingWidth: the trader (B by default) is on the clock.
-      const negotiating = submitInitialWidth(readyForWidth(), 500);
-      const expired = expireTurn(negotiating);
-
-      expect(expired.phase).toBe("roundForfeited");
-
-      if (expired.phase !== "roundForfeited") {
-        throw new Error("Expected roundForfeited state.");
-      }
-      expect(expired.forfeit).toMatchObject({
-        roundNumber: 1,
-        itemTitle: item.item_title,
-        phase: "negotiatingWidth",
-        forfeitedBy: "B",
-        awardedTo: "A",
-        penalty: 500,
-      });
-      expect(expired.scores).toEqual({ A: 500, B: -500 });
-    });
-
-    it("forfeits proposingWidth using the named fallback penalty since no width has been proposed yet", () => {
-      // proposingWidth: the market maker (A by default) is on the clock.
-      const proposing = readyForWidth();
-      const expired = expireTurn(proposing);
-
-      expect(expired.phase).toBe("roundForfeited");
-
-      if (expired.phase !== "roundForfeited") {
-        throw new Error("Expected roundForfeited state.");
-      }
-      expect(expired.forfeit).toMatchObject({
-        phase: "proposingWidth",
-        forfeitedBy: "A",
-        awardedTo: "B",
-        penalty: PROPOSING_WIDTH_FORFEIT_PENALTY,
-      });
-      expect(expired.scores).toEqual({
-        A: -PROPOSING_WIDTH_FORFEIT_PENALTY,
-        B: PROPOSING_WIDTH_FORFEIT_PENALTY,
-      });
-    });
-
-    it("forfeits configuringMarket against whichever player is on the clock there", () => {
-      const configuring = tradeOnWidth(tightenWidth(submitInitialWidth(readyForWidth(), 500), 200));
-      const expiredMarket = expireTurn(configuring);
-
-      expect(expiredMarket.phase).toBe("roundForfeited");
-      if (expiredMarket.phase !== "roundForfeited") {
-        throw new Error("Expected roundForfeited state.");
-      }
-      // negotiatingWidth's TIGHTEN_WIDTH swapped roles, so B is now
-      // marketMaker and on the clock in configuringMarket.
-      expect(expiredMarket.forfeit).toMatchObject({
-        phase: "configuringMarket",
-        forfeitedBy: "B",
-        awardedTo: "A",
-        penalty: 200,
-      });
-    });
-
-    it("rejects TURN_EXPIRED outside the four actionable phases, leaving state untouched", () => {
-      const singleRoundPayload: StartGamePayload = { ...startPayload, totalRounds: 1 };
-      const setup = createInitialGameState();
-      const generating = startGame(setup, singleRoundPayload);
-      const choosing = readyForSideChoice({ bid: 200, ask: 400 });
-      const settling = executeTrade(choosing, "BUY");
-      const settlement = settleTrade(
-        submitMarketQuote(
-          tradeOnWidth(submitInitialWidth(receiveItem(generating, item), 200)),
-          { bid: 200, ask: 400 },
-        ),
-        "BUY",
-        300,
-      );
-      const gameOver = nextRound(settlement);
-
-      expect(gameOver.phase).toBe("gameOver");
-
-      for (const state of [setup, generating, settling, settlement, gameOver]) {
-        expect(gameReducer(state, { type: "TURN_EXPIRED" })).toBe(state);
-      }
-    });
-
-    it("advances from a round forfeit exactly like from settlement, including to game over on the final round", () => {
-      const singleRoundPayload: StartGamePayload = { ...startPayload, totalRounds: 1 };
-      const proposing = receiveItem(startGame(createInitialGameState(), singleRoundPayload), item);
-      const forfeited = expireTurn(proposing);
-
-      expect(forfeited.phase).toBe("roundForfeited");
-
-      const over = nextRound(forfeited);
-
-      expect(over.phase).toBe("gameOver");
-
-      if (over.phase !== "gameOver") {
-        throw new Error("Expected game over state.");
-      }
-      expect(over.scores.A + over.scores.B).toBe(0);
-      expect(over.winner).toBe("B");
-    });
-
-    it("advances a round forfeit into the next round (not final) with fresh roles", () => {
-      const proposing = readyForWidth();
-      const forfeited = expireTurn(proposing);
-      const round2 = nextRound(forfeited);
-
-      expect(round2.phase).toBe("generatingItem");
-      expect(round2.roundNumber).toBe(2);
-      expect(round2.roles).toEqual({ marketMaker: "B", trader: "A" });
-    });
-  });
-
-  describe("F-06 choosingSide timeout forces worst-side settlement", () => {
-    it("moves a choosingSide timeout straight to settling with an unresolved pendingTrade instead of forfeiting, and drops turnDeadlineMs", () => {
-      const choosing = readyForSideChoice({ bid: 200, ask: 400 });
-      const settling = expireTurn(choosing);
-
-      expect(settling.phase).toBe("settling");
-
-      if (settling.phase !== "settling") {
-        throw new Error("Expected settling state.");
-      }
-
-      // Not a forfeit: choosingSide's clock expiring must not short-circuit
-      // to roundForfeited any more (see the "forfeits configuringMarket..."
-      // test above for the phases that still do).
-      expect(settling.pendingTrade).toEqual({ kind: "timeoutForcedWorstSide" });
-      expect(settling.quote).toEqual({ bid: 200, ask: 400 });
-      expect("true_value" in settling.item).toBe(false);
-      // Mirrors EXECUTE_TRADE's own settling transition: settling is not a
-      // turn-clocked phase, so it must not carry a stray turnDeadlineMs.
-      expect("turnDeadlineMs" in settling).toBe(false);
-    });
-
-    it("settles against BUY when BUY is the worse side for the trader", () => {
-      // trueValue 3600, quote 3600/3800: buyPnL = 3600-3800 = -200,
-      // sellPnL = 3600-3600 = 0. BUY is worse.
-      const choosing = readyForSideChoice({ bid: 3600, ask: 3800 });
-      const settling = expireTurn(choosing);
-
-      expect(settling.phase).toBe("settling");
-
-      if (settling.phase !== "settling") {
-        throw new Error("Expected settling state.");
-      }
-
-      const { item: revealedItem, settlement } = serverSettlement(settling, 3600);
-      const settled = receiveSettlement(settling, revealedItem, settlement);
-
-      expect(settled.phase).toBe("settlement");
-
-      if (settled.phase !== "settlement") {
-        throw new Error("Expected settlement state.");
-      }
-      expect(settled.settlement.side).toBe("BUY");
-      expect(settled.settlement.traderPnL).toBe(-200);
-      expect(settled.settlement.forcedByTimeout).toBe(true);
-      expect(settled.log.at(-1)?.message).toContain("ran out of time");
-    });
-
-    it("settles against SELL when SELL is the worse side for the trader", () => {
-      // trueValue 3600, quote 3300/3500: buyPnL = 3600-3500 = 100,
-      // sellPnL = 3300-3600 = -300. SELL is worse.
-      const choosing = readyForSideChoice({ bid: 3300, ask: 3500 });
-      const settling = expireTurn(choosing);
-
-      expect(settling.phase).toBe("settling");
-
-      if (settling.phase !== "settling") {
-        throw new Error("Expected settling state.");
-      }
-
-      const { item: revealedItem, settlement } = serverSettlement(settling, 3600);
-      const settled = receiveSettlement(settling, revealedItem, settlement);
-
-      expect(settled.phase).toBe("settlement");
-
-      if (settled.phase !== "settlement") {
-        throw new Error("Expected settlement state.");
-      }
-      expect(settled.settlement.side).toBe("SELL");
-      expect(settled.settlement.traderPnL).toBe(-300);
-      expect(settled.settlement.forcedByTimeout).toBe(true);
-    });
-
-    it("breaks an exact PnL tie by deterministically forcing BUY", () => {
-      // trueValue 3600, quote 3500/3700: buyPnL = 3600-3700 = -100,
-      // sellPnL = 3500-3600 = -100. Tied.
-      const choosing = readyForSideChoice({ bid: 3500, ask: 3700 });
-      const settling = expireTurn(choosing);
-
-      expect(settling.phase).toBe("settling");
-
-      if (settling.phase !== "settling") {
-        throw new Error("Expected settling state.");
-      }
-
-      const { item: revealedItem, settlement } = serverSettlement(settling, 3600);
-      const settled = receiveSettlement(settling, revealedItem, settlement);
-
-      expect(settled.phase).toBe("settlement");
-
-      if (settled.phase !== "settlement") {
-        throw new Error("Expected settlement state.");
-      }
-      expect(settled.settlement.side).toBe("BUY");
-      expect(settled.settlement.traderPnL).toBe(-100);
-    });
-
-    it("does not treat a trader's own EXECUTE_TRADE as forced", () => {
-      const choosing = readyForSideChoice({ bid: 200, ask: 400 });
-      const settled = settleTrade(choosing, "BUY", 300);
-
-      expect(settled.phase).toBe("settlement");
-
-      if (settled.phase !== "settlement") {
-        throw new Error("Expected settlement state.");
-      }
-      expect(settled.settlement.forcedByTimeout).toBe(false);
-    });
-  });
 });

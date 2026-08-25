@@ -18,13 +18,11 @@ import {
   LiveAnnouncerProvider,
   MarketRangeForm,
   PhaseStepper,
-  RoundForfeitPanel,
   Scoreboard,
   SettlementPanel,
   SpreadWidthForm,
   TradeActionPanel,
   TurnBanner,
-  TurnCountdown,
   WidthNegotiationPanel,
   useAnnouncer,
   type PhaseStep,
@@ -100,7 +98,6 @@ function phaseToStepId(phase: string): string | null {
       return "trade";
     case "settling":
     case "settlement":
-    case "roundForfeited":
       return "settle";
     default:
       return null;
@@ -294,16 +291,6 @@ function HomeContent() {
           );
         } else {
           announce(`Round ${room?.game?.roundNumber ?? ""} settled`);
-        }
-        break;
-      }
-      case "roundForfeited": {
-        const g = room?.game;
-        if (g?.phase === "roundForfeited") {
-          const forfeitedName = g.players[g.forfeit.forfeitedBy].name;
-          announce(`Round ${g.roundNumber} forfeited: ${forfeitedName} ran out of time.`);
-        } else {
-          announce(`Round ${room?.game?.roundNumber ?? ""} forfeited`);
         }
         break;
       }
@@ -1428,7 +1415,6 @@ function RoomGameView({
       <>
         {stepper}
         <TurnBanner isYourTurn={isYourTurn} waitingForName={waitingForName} />
-        <TurnCountdown turnDeadlineMs={game.turnDeadlineMs} />
         <div className="play-stack">
           <ItemPanel item={game.item} />
           <section className="phase-panel">
@@ -1459,7 +1445,6 @@ function RoomGameView({
       <>
         {stepper}
         <TurnBanner isYourTurn={isYourTurn} waitingForName={waitingForName} />
-        <TurnCountdown turnDeadlineMs={game.turnDeadlineMs} />
         <div className="play-stack">
           <ItemPanel item={game.item} />
           <WidthNegotiationPanel
@@ -1489,7 +1474,6 @@ function RoomGameView({
       <>
         {stepper}
         <TurnBanner isYourTurn={isYourTurn} waitingForName={waitingForName} />
-        <TurnCountdown turnDeadlineMs={game.turnDeadlineMs} />
         <div className="play-stack">
           <ItemPanel item={game.item} />
           <section className="phase-panel">
@@ -1525,7 +1509,6 @@ function RoomGameView({
       <>
         {stepper}
         <TurnBanner isYourTurn={isYourTurn} waitingForName={waitingForName} />
-        <TurnCountdown turnDeadlineMs={game.turnDeadlineMs} />
         <div className="play-stack">
           <ItemPanel item={game.item} />
           <TradeActionPanel
@@ -1568,32 +1551,6 @@ function RoomGameView({
             onContinue={onAdvanceRound}
             players={game.players}
             settlement={game.settlement}
-          />
-        </div>
-      </>
-    );
-  }
-
-  if (game.phase === "roundForfeited") {
-    const isFinalRound = game.roundNumber >= game.totalRounds;
-    const forfeitDisabledReason = !isHost
-      ? "Only the host can advance rounds."
-      : undefined;
-
-    return (
-      <>
-        {stepper}
-        <div className="play-stack">
-          <RoundForfeitPanel
-            disabled={
-              isCommandPending("ADVANCE_ROUND") ||
-              forfeitDisabledReason !== undefined
-            }
-            disabledReason={forfeitDisabledReason}
-            forfeit={game.forfeit}
-            isFinalRound={isFinalRound}
-            onContinue={onAdvanceRound}
-            players={game.players}
           />
         </div>
       </>

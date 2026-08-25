@@ -472,7 +472,6 @@ describe("per-command pending state (F-06)", () => {
         marketMaker: "A",
         traderPnL: 0,
         marketMakerPnL: 0,
-        forcedByTimeout: false,
       },
     },
   } satisfies PublicRoomSnapshot;
