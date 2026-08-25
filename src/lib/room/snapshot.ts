@@ -65,8 +65,6 @@ export type PublicSettlingGameState = Omit<SettlingGameState, "item"> &
 export type PublicSettledGeneratedItem = PublicGeneratedItem &
   Readonly<{
     true_value: number;
-    scraped_items?: SettledGeneratedItem["scraped_items"];
-    amazon_url?: string;
   }>;
 export type PublicSettlementGameState = Omit<SettlementGameState, "item"> &
   Readonly<{ item: PublicSettledGeneratedItem }>;
@@ -296,12 +294,6 @@ function assertNever(value: never): never {
 function publicGameBase(game: GameState): Omit<SetupGameState, "phase"> {
   return {
     mode: game.mode,
-    ...(game.customAmazonQuery === undefined
-      ? {}
-      : { customAmazonQuery: game.customAmazonQuery }),
-    ...(game.aiGenerated === undefined
-      ? {}
-      : { aiGenerated: game.aiGenerated }),
     players: {
       A: publicPlayer(game.players.A),
       B: publicPlayer(game.players.B),
@@ -359,15 +351,6 @@ function toPublicSettledItem(
   return {
     ...toPublicItem(item),
     true_value: item.true_value,
-    ...(item.scraped_items === undefined
-      ? {}
-      : {
-          scraped_items: item.scraped_items.map((scraped) => ({
-            title: scraped.title,
-            price: scraped.price,
-          })),
-        }),
-    ...(item.amazon_url === undefined ? {} : { amazon_url: item.amazon_url }),
   };
 }
 

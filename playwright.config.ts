@@ -23,7 +23,7 @@ export default defineConfig({
   ],
   webServer: {
     command:
-      "npm run build:cloudflare && wrangler dev --var WORKER_ITEM_PROVIDER:deterministic --var WORKER_TEST_MODE:1 --port 8787",
+      "npm run build:cloudflare && wrangler dev --var WORKER_TEST_MODE:1 --port 8787",
     timeout: 120_000,
     url: "http://localhost:8787",
     reuseExistingServer: !process.env.CI

@@ -20,10 +20,9 @@ import { DurableObject } from "cloudflare:workers";
 import openNextWorker from "../../.open-next/worker.js";
 import {
   createRoomCreationRateLimiter,
-  createRoomCustomAmazonRateLimiter,
   isAllowedOrigin
 } from "../api/request-guards";
-import type { GameMode, ProviderGeneratedItem, SettledGeneratedItem } from "../lib/game";
+import type { GameMode, SettledGeneratedItem } from "../lib/game";
 import {
   authorizeRoomAccess,
   authorizeRoomAction,
@@ -37,7 +36,7 @@ import {
   parseRoomGameConfigPatch,
   parseTokenHash,
   roomExpiresAtMs,
-  roomDomainError,
+  setRoomMaxTotalRounds,
   toPersistenceEnvelope,
   toPublicRoomInvitePreview,
   toPublicRoomSnapshot,
@@ -58,10 +57,6 @@ import {
   type UnixTimeMs
 } from "../lib/room";
 import {
-  createWorkerRoomItemProviders,
-  itemGenerationErrorMessage
-} from "./item-provider";
-import {
   createSettledGeneratedItem,
   loadPrivateGeneratedItemEnvelope,
   privateGeneratedItemStoragePrefix,
@@ -69,31 +64,24 @@ import {
   toGeneratedItem,
   toPrivateGeneratedItemEnvelope
 } from "./private-generated-items";
-import { GoogleGenAI } from "@google/genai/web";
-import staticMarkets from "../../config/static-markets.json";
-import marketConfig from "../../config/gemini-markets.json";
-import {
-  GEMINI_MODEL,
-  GEMINI_RESPONSE_MIME_TYPE,
-  GEMINI_BATCH_RESPONSE_SCHEMA,
-  buildGeminiBatchPrompt
-} from "../api/item-generation/config";
-import { createFetchAmazonLookup } from "../api/item-generation/amazon-provider";
+import { itemForRound, maxRoundsForDeck } from "./static-deck";
 import {
   ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS,
   ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE
 } from "../lib/room-socket-supervisor";
+
+// D3: a match can never outlive its item variety - cap totalRounds at the
+// static deck's per-mode length for every config decoded by this Worker.
+setRoomMaxTotalRounds(maxRoundsForDeck());
 
 const JSON_CONTENT_TYPE = "application/json; charset=utf-8";
 const ROOM_ENDPOINT = "/room";
 const ROOM_ACCESS_ENDPOINT = "/room/access";
 const ROOM_JOIN_ENDPOINT = "/room/join";
 const ROOM_COMMAND_ENDPOINT = "/room/command";
-const ROOM_CUSTOM_AMAZON_ITEM_ENDPOINT = "/room/custom-amazon-item";
 const ROOM_SOCKET_ENDPOINT = "/room/socket";
 const ROOM_TEST_EXPIRE_TURN_ENDPOINT = "/room/test-expire-turn";
 const PUBLIC_ROOMS_ENDPOINT = "/api/rooms";
-const PUBLIC_CUSTOM_AMAZON_ITEM_ROUTE = "custom-amazon-item";
 const PUBLIC_TEST_EXPIRE_TURN_ROUTE = "test-expire-turn";
 /**
  * Test-only affordance for e2e coverage of the F-05 shot clock (PR #18,
@@ -106,9 +94,8 @@ const PUBLIC_TEST_EXPIRE_TURN_ROUTE = "test-expire-turn";
  * production alarm handler, reducer transition, persistence, and
  * WebSocket broadcast all still run for real - only the wait is
  * shortened. It is only reachable when this.env.WORKER_TEST_MODE is set
- * (see testExpireTurnSoon's own comment for why that - and specifically
- * not this.env.WORKER_ITEM_PROVIDER - is the gate), which is never the
- * case in a real deploy.
+ * (see testExpireTurnSoon's own comment for why that is the gate), which is
+ * never the case in a real deploy.
  */
 const E2E_FAST_FORWARD_TURN_OFFSET_MS = 3_000;
 const LEGACY_NEXT_GAME_API_PATHS = new Set([
@@ -151,7 +138,6 @@ const TOKEN_HASH_INPUT_PREFIX = "trader-titan.room-token.v1";
 const PRIVATE_ITEM_UNAVAILABLE_MESSAGE = "Private generated item is unavailable for settlement.";
 const rejectTokenVerification: TokenVerifier = () => false;
 const publicRoomCreationRateLimiter = createRoomCreationRateLimiter();
-const publicRoomCustomAmazonRateLimiter = createRoomCustomAmazonRateLimiter();
 
 type OpenNextWorker = Required<Pick<ExportedHandler<Cloudflare.Env>, "fetch">>;
 type WorkerFetchContext = Parameters<OpenNextWorker["fetch"]>[2];
@@ -209,9 +195,11 @@ type CommandRoomResponse = Readonly<{
   room: PublicRoomSnapshot;
 }>;
 
-type CustomAmazonItemResponse = Readonly<{
-  ok: true;
-  room: PublicRoomSnapshot;
+type PendingItemGeneration = Readonly<{
+  roomId: RoomId;
+  revision: number;
+  roundNumber: number;
+  mode: GameMode;
 }>;
 
 type CreateRoomBody = Readonly<{
@@ -225,11 +213,6 @@ type JoinRoomBody = Readonly<{
 
 type AccessRoomBody = Readonly<{
   credential: PresentedCapabilityToken;
-}>;
-
-type CustomAmazonItemBody = Readonly<{
-  credential: PresentedCapabilityToken;
-  query: unknown;
 }>;
 
 type BodyDecodeResult<T> =
@@ -252,14 +235,6 @@ type CreateOrLoadRoomResult =
   | Readonly<{ ok: true; created: true; room: RoomState }>
   | Readonly<{ ok: true; created: false; room: RoomState }>
   | Readonly<{ ok: false; status: number; error: RoomHttpError | RoomDomainError }>;
-
-type PendingItemGeneration = Readonly<{
-  roomId: RoomId;
-  revision: number;
-  roundNumber: number;
-  mode: GameMode;
-  customAmazonQuery: boolean;
-}>;
 
 /**
  * A durably-persisted marker for a room-level effect that must run outside
@@ -393,10 +368,6 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       return this.applyRoomCommand(request);
     }
 
-    if (pathname === ROOM_CUSTOM_AMAZON_ITEM_ENDPOINT && request.method === "POST") {
-      return this.applyCustomAmazonItem(request);
-    }
-
     if (pathname === ROOM_TEST_EXPIRE_TURN_ENDPOINT && request.method === "POST") {
       return this.testExpireTurnSoon(request);
     }
@@ -406,7 +377,6 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       pathname === ROOM_ACCESS_ENDPOINT ||
       pathname === ROOM_JOIN_ENDPOINT ||
       pathname === ROOM_COMMAND_ENDPOINT ||
-      pathname === ROOM_CUSTOM_AMAZON_ITEM_ENDPOINT ||
       pathname === ROOM_SOCKET_ENDPOINT ||
       pathname === ROOM_TEST_EXPIRE_TURN_ENDPOINT
     ) {
@@ -622,60 +592,6 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
     });
   }
 
-  private async applyCustomAmazonItem(request: Request): Promise<Response> {
-    const decoded = await decodeCustomAmazonItemBody(request);
-
-    if (!decoded.ok) {
-      return decoded.response;
-    }
-
-    const verifyToken = await buildTokenVerifier(decoded.value.credential);
-    const nowMs = currentUnixTimeMs();
-    const target = await this.loadCustomAmazonGenerationTarget(
-      decoded.value.credential,
-      verifyToken,
-      nowMs
-    );
-
-    if (!target.ok) {
-      return errorResponse(target.error, target.status);
-    }
-
-    const generated = await createWorkerRoomItemProviders({
-      env: this.env,
-      fetchImpl: (input, init) => fetch(input, init)
-    }).generateCustomAmazonItem({ query: decoded.value.query });
-
-    if (!generated.ok) {
-      return errorResponse(
-        {
-          code: generated.error.code,
-          message: itemGenerationErrorMessage(generated.error)
-        },
-        statusForItemGenerationError(generated.error.code)
-      );
-    }
-
-    const result = await this.receiveGeneratedProviderItem(
-      target.target,
-      generated.item,
-      nowMs,
-      decoded.value.credential,
-      verifyToken
-    );
-
-    if (!result.ok) {
-      return errorResponse(result.error, result.status);
-    }
-
-    this.broadcastRoomSnapshot(result.room);
-
-    return jsonResponse<CustomAmazonItemResponse>({
-      ok: true,
-      room: this.publicRoomSnapshot(result.room)
-    });
-  }
-
   /**
    * Test-only (see E2E_FAST_FORWARD_TURN_OFFSET_MS above): fast-forwards
    * the room's currently-armed F-05 turn deadline to a few seconds from
@@ -688,18 +604,9 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
    *
    * Gated on this.env.WORKER_TEST_MODE being set - a dedicated var with no
    * meaning anywhere else in this codebase and no legitimate reason to be
-   * set on a real deploy, unlike this.env.WORKER_ITEM_PROVIDER (which this
-   * gate deliberately does NOT key off). WORKER_ITEM_PROVIDER is a real
-   * provider-selection override (see its use in
-   * applyAutomaticRoomEffects/isTestEnv and the "deterministic" | "gemini"
-   * type in worker-configuration.d.ts) that an operator could legitimately
-   * set on a genuine deploy - e.g. to force the deterministic provider
-   * during an incident - which would have silently un-404d a route able to
-   * force any player's clock to expire in ~3s. wrangler.toml currently sets
-   * no vars at all, so that was not reachable in the shipped config, but it
-   * was one plausible config change away from open. WORKER_TEST_MODE has no
-   * such double duty: nothing else in this file reads it, so setting it can
-   * only ever be a deliberate, test-specific choice (see
+   * set on a real deploy. It deliberately does not double as any other
+   * operational override: nothing else in this file reads it, so setting it
+   * can only ever be a deliberate, test-specific choice (see
    * playwright.config.ts and vitest.worker.config.ts).
    *
    * Authorization below is intentionally `{ type: "access" }` rather than
@@ -1480,48 +1387,11 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
     room: RoomState,
     nowMs: UnixTimeMs
   ): Promise<StoredRoomCommandResult> {
+    // The static deck (D3) makes item receipt synchronous with the command
+    // that opened the round: the deck pick cannot fail, so there is no
+    // generation phase to retry and no provider error path.
     if (shouldGenerateItemAfterCommand(command, room)) {
-      const isTestEnv = this.env.WORKER_ITEM_PROVIDER !== undefined;
-
-      if (isTestEnv) {
-        const generatedResult = await this.pregenerateAllItems(room);
-        if (!generatedResult.ok) {
-          return this.recordRoomItemFailure(
-            generationTargetForRoom(room),
-            generatedResult.error,
-            nowMs
-          );
-        }
-        const currentItem = generatedResult.items[room.game.roundNumber - 1] || generatedResult.items[0];
-        return this.receiveGeneratedProviderItem(
-          generationTargetForRoom(room),
-          currentItem,
-          nowMs
-        );
-      }
-
-      let pregeneratedItems = await this.ctx.storage.get<ProviderGeneratedItem[]>("room:pregenerated-items:v1");
-      if (!pregeneratedItems || room.game.roundNumber === 1 || command.type === "RETRY_ITEM_GENERATION") {
-        const generatedResult = await this.pregenerateAllItems(room);
-        if (!generatedResult.ok) {
-          return this.recordRoomItemFailure(
-            generationTargetForRoom(room),
-            generatedResult.error,
-            nowMs
-          );
-        }
-        pregeneratedItems = generatedResult.items;
-        await this.ctx.storage.put("room:pregenerated-items:v1", pregeneratedItems);
-      }
-
-      const roundIndex = room.game.roundNumber - 1;
-      const currentItem = pregeneratedItems[roundIndex] || pregeneratedItems[pregeneratedItems.length - 1];
-
-      return this.receiveGeneratedProviderItem(
-        generationTargetForRoom(room),
-        currentItem,
-        nowMs
-      );
+      return this.receiveDeckItem(room, nowMs);
     }
 
     if (command.type === "EXECUTE_TRADE" && room.lifecycle === "active" && room.game.phase === "settling") {
@@ -1549,197 +1419,18 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
     };
   }
 
-  private async pregenerateAllItems(
-    room: RoomState
-  ): Promise<{ ok: true; items: ProviderGeneratedItem[] } | { ok: false; error: string }> {
-    const mode = room.game.mode;
-    const count = room.game.totalRounds;
-    const providerMode = this.env.WORKER_ITEM_PROVIDER || (room.game.aiGenerated === true ? "gemini" : "static");
-
-    if (providerMode === "deterministic") {
-      const provider = createWorkerRoomItemProviders({
-        env: this.env,
-        fetchImpl: (input, init) => fetch(input, init)
-      }).generateItem;
-
-      const items: ProviderGeneratedItem[] = [];
-      for (let i = 0; i < count; i++) {
-        const generated = await provider({ mode });
-        if (!generated.ok) {
-          return { ok: false, error: generated.error.message };
-        }
-        items.push(generated.item);
-      }
-      return { ok: true, items };
-    }
-
-    if (providerMode === "static") {
-      const itemsForMode = (staticMarkets as Record<string, Omit<ProviderGeneratedItem, "round_id">[]>)[mode] || [];
-      if (itemsForMode.length === 0) {
-        return { ok: false, error: `No static items defined for mode ${mode}.` };
-      }
-
-      const shuffled = [...itemsForMode].sort(() => Math.random() - 0.5);
-      const selected: ProviderGeneratedItem[] = [];
-      for (let i = 0; i < count; i++) {
-        const baseItem = shuffled[i % shuffled.length];
-        selected.push({
-          item_title: baseItem.item_title,
-          category: baseItem.category,
-          context_clue: baseItem.context_clue,
-          true_value: baseItem.true_value,
-          scraped_items: baseItem.scraped_items,
-          amazon_url: baseItem.amazon_url,
-        });
-      }
-
-      return { ok: true, items: selected };
-    }
-
-    const apiKey = this.env.GEMINI_API_KEY;
-    if (!apiKey) {
-      return { ok: false, error: "Item generation is not configured." };
-    }
-
-    try {
-      const ai = new GoogleGenAI({ apiKey });
-      const response = await ai.models.generateContent({
-        model: GEMINI_MODEL,
-        contents: buildGeminiBatchPrompt({ marketConfig, mode, count }),
-        config: {
-          responseMimeType: GEMINI_RESPONSE_MIME_TYPE,
-          responseSchema: GEMINI_BATCH_RESPONSE_SCHEMA,
-        },
-      });
-
-      const responseText = response.text;
-      if (!responseText) {
-        return { ok: false, error: "AI response was empty." };
-      }
-
-      const rawArray = JSON.parse(responseText);
-      if (!Array.isArray(rawArray)) {
-        return { ok: false, error: "AI response was not a valid array." };
-      }
-
-      const items: ProviderGeneratedItem[] = [];
-      const amazonLookup = createFetchAmazonLookup({ fetchImpl: (input, init) => fetch(input, init) });
-
-      for (const rawItem of rawArray) {
-        if (
-          typeof rawItem.item_title !== "string" ||
-          typeof rawItem.category !== "string" ||
-          typeof rawItem.context_clue !== "string" ||
-          typeof rawItem.true_value !== "number"
-        ) {
-          continue;
-        }
-
-        const item: ProviderGeneratedItem = {
-          item_title: rawItem.item_title,
-          category: rawItem.category,
-          context_clue: rawItem.context_clue,
-          true_value: rawItem.true_value,
-        };
-
-        if (mode === "Amazon") {
-          try {
-            const details = await amazonLookup(item.item_title);
-            if (details !== null) {
-              item.true_value = details.price;
-              item.scraped_items = details.scraped_items;
-              item.amazon_url = details.amazon_url;
-            } else {
-              const fallbackPrice = Math.floor(Math.random() * 145) + 5 + 0.99;
-              item.true_value = fallbackPrice;
-              item.scraped_items = [{ title: item.item_title, price: fallbackPrice }];
-              item.amazon_url = `https://www.amazon.com/s?k=${encodeURIComponent(item.item_title)}`;
-            }
-          } catch {
-            const fallbackPrice = Math.floor(Math.random() * 145) + 5 + 0.99;
-            item.true_value = fallbackPrice;
-            item.scraped_items = [{ title: item.item_title, price: fallbackPrice }];
-            item.amazon_url = `https://www.amazon.com/s?k=${encodeURIComponent(item.item_title)}`;
-          }
-        }
-
-        items.push(item);
-      }
-
-      if (items.length === 0) {
-        return { ok: false, error: "AI failed to generate any valid items." };
-      }
-
-      if (items.length < count) {
-        const fallbackList = (staticMarkets as Record<string, Omit<ProviderGeneratedItem, "round_id">[]>)[mode] || [];
-        let fallbackIndex = 0;
-        while (items.length < count && fallbackList.length > 0) {
-          const fb = fallbackList[fallbackIndex % fallbackList.length];
-          items.push({
-            item_title: fb.item_title,
-            category: fb.category,
-            context_clue: fb.context_clue,
-            true_value: fb.true_value,
-            scraped_items: fb.scraped_items,
-            amazon_url: fb.amazon_url,
-          });
-          fallbackIndex++;
-        }
-      }
-
-      return { ok: true, items: items.slice(0, count) };
-    } catch (e: unknown) {
-      const errorMessage = e instanceof Error ? e.message : String(e);
-      return { ok: false, error: `AI item generation failed: ${errorMessage}` };
-    }
-  }
-
-  private async loadCustomAmazonGenerationTarget(
-    credential: PresentedCapabilityToken,
-    verifyToken: TokenVerifier,
+  /**
+   * D3 (decided): attaches the round's static-deck item inside one storage
+   * transaction against the freshly-loaded room - same shape as the old
+   * provider receipt path, minus credentials and minus any way to fail
+   * mid-generation. The private-item write stays until Phase 3 so the
+   * existing settle-resume path keeps working unchanged.
+   */
+  private async receiveDeckItem(
+    room: RoomState,
     nowMs: UnixTimeMs
-  ): Promise<
-    | Readonly<{ ok: true; target: PendingItemGeneration }>
-    | Readonly<{ ok: false; status: number; error: RoomHttpError | RoomDomainError }>
-  > {
-    const loaded = await this.loadStoredRoom(nowMs);
-
-    if (!loaded.ok) {
-      return {
-        ok: false,
-        status: statusForStoredRoomLoadFailure(loaded),
-        error: loaded.error
-      };
-    }
-
-    const authorization = authorizeCustomAmazonGeneration(
-      loaded.room,
-      credential,
-      verifyToken
-    );
-
-    if (!authorization.ok) {
-      return {
-        ok: false,
-        status: statusForDomainError(authorization.error),
-        error: authorization.error
-      };
-    }
-
-    return {
-      ok: true,
-      target: authorization.target
-    };
-  }
-
-  private async receiveGeneratedProviderItem(
-    target: PendingItemGeneration,
-    providerItem: ProviderGeneratedItem,
-    nowMs: UnixTimeMs,
-    credential?: PresentedCapabilityToken,
-    verifyToken?: TokenVerifier
   ): Promise<StoredRoomCommandResult> {
-    const privateItem = createSettledGeneratedItem(generateRoundId(), providerItem);
+    const target = generationTargetForRoom(room);
 
     return this.ctx.storage.transaction(async (transaction) => {
       const loaded = loadStoredRoomEnvelope(
@@ -1756,40 +1447,18 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       }
 
       if (!samePendingGeneration(loaded.room, target)) {
-        if (credential !== undefined && verifyToken !== undefined) {
-          const error = roomDomainError(
-            "invalid_game_phase",
-            "Custom Amazon generation is no longer pending."
-          );
-
-          return {
-            ok: false,
-            status: statusForDomainError(error),
-            error
-          } as const;
-        }
-
+        // Stale wake: the room moved on between committing the command that
+        // opened the round and this effect running. Leave it untouched.
         return {
           ok: true,
           room: loaded.room
         } as const;
       }
 
-      if (credential !== undefined && verifyToken !== undefined) {
-        const authorization = authorizeCustomAmazonGeneration(
-          loaded.room,
-          credential,
-          verifyToken
-        );
-
-        if (!authorization.ok) {
-          return {
-            ok: false,
-            status: statusForDomainError(authorization.error),
-            error: authorization.error
-          } as const;
-        }
-      }
+      const privateItem = createSettledGeneratedItem(
+        generateRoundId(),
+        itemForRound(loaded.room.game.mode, loaded.room.game.roundNumber)
+      );
 
       await transaction.put(
         privateGeneratedItemStorageKey(privateItem.round_id),
@@ -1801,58 +1470,6 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         {
           type: "ITEM_RECEIVED",
           item: toGeneratedItem(privateItem),
-          nowMs
-        }
-      );
-
-      if (!eventResult.ok) {
-        return {
-          ok: false,
-          status: statusForDomainError(eventResult.error),
-          error: eventResult.error
-        } as const;
-      }
-
-      await this.persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
-
-      return {
-        ok: true,
-        room: eventResult.room
-      } as const;
-    });
-  }
-
-  private async recordRoomItemFailure(
-    target: PendingItemGeneration,
-    message: string,
-    nowMs: UnixTimeMs
-  ): Promise<StoredRoomCommandResult> {
-    return this.ctx.storage.transaction(async (transaction) => {
-      const loaded = loadStoredRoomEnvelope(
-        await transaction.get<unknown>(ROOM_STORAGE_KEY),
-        nowMs
-      );
-
-      if (!loaded.ok) {
-        return {
-          ok: false,
-          status: statusForStoredRoomLoadFailure(loaded),
-          error: loaded.error
-        } as const;
-      }
-
-      if (!samePendingGeneration(loaded.room, target)) {
-        return {
-          ok: true,
-          room: loaded.room
-        } as const;
-      }
-
-      const eventResult = dispatchSystemRoomEvent(
-        loaded.room,
-        {
-          type: "ITEM_FAILED",
-          error: message,
           nowMs
         }
       );
@@ -2463,25 +2080,6 @@ function routePublicRoomRequest(
     return forwardRoomRequest(request, env, parsedRoomId.roomId, ROOM_TEST_EXPIRE_TURN_ENDPOINT);
   }
 
-  if (routeParts.length === 2 && routeParts[1] === PUBLIC_CUSTOM_AMAZON_ITEM_ROUTE && request.method === "POST") {
-    const originRejection = publicRoomOriginRejection(request);
-
-    if (originRejection !== null) {
-      return originRejection;
-    }
-
-    const rateLimitRejection = publicRoomRateLimitRejection(
-      request,
-      publicRoomCustomAmazonRateLimiter
-    );
-
-    if (rateLimitRejection !== null) {
-      return rateLimitRejection;
-    }
-
-    return forwardRoomRequest(request, env, parsedRoomId.roomId, ROOM_CUSTOM_AMAZON_ITEM_ENDPOINT);
-  }
-
   if (routeParts.length === 2 && routeParts[1] === "socket") {
     if (request.method !== "GET") {
       return errorResponse(
@@ -2506,7 +2104,17 @@ function routePublicRoomRequest(
     return forwardRoomRequest(request, env, parsedRoomId.roomId, ROOM_SOCKET_ENDPOINT);
   }
 
-  if (routeParts.length === 1 || routeParts.length === 2) {
+  if (routeParts.length === 2) {
+    // An unknown room subpath is a missing endpoint, not a known endpoint
+    // hit with the wrong method: it gets a 404, not a 405. This is what
+    // retired routes like custom-amazon-item degrade into.
+    return errorResponse(
+      { code: "not_found", message: "Room endpoint was not found." },
+      404
+    );
+  }
+
+  if (routeParts.length === 1) {
     return errorResponse(
       { code: "method_not_allowed", message: "HTTP method is not supported for this room endpoint." },
       405
@@ -2589,14 +2197,7 @@ function shouldGenerateItemAfterCommand(
     command.type === "RETRY_ITEM_GENERATION"
   ) &&
     room.lifecycle === "active" &&
-    room.game.phase === "generatingItem" &&
-    !isCustomAmazonGenerationPending(room);
-}
-
-function isCustomAmazonGenerationPending(room: RoomState): boolean {
-  return room.lifecycle === "active" &&
-    room.game.phase === "generatingItem" &&
-    room.game.customAmazonQuery === true;
+    room.game.phase === "generatingItem";
 }
 
 function generationTargetForRoom(room: RoomState): PendingItemGeneration {
@@ -2608,8 +2209,7 @@ function generationTargetForRoom(room: RoomState): PendingItemGeneration {
     roomId: room.id,
     revision: room.revision,
     roundNumber: room.game.roundNumber,
-    mode: room.game.mode,
-    customAmazonQuery: room.game.customAmazonQuery === true
+    mode: room.game.mode
   };
 }
 
@@ -2622,37 +2222,7 @@ function samePendingGeneration(
     room.lifecycle === "active" &&
     room.game.phase === "generatingItem" &&
     room.game.roundNumber === target.roundNumber &&
-    room.game.mode === target.mode &&
-    (room.game.customAmazonQuery === true) === target.customAmazonQuery;
-}
-
-function authorizeCustomAmazonGeneration(
-  room: RoomState,
-  credential: PresentedCapabilityToken,
-  verifyToken: TokenVerifier
-):
-  | Readonly<{ ok: true; target: PendingItemGeneration }>
-  | Readonly<{ ok: false; error: RoomDomainError }> {
-  if (!isCustomAmazonGenerationPending(room)) {
-    return {
-      ok: false,
-      error: roomDomainError(
-        "invalid_game_phase",
-        "Custom Amazon items can only be submitted while the active room is waiting for a custom Amazon query."
-      )
-    };
-  }
-
-  const authorized = authorizeRoomAction(
-    room,
-    credential,
-    { type: "activePlayer", playerId: room.game.roles.trader },
-    verifyToken
-  );
-
-  return authorized.ok
-    ? { ok: true, target: generationTargetForRoom(room) }
-    : { ok: false, error: authorized.error };
+    room.game.mode === target.mode;
 }
 
 function decodeRoomCommandText(
@@ -2961,34 +2531,6 @@ async function decodeAccessRoomBody(
   };
 }
 
-async function decodeCustomAmazonItemBody(
-  request: Request
-): Promise<BodyDecodeResult<CustomAmazonItemBody>> {
-  const parsed = await readJsonObjectBody(request, false);
-
-  if (!parsed.ok) {
-    return parsed;
-  }
-
-  const credential = parseCapabilityToken(parsed.value.credential);
-
-  if (!credential.ok) {
-    return invalidRequest(credential.error.message);
-  }
-
-  return {
-    ok: true,
-    value: {
-      credential: {
-        roomId: credential.token.roomId,
-        role: credential.token.role,
-        secret: credential.token.secret
-      },
-      query: parsed.value.query
-    }
-  };
-}
-
 async function readJsonObjectBody(
   request: Request,
   allowEmpty: boolean
@@ -3223,10 +2765,9 @@ async function deletePrivateGeneratedItems(
   const items = await transaction.list<unknown>({
     prefix: privateGeneratedItemStoragePrefix()
   });
-  const keys = [...items.keys(), "room:pregenerated-items:v1"];
 
-  if (keys.length > 0) {
-    await transaction.delete(keys);
+  if (items.size > 0) {
+    await transaction.delete([...items.keys()]);
   }
 }
 
@@ -3475,21 +3016,6 @@ function statusForDomainError(error: RoomDomainError): number {
       return 409;
     default:
       return assertNever(error.code);
-  }
-}
-
-function statusForItemGenerationError(code: string): number {
-  switch (code) {
-    case "invalid_custom_query":
-      return 400;
-    case "missing_api_key":
-      return 500;
-    case "amazon_price_unavailable":
-    case "invalid_provider_response":
-    case "provider_failed":
-      return 502;
-    default:
-      return 502;
   }
 }
 

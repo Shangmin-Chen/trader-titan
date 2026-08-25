@@ -42,7 +42,6 @@ vi.mock("../lib/room-client", async (importOriginal) => {
     loadRoomSession: vi.fn(),
     openRoomSocket: vi.fn(),
     sendRoomCommand: vi.fn(),
-    submitCustomAmazonItem: vi.fn(),
   };
 });
 
@@ -735,11 +734,11 @@ describe("per-command pending state (F-06)", () => {
     expect(sendRoomCommand).toHaveBeenCalledTimes(1);
   });
 
-  // Regression coverage for the timeout-sizing gap noted during review:
-  // START_ROOM / RETRY_ITEM_GENERATION can run a batched Gemini call plus
-  // up to MAX_ROUNDS sequential, uncapped Amazon lookups synchronously in
-  // the worker request path, so they must not share the same default
-  // timeout budget as a single-field command like RESET_TO_LOBBY.
+  // Regression coverage pinning the timeout split between the two
+  // item-generation command types and plain commands. Both commands now do
+  // only local, synchronous worker work (static-deck item receipt), so
+  // this dedicated budget is legacy and slated for removal in cleanup plan
+  // Phase 3; these assertions keep guarding the signal wiring until then.
   it("gives RETRY_ITEM_GENERATION a longer timeout signal than a plain command", async () => {
     const ERROR_SNAPSHOT = {
       ...BASE_SNAPSHOT,

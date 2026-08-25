@@ -211,12 +211,6 @@ function settlingStateFromChoosingSideTimeout(
   return {
     phase: "settling",
     mode: state.mode,
-    ...(state.customAmazonQuery === undefined
-      ? {}
-      : { customAmazonQuery: state.customAmazonQuery }),
-    ...(state.aiGenerated === undefined
-      ? {}
-      : { aiGenerated: state.aiGenerated }),
     players: state.players,
     scores: state.scores,
     roles: state.roles,
@@ -298,11 +292,9 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         ...state,
         phase: "generatingItem",
         mode: action.payload.mode,
-        customAmazonQuery: action.payload.customAmazonQuery === true,
-        aiGenerated: action.payload.aiGenerated,
         players: makePlayersFromStart(action.payload),
         scores: { ...DEFAULT_SCORES },
-        roles: action.payload.customAmazonQuery === true ? swapRoles(DEFAULT_ROLES) : DEFAULT_ROLES,
+        roles: DEFAULT_ROLES,
         roundNumber: 1,
         totalRounds: action.payload.totalRounds,
         log: [],
@@ -363,10 +355,6 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
       const nextState: GameState = {
         phase: "generatingItem",
         mode: state.mode,
-        customAmazonQuery: state.customAmazonQuery,
-        ...(state.aiGenerated === undefined
-          ? {}
-          : { aiGenerated: state.aiGenerated }),
         players: state.players,
         scores: state.scores,
         roles: state.roles,
@@ -513,12 +501,6 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
       const nextState: GameState = {
         phase: "settling",
         mode: state.mode,
-        ...(state.customAmazonQuery === undefined
-          ? {}
-          : { customAmazonQuery: state.customAmazonQuery }),
-        ...(state.aiGenerated === undefined
-          ? {}
-          : { aiGenerated: state.aiGenerated }),
         players: state.players,
         scores: state.scores,
         roles: state.roles,
@@ -555,10 +537,6 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
       const nextState: GameState = {
         phase: "settlement",
         mode: state.mode,
-        customAmazonQuery: state.customAmazonQuery,
-        ...(state.aiGenerated === undefined
-          ? {}
-          : { aiGenerated: state.aiGenerated }),
         players: state.players,
         scores: applySettlementToScores(state.scores, action.settlement),
         roles: state.roles,
@@ -602,12 +580,6 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         const nextState: GameState = {
           phase: "error",
           mode: state.mode,
-          ...(state.customAmazonQuery === undefined
-            ? {}
-            : { customAmazonQuery: state.customAmazonQuery }),
-          ...(state.aiGenerated === undefined
-            ? {}
-            : { aiGenerated: state.aiGenerated }),
           players: state.players,
           scores: state.scores,
           roles: state.roles,
@@ -641,12 +613,6 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
       const nextState: GameState = {
         phase: "choosingSide",
         mode: state.mode,
-        ...(state.customAmazonQuery === undefined
-          ? {}
-          : { customAmazonQuery: state.customAmazonQuery }),
-        ...(state.aiGenerated === undefined
-          ? {}
-          : { aiGenerated: state.aiGenerated }),
         players: state.players,
         scores: state.scores,
         roles: state.roles,
@@ -729,12 +695,6 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
       const nextState: GameState = {
         phase: "roundForfeited",
         mode: state.mode,
-        ...(state.customAmazonQuery === undefined
-          ? {}
-          : { customAmazonQuery: state.customAmazonQuery }),
-        ...(state.aiGenerated === undefined
-          ? {}
-          : { aiGenerated: state.aiGenerated }),
         players: state.players,
         scores: applyForfeitToScores(state.scores, forfeit),
         roles: state.roles,
@@ -775,15 +735,12 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
       }
 
       const nextRoundNumber = state.roundNumber + 1;
-      const baseRoles = rolesForRound(nextRoundNumber);
       const nextState: GameState = {
         phase: "generatingItem",
         mode: state.mode,
-        customAmazonQuery: state.customAmazonQuery,
-        aiGenerated: state.aiGenerated,
         players: state.players,
         scores: state.scores,
-        roles: state.customAmazonQuery === true ? swapRoles(baseRoles) : baseRoles,
+        roles: rolesForRound(nextRoundNumber),
         roundNumber: nextRoundNumber,
         totalRounds: state.totalRounds,
         log: state.log,

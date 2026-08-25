@@ -31,6 +31,7 @@ import {
   HOST_PLAYER_ID,
   PLAYER_DISPLAY_NAME_MAX_LENGTH,
   roomDomainError,
+  roomMaxTotalRounds,
   type HostSeat,
   type GuestSeat,
   type RoomCommandFailure,
@@ -691,30 +692,13 @@ function startPayloadForRoom(room: RoomState): Parameters<typeof startGameReduce
     playerBName: room.guest?.displayName ?? DEFAULT_GUEST_NAME,
     mode: room.config.mode,
     totalRounds: room.config.totalRounds,
-    customAmazonQuery: room.config.customAmazonQuery,
-    aiGenerated: room.config.aiGenerated,
   };
 }
 
 function normalizeRoomConfig(config: Partial<RoomGameConfig>): RoomGameConfig {
-  const baseConfig = {
+  return {
     mode: config.mode ?? DEFAULT_ROOM_CONFIG.mode,
     totalRounds: config.totalRounds ?? DEFAULT_ROOM_CONFIG.totalRounds,
-  };
-
-  // Player-entered queries are the default for every mode; AI pre-generated
-  // markets are the explicit opt-out. The two are mutually exclusive, so the
-  // client's customAmazonQuery flag is derived here rather than trusted.
-  if (config.aiGenerated === true) {
-    return {
-      ...baseConfig,
-      aiGenerated: true,
-    };
-  }
-
-  return {
-    ...baseConfig,
-    customAmazonQuery: true,
   };
 }
 
@@ -726,10 +710,23 @@ function validateRoomConfig(
     playerBName: DEFAULT_GUEST_NAME,
     mode: config.mode,
     totalRounds: config.totalRounds,
-    customAmazonQuery: config.customAmazonQuery,
   });
 
-  return validation.ok ? { ok: true } : { ok: false, error: validation.error };
+  if (!validation.ok) {
+    return validation;
+  }
+
+  // D3: a match must never outlive its item variety, so totalRounds is also
+  // capped at the static deck's per-mode item count (configured by the Worker
+  // at boot; MAX_ROUNDS remains the bound when no deck is configured).
+  if (config.totalRounds > roomMaxTotalRounds()) {
+    return {
+      ok: false,
+      error: `Number of rounds must be between 1 and ${roomMaxTotalRounds()}.`,
+    };
+  }
+
+  return { ok: true };
 }
 
 function normalizeDisplayName(value: string, fallback: string): string {

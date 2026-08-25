@@ -78,7 +78,7 @@ describe("room snapshots", () => {
     expect(JSON.stringify(snapshot.presence)).not.toContain("hash");
   });
 
-  it("redacts hidden true_value and Amazon metadata before settlement even if the game object is polluted", () => {
+  it("redacts the hidden true_value before settlement even if the game object is polluted", () => {
     const { room, hostToken, guestToken } = startedRoom();
     const withItem = expectOk(receiveRoomItem(room, item, NOW_MS + 3));
     const opened = expectOk(
@@ -100,8 +100,6 @@ describe("room snapshots", () => {
       item: {
         ...item,
         true_value: 1_000,
-        scraped_items: [{ title: "Hidden Amazon Listing", price: 129.99 }],
-        amazon_url: "https://www.amazon.com/s?k=hidden",
       },
     } as unknown as GameState;
     const pollutedRoom: RoomState = {
@@ -112,13 +110,12 @@ describe("room snapshots", () => {
 
     expect(snapshotJson).not.toContain("true_value");
     expect(snapshotJson).not.toContain("1000");
-    expect(snapshotJson).not.toContain("scraped_items");
-    expect(snapshotJson).not.toContain("Hidden Amazon Listing");
-    expect(snapshotJson).not.toContain("amazon_url");
-    expect(snapshotJson).not.toContain("amazon.com");
+    // The scrape-display surface is gone entirely (P1+2): no snapshot field
+    // may carry Amazon metadata anymore.
+    expect(snapshotJson).not.toContain("amazon");
   });
 
-  it("reveals true_value and Amazon metadata only after settlement", () => {
+  it("reveals true_value only after settlement", () => {
     const { room, hostToken, guestToken } = startedRoom();
     const withItem = expectOk(receiveRoomItem(room, item, NOW_MS + 3));
     const opened = expectOk(
@@ -154,13 +151,7 @@ describe("room snapshots", () => {
       throw new Error("Expected settling phase.");
     }
 
-    const settledItem = settledItemFor(settling.game, 1_250, {
-      scraped_items: [
-        { title: "Source truth item", price: 1_250 },
-        { title: "Comparable listing", price: 1_199.95 },
-      ],
-      amazon_url: "https://www.amazon.com/s?k=source%20truth%20item",
-    });
+    const settledItem = settledItemFor(settling.game, 1_250);
     const settled = expectOk(
       receiveRoomSettlement(
         settling,
@@ -177,13 +168,7 @@ describe("room snapshots", () => {
     }
 
     expect(snapshot.game.item.true_value).toBe(1_250);
-    expect(snapshot.game.item.scraped_items).toEqual([
-      { title: "Source truth item", price: 1_250 },
-      { title: "Comparable listing", price: 1_199.95 },
-    ]);
-    expect(snapshot.game.item.amazon_url).toBe(
-      "https://www.amazon.com/s?k=source%20truth%20item",
-    );
+    expect(JSON.stringify(snapshot)).not.toContain("amazon");
   });
 
   it("exposes the absolute turnDeadlineMs on actionable phases", () => {
@@ -346,9 +331,6 @@ function joinedRoom(): {
     id: roomId,
     hostName: "Ada",
     hostTokenHash: hashFor(hostToken),
-    // Server-generated items (no player-entered query), so round-1 roles
-    // stay marketMaker=A / trader=B as these command flows assume.
-    config: { aiGenerated: true },
     nowMs: NOW_MS,
   });
   const joined = expectOk(
@@ -365,12 +347,10 @@ function joinedRoom(): {
 function settledItemFor(
   state: Extract<RoomState["game"], { phase: "settling" }>,
   trueValue: number,
-  metadata: Pick<SettledGeneratedItem, "scraped_items" | "amazon_url"> = {},
 ): SettledGeneratedItem {
   return {
     ...state.item,
     true_value: trueValue,
-    ...metadata,
   };
 }
 

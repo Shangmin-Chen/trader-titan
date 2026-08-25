@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import * as fs from "fs";
 import * as path from "path";
+import { createInviteRoomAndWaitForControls } from "./helpers";
 
 // Repo-relative by default. This was previously a hardcoded absolute path
 // into one developer's home directory, which made the whole file throw at
@@ -37,14 +38,13 @@ test.describe("Visual Audit Multi-Player Flows", () => {
     await host.getByTestId("create-room-form").getByLabel("Your name").fill("Ada");
     await host.getByLabel("Total rounds").fill("1");
     
-    // Select Amazon mode; player-entered queries are the default flow.
+    // Select a surviving static-deck mode.
     await host.getByRole("combobox", { name: "Game mode" }).click();
-    await host.locator("li.custom-select__item").filter({ hasText: "Amazon" }).click();
-    
+    await host.locator("li.custom-select__item").filter({ hasText: "Chaos Quant" }).click();
+
     // Create the room
-    await host.getByRole("button", { name: "Create invite room" }).click();
-    await expect(host.getByTestId("room-controls")).toBeVisible({ timeout: 15000 });
-    
+    await createInviteRoomAndWaitForControls(host);
+
     const inviteUrl = await host.locator("#room-invite-link").inputValue();
 
     await guest.goto(inviteUrl);
@@ -58,24 +58,10 @@ test.describe("Visual Audit Multi-Player Flows", () => {
     await host.screenshot({ path: path.join(SCREENSHOTS_DIR, `${prefix}-01-lobby-host.png`) });
     await guest.screenshot({ path: path.join(SCREENSHOTS_DIR, `${prefix}-01-lobby-guest.png`) });
 
-    // 2. Start Game -> Setup / Query Input Phase
+    // 2. Start Game -> Width Proposal Phase (deck items attach synchronously;
+    // there is no item-generation step).
     await host.getByRole("button", { name: "Start game" }).click();
 
-    // Wait for the custom query form to be visible on both pages
-    await expect(host.getByTestId("custom-amazon-query-form")).toBeVisible({ timeout: 15000 });
-    await expect(guest.getByTestId("custom-amazon-query-form")).toBeVisible({ timeout: 15000 });
-
-    // Now check which one is enabled
-    const hostEnabled = await host.getByLabel("Search Term / Product Name").isEnabled();
-    const traderPage = hostEnabled ? host : guest;
-
-    await host.screenshot({ path: path.join(SCREENSHOTS_DIR, `${prefix}-02-setup-host.png`) });
-    await guest.screenshot({ path: path.join(SCREENSHOTS_DIR, `${prefix}-02-setup-guest.png`) });
-
-    await traderPage.getByLabel("Search Term / Product Name").fill("gaming mouse");
-    await traderPage.getByRole("button", { name: "Submit & Scrape Price" }).click();
-
-    // Wait for generation to complete and enter width proposal phase
     await expect(host.getByTestId("item-panel")).toBeVisible({ timeout: 25000 });
     await host.waitForTimeout(1000);
 
@@ -134,7 +120,7 @@ test.describe("Visual Audit Multi-Player Flows", () => {
     // Trader executes trade (Buy)
     await makerPage.getByRole("button", { name: "Buy" }).click();
 
-    // 6. Settlement & Scraper Breakdown Phase
+    // 6. Settlement Phase
     await expect(host.getByTestId("settlement-panel")).toBeVisible({ timeout: 15000 });
     await host.waitForTimeout(1000);
     await host.screenshot({ path: path.join(SCREENSHOTS_DIR, `${prefix}-06-settlement-host.png`) });
@@ -167,13 +153,12 @@ test.describe("Visual Audit Multi-Player Flows", () => {
     await expect(host.getByTestId("create-room-form")).toBeVisible();
     await host.getByTestId("create-room-form").getByLabel("Your name").fill("Ada");
     await host.getByLabel("Total rounds").fill("1");
-    
+
     await host.getByRole("combobox", { name: "Game mode" }).click();
-    await host.locator("li.custom-select__item").filter({ hasText: "Amazon" }).click();
-    
-    await host.getByRole("button", { name: "Create invite room" }).click();
-    await expect(host.getByTestId("room-controls")).toBeVisible({ timeout: 15000 });
-    
+    await host.locator("li.custom-select__item").filter({ hasText: "Chaos Quant" }).click();
+
+    await createInviteRoomAndWaitForControls(host);
+
     const inviteUrl = await host.locator("#room-invite-link").inputValue();
 
     await guest.goto(inviteUrl);
@@ -186,22 +171,9 @@ test.describe("Visual Audit Multi-Player Flows", () => {
     await host.screenshot({ path: path.join(SCREENSHOTS_DIR, `${prefix}-01-lobby-host.png`) });
     await guest.screenshot({ path: path.join(SCREENSHOTS_DIR, `${prefix}-01-lobby-guest.png`) });
 
-    // 2. Start Game -> Setup / Query Input Phase
+    // 2. Start Game -> Width Proposal Phase (deck items attach synchronously;
+    // there is no item-generation step).
     await host.getByRole("button", { name: "Start game" }).click();
-
-    // Wait for the custom query form to be visible on both pages
-    await expect(host.getByTestId("custom-amazon-query-form")).toBeVisible({ timeout: 15000 });
-    await expect(guest.getByTestId("custom-amazon-query-form")).toBeVisible({ timeout: 15000 });
-
-    // Now check which one is enabled
-    const hostEnabled = await host.getByLabel("Search Term / Product Name").isEnabled();
-    const traderPage = hostEnabled ? host : guest;
-
-    await host.screenshot({ path: path.join(SCREENSHOTS_DIR, `${prefix}-02-setup-host.png`) });
-    await guest.screenshot({ path: path.join(SCREENSHOTS_DIR, `${prefix}-02-setup-guest.png`) });
-
-    await traderPage.getByLabel("Search Term / Product Name").fill("gaming mouse");
-    await traderPage.getByRole("button", { name: "Submit & Scrape Price" }).click();
 
     await expect(host.getByTestId("item-panel")).toBeVisible({ timeout: 25000 });
     await host.waitForTimeout(1000);
@@ -251,7 +223,7 @@ test.describe("Visual Audit Multi-Player Flows", () => {
 
     await makerPage.getByRole("button", { name: "Buy" }).click();
 
-    // 6. Settlement & Scraper Breakdown Phase
+    // 6. Settlement Phase
     await expect(host.getByTestId("settlement-panel")).toBeVisible({ timeout: 15000 });
     await host.waitForTimeout(1000);
     await host.screenshot({ path: path.join(SCREENSHOTS_DIR, `${prefix}-06-settlement-host.png`) });

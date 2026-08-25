@@ -3,7 +3,6 @@ export const GAME_MODES = [
   "Static Landmarks & History",
   "Cosmic Scale",
   "Chaos Quant",
-  "Amazon",
 ] as const;
 
 export const MAX_ROUNDS = 99;
@@ -42,7 +41,7 @@ export const MIN_TURN_DURATION_MS = Math.min(
 // maker never proposed one), so a forfeit there needs its own fixed stake
 // rather than "the width in play". Settlement PnL scales with the item's
 // true value, which this repo's own fixtures and static market config put
-// anywhere from double digits (Amazon, Chaos Quant) to the tens of
+// anywhere from double digits (Chaos Quant) to the tens of
 // thousands (Cosmic Scale, Fermi Math) - and the default game mode (Chaos
 // Quant) has a true_value median in the same 2-3 digit neighborhood as the
 // spread widths already used throughout this codebase's own tests (100,
@@ -106,11 +105,6 @@ export type Quote = {
   ask: number;
 };
 
-export type ScrapedAmazonItem = {
-  title: string;
-  price: number;
-};
-
 export type QuantItemFields = {
   item_title: string;
   category: string;
@@ -119,8 +113,6 @@ export type QuantItemFields = {
 
 export type ProviderGeneratedItem = QuantItemFields & {
   true_value: number;
-  scraped_items?: ScrapedAmazonItem[];
-  amazon_url?: string;
 };
 
 export type GeneratedItem = QuantItemFields & {
@@ -131,8 +123,6 @@ export type PublicGeneratedItem = GeneratedItem;
 
 export type SettledGeneratedItem = GeneratedItem & {
   true_value: number;
-  scraped_items?: ScrapedAmazonItem[];
-  amazon_url?: string;
 };
 
 export type TradeSide = "BUY" | "SELL";
@@ -216,8 +206,6 @@ export type RoundLogEntry = {
 
 type GameStateBase = {
   mode: GameMode;
-  customAmazonQuery?: boolean;
-  aiGenerated?: boolean;
   players: Record<PlayerId, Player>;
   scores: Scores;
   roles: Roles;
@@ -354,8 +342,6 @@ export type StartGamePayload = {
   playerBName: string;
   mode: GameMode;
   totalRounds: number;
-  customAmazonQuery?: boolean;
-  aiGenerated?: boolean;
 };
 
 export type GameAction =

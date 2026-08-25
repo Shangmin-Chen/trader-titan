@@ -32,10 +32,6 @@ export default defineConfig({
         [GAME_ROOM_DURABLE_OBJECT]: "DurableObject"
       },
       miniflare: {
-        bindings: {
-          GEMINI_API_KEY: "worker-test-gemini-api-key",
-          WORKER_ITEM_PROVIDER: "deterministic"
-        },
         compatibilityDate: COMPATIBILITY_DATE,
         compatibilityFlags: [...WORKER_COMPATIBILITY_FLAGS],
         durableObjects: {

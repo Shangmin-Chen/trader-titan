@@ -30,7 +30,7 @@ test.describe("Cloudflare room invite flow", () => {
     await expect(guest.getByTestId("room-controls")).toBeVisible();
 
     await host.getByRole("button", { name: "Start game" }).click();
-    await playDefaultQueryRoundToSettlement(host, guest);
+    await playDeckRoundToSettlement(host, guest);
 
     await host.getByRole("button", { name: "End game" }).click();
     await expect(host.getByTestId("game-over-panel")).toBeVisible({
@@ -85,7 +85,7 @@ test.describe("Cloudflare room invite flow", () => {
 
     await expect(host.getByRole("button", { name: "Start game" })).toBeEnabled();
     await host.getByRole("button", { name: "Start game" }).click();
-    await playDefaultQueryRoundToSettlement(host, guest);
+    await playDeckRoundToSettlement(host, guest);
 
     await guest.goto("about:blank");
 
@@ -119,18 +119,17 @@ test.describe("Cloudflare room invite flow", () => {
     await expect(host.getByRole("button", { name: "Next round" })).toBeEnabled();
     await host.getByRole("button", { name: "Next round" }).click();
 
-    // Round 2 alternates roles: the guest is now the trader who enters the
-    // query, after which the host makes the market.
-    await expect(guest.getByTestId("custom-amazon-query-form")).toBeVisible({
+    // Round 2 alternates roles under the uniform rolesForRound calendar
+    // (D5): the guest is now the market maker, and ADVANCE_ROUND attaches
+    // the next deck item synchronously, so the room lands directly back in
+    // width proposal with the guest's control enabled.
+    await expect(guest.getByTestId("item-panel")).toBeVisible({
       timeout: ROOM_PHASE_TIMEOUT_MS,
     });
-    await guest.getByLabel("Search Term / Product Name").fill("standing desk");
-    await guest.getByRole("button", { name: "Submit & Scrape Price" }).click();
-
-    await expect(host.getByRole("button", { name: "Propose width" })).toBeEnabled({
+    await expect(guest.getByRole("button", { name: "Propose width" })).toBeEnabled({
       timeout: ROOM_PHASE_TIMEOUT_MS,
     });
-    await expect(guest.getByRole("button", { name: "Propose width" })).toBeDisabled();
+    await expect(host.getByRole("button", { name: "Propose width" })).toBeDisabled();
   });
 
   test("allows lobby start while player B is disconnected (F-04); the badge still reflects reconnect", async ({
@@ -237,7 +236,7 @@ test.describe("Cloudflare room invite flow", () => {
 
     await expect(host.getByRole("button", { name: "Start game" })).toBeEnabled();
     await host.getByRole("button", { name: "Start game" }).click();
-    await playDefaultQueryRoundToSettlement(host, guest);
+    await playDeckRoundToSettlement(host, guest);
 
     severed = true;
 
@@ -271,23 +270,20 @@ test.describe("Cloudflare room invite flow", () => {
     );
 
     // Convergence, not just "a socket is open": the host can now advance
-    // the round, and round 2 (which requires the guest to submit the
-    // query, i.e. the guest's client has to be on the same phase the host
+    // the round, and round 2 (which puts the guest in the market-maker
+    // seat, i.e. the guest's client has to be on the same phase the host
     // just advanced it to) proceeds exactly as it would with an
     // uninterrupted connection.
     await expect(host.getByRole("button", { name: "Next round" })).toBeEnabled();
     await host.getByRole("button", { name: "Next round" }).click();
 
-    await expect(guest.getByTestId("custom-amazon-query-form")).toBeVisible({
+    await expect(guest.getByTestId("item-panel")).toBeVisible({
       timeout: ROOM_PHASE_TIMEOUT_MS,
     });
-    await guest.getByLabel("Search Term / Product Name").fill("standing desk");
-    await guest.getByRole("button", { name: "Submit & Scrape Price" }).click();
-
-    await expect(host.getByRole("button", { name: "Propose width" })).toBeEnabled({
+    await expect(guest.getByRole("button", { name: "Propose width" })).toBeEnabled({
       timeout: ROOM_PHASE_TIMEOUT_MS,
     });
-    await expect(guest.getByRole("button", { name: "Propose width" })).toBeDisabled();
+    await expect(host.getByRole("button", { name: "Propose width" })).toBeDisabled();
   });
 });
 
@@ -330,48 +326,42 @@ test.describe("Mobile viewport and a11y smoke", () => {
 });
 
 /**
- * Plays round 1 to settlement under the default player-entered-query flow:
- * roles are swapped, so the host (Ada) is the trader who enters the query
- * and the guest (Grace) makes the market.
+ * Plays round 1 to settlement against the static deck: START_ROOM attaches
+ * the deck item synchronously, so the room lands directly in width proposal
+ * with no item-generation step. Roles follow the uniform rolesForRound
+ * calendar (D5): in odd rounds the host (Player A) is the market maker and
+ * the guest (Player B) is the trader.
  */
-async function playDefaultQueryRoundToSettlement(host: Page, guest: Page) {
-  await expect(host.getByTestId("custom-amazon-query-form")).toBeVisible({
-    timeout: ROOM_PHASE_TIMEOUT_MS,
-  });
-  await host
-    .getByLabel("Search Term / Product Name")
-    .fill("mechanical keyboard");
-  await host.getByRole("button", { name: "Submit & Scrape Price" }).click();
-
+async function playDeckRoundToSettlement(host: Page, guest: Page) {
   await expect(host.getByTestId("item-panel")).toBeVisible({
     timeout: ROOM_PHASE_TIMEOUT_MS,
   });
   await expect(host.getByTestId("item-panel")).not.toContainText("True value");
 
-  await guest.getByRole("spinbutton", { name: "Spread width" }).fill("100");
-  await guest.getByRole("button", { name: "Propose width" }).click();
+  await host.getByRole("spinbutton", { name: "Spread width" }).fill("100");
+  await host.getByRole("button", { name: "Propose width" }).click();
 
-  await expect(host.getByTestId("width-negotiation-panel")).toContainText(
+  await expect(guest.getByTestId("width-negotiation-panel")).toContainText(
     /Current width:?\s*100/,
     { timeout: ROOM_PHASE_TIMEOUT_MS },
   );
-  await host.getByRole("button", { name: "Trade on width" }).click();
+  await guest.getByRole("button", { name: "Trade on width" }).click();
 
-  await guest.getByRole("spinbutton", { name: "Ask" }).fill("3700");
-  await expect(guest.getByRole("spinbutton", { name: "Bid" })).toHaveValue("3600");
-  await guest.getByRole("button", { name: "Commit market" }).click();
+  await host.getByRole("spinbutton", { name: "Ask" }).fill("3700");
+  await expect(host.getByRole("spinbutton", { name: "Bid" })).toHaveValue("3600");
+  await host.getByRole("button", { name: "Commit market" }).click();
 
-  await expect(host.getByTestId("trade-action-panel")).toContainText(
+  await expect(guest.getByTestId("trade-action-panel")).toContainText(
     "Quote: 3,600 / 3,700",
     { timeout: ROOM_PHASE_TIMEOUT_MS },
   );
-  await host.getByRole("button", { name: "Buy" }).click();
+  await guest.getByRole("button", { name: "Buy" }).click();
 
   await expect(host.getByTestId("settlement-panel")).toBeVisible({
     timeout: ROOM_PHASE_TIMEOUT_MS,
   });
   await expect(host.getByTestId("item-panel")).toContainText("True value");
   await expect(host.getByTestId("settlement-panel")).toContainText(
-    "Ada trader PnL",
+    "Grace trader PnL",
   );
 }

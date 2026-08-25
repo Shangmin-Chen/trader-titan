@@ -299,7 +299,6 @@ describe("room commands", () => {
     expect(retried.revision).toBe(failed.revision + 1);
     expect(retried.game.phase).toBe("generatingItem");
     expect(retried.game.mode).toBe(failed.game.mode);
-    expect(retried.game.customAmazonQuery).toBe(failed.game.customAmazonQuery);
     expect(retried.game.players).toEqual(failed.game.players);
     expect(retried.game.scores).toEqual(failed.game.scores);
     expect(retried.game.roles).toEqual(failed.game.roles);
@@ -929,9 +928,6 @@ function joinedRoom(): {
     id: roomId,
     hostName: "Ada",
     hostTokenHash: hashFor(hostToken),
-    // Server-generated items (no player-entered query), so round-1 roles
-    // stay marketMaker=A / trader=B as these command flows assume.
-    config: { aiGenerated: true },
     nowMs: NOW_MS,
   });
   const joined = expectOk(

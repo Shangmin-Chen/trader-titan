@@ -7,6 +7,34 @@ import {
 
 export const ROOM_PHASE_TIMEOUT_MS = 15_000;
 
+/**
+ * Clicks "Create invite room" and waits for the host's room controls.
+ *
+ * The whole e2e suite shares one `wrangler dev` origin, so parallel specs
+ * starting together can hit the worker's per-IP room-creation rate limit
+ * (10 per rolling 60s — see ROOM_CREATION_RATE_LIMIT_* in
+ * src/api/request-guards.ts). A rejected request consumes no limiter slot,
+ * so poll until the rolling window frees up rather than failing the spec.
+ */
+export async function createInviteRoomAndWaitForControls(host: Page): Promise<void> {
+  await expect(async () => {
+    const createButton = host.getByRole("button", { name: "Create invite room" });
+
+    if ((await createButton.count()) === 0) {
+      // A previous attempt already landed us in the room view; the final
+      // assertion below owns the visibility check from here.
+      return;
+    }
+
+    await createButton.click();
+    await expect(host.getByTestId("room-controls")).toBeVisible({
+      timeout: 5_000,
+    });
+  }).toPass({ timeout: 90_000 });
+
+  await expect(host.getByTestId("room-controls")).toBeVisible();
+}
+
 export async function createAndJoinRoom(
   browser: Browser,
   baseURL: string | undefined,
@@ -41,10 +69,7 @@ export async function createAndJoinRoom(
   await expect(host.getByTestId("create-room-form")).toBeVisible();
   await host.getByTestId("create-room-form").getByLabel("Your name").fill("Ada");
   await host.getByLabel("Total rounds").fill(String(options.totalRounds ?? 1));
-  await host.getByRole("button", { name: "Create invite room" }).click();
-  await expect(host.getByTestId("room-controls")).toBeVisible({
-    timeout: ROOM_PHASE_TIMEOUT_MS,
-  });
+  await createInviteRoomAndWaitForControls(host);
   await expect(host.getByRole("button", { name: "Start game" })).toBeDisabled();
 
   const inviteUrl = await host.locator("#room-invite-link").inputValue();
@@ -76,51 +101,3 @@ export function roomIdFromInviteUrl(inviteUrl: string): string {
   return roomId;
 }
 
-/**
- * Test-only affordance (see E2E_FAST_FORWARD_TURN_OFFSET_MS in
- * src/worker/index.ts): fast-forwards a room's currently-armed F-05 turn
- * deadline to a few seconds from now, so a Playwright test can exercise a
- * genuine clock expiry without sleeping out the real 30-60s duration (see
- * *_TURN_DURATION_MS in src/lib/game/types.ts). Everything downstream of
- * the deadline still runs for real: the Durable Object alarm, the
- * TURN_EXPIRED transition, persistence, and the WebSocket broadcast that
- * updates `page`'s own rendered state.
- *
- * Reads the caller's own stored room-session credential straight out of
- * `page`'s sessionStorage (the same one src/lib/room-client.ts's
- * saveRoomSession/loadRoomSession read and write under the
- * "trader-titan.room-session.v1:<roomId>" key) rather than threading a
- * credential through test code, so this works identically for a host or a
- * guest page. Only reachable against a dev/test server (the Worker 404s
- * this route unless WORKER_ITEM_PROVIDER is set — see wrangler dev's
- * --var in playwright.config.ts), never in a real deploy.
- */
-export async function fastForwardTurnClock(
-  page: Page,
-  roomId: string,
-): Promise<void> {
-  const result = await page.evaluate(async (id) => {
-    const sessionKey = `trader-titan.room-session.v1:${id}`;
-    const raw = window.sessionStorage.getItem(sessionKey);
-
-    if (raw === null) {
-      return { ok: false as const, status: 0, body: `No room session found under ${sessionKey}` };
-    }
-
-    const session = JSON.parse(raw) as { token: unknown };
-    const response = await fetch(`/api/rooms/${id}/test-expire-turn`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ credential: session.token }),
-    });
-    const body: unknown = await response.json();
-
-    return { ok: response.ok, status: response.status, body };
-  }, roomId);
-
-  if (!result.ok) {
-    throw new Error(
-      `fastForwardTurnClock failed (status ${result.status}): ${JSON.stringify(result.body)}`,
-    );
-  }
-}

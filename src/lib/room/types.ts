@@ -1,4 +1,4 @@
-import type { GameMode, GameState, PlayerId, UnixTimeMs } from "../game/types";
+import { MAX_ROUNDS, type GameMode, type GameState, type PlayerId, type UnixTimeMs } from "../game/types";
 import type { RoomId } from "./ids";
 import type { CapabilityRole, TokenHash } from "./tokens";
 
@@ -10,6 +10,28 @@ export const DEFAULT_ROOM_MODE: GameMode = "Chaos Quant";
 export const DEFAULT_ROOM_TOTAL_ROUNDS = 3;
 export const PLAYER_DISPLAY_NAME_MAX_LENGTH = 80;
 
+/**
+ * Upper bound on totalRounds: the static deck's per-mode item count once the
+ * Worker has configured it via setRoomMaxTotalRounds (D3 - a match must never
+ * outlive its item variety), or the generic MAX_ROUNDS ceiling before that
+ * (lib-level tests run without a deck). The value crosses the boundary as a
+ * number rather than letting lib code import the deck itself, which would
+ * ship every true_value in client bundles.
+ */
+let configuredMaxTotalRounds: number | null = null;
+
+export function setRoomMaxTotalRounds(maxTotalRounds: number): void {
+  if (!Number.isInteger(maxTotalRounds) || maxTotalRounds < 1) {
+    throw new Error("Room max total rounds must be a positive integer.");
+  }
+
+  configuredMaxTotalRounds = Math.min(maxTotalRounds, MAX_ROUNDS);
+}
+
+export function roomMaxTotalRounds(): number {
+  return configuredMaxTotalRounds ?? MAX_ROUNDS;
+}
+
 export type { UnixTimeMs };
 export type RoomLifecycle = "lobby" | "active" | "finished";
 export type RoomPresence = Readonly<{
@@ -19,8 +41,6 @@ export type RoomPresence = Readonly<{
 export type RoomGameConfig = Readonly<{
   mode: GameMode;
   totalRounds: number;
-  customAmazonQuery?: boolean;
-  aiGenerated?: boolean;
 }>;
 
 export type HostSeat = Readonly<{

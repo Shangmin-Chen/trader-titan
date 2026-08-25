@@ -12,7 +12,6 @@ import {
 import {
   ActionLog,
   CopyButton,
-  CustomAmazonQueryForm,
   CustomSelect,
   GameShell,
   ItemPanel,
@@ -64,7 +63,6 @@ import {
   RoomClientRequestError,
   saveRoomSession,
   sendRoomCommand,
-  submitCustomAmazonItem as submitRoomCustomAmazonItem,
   type RoomClientCommand,
   type RoomClientOptions,
   type RoomSession,
@@ -146,12 +144,13 @@ type ClientCommandInput =
 // silently never gets gated.
 type ClientCommandType = ClientCommandInput["type"];
 
-// START_ROOM (round 1) and RETRY_ITEM_GENERATION are the only commands
-// whose worker-side handling can run real, uncapped network calls
-// (batched Gemini + sequential per-round Amazon lookups) synchronously in
-// the request path — see ITEM_GENERATION_REQUEST_TIMEOUT_MS in
-// room-client.ts for why they get a longer timeout than every other
-// command here.
+// START_ROOM (round 1) and RETRY_ITEM_GENERATION historically needed a
+// longer client-side timeout because their worker-side handling could run
+// real external network calls synchronously in the request path. Item
+// receipt is now a synchronous static-deck pick with no external I/O, so
+// this special-casing — and ITEM_GENERATION_REQUEST_TIMEOUT_MS in
+// room-client.ts — remains only until cleanup plan Phase 3 removes the
+// leftover item-generation plumbing.
 const ITEM_GENERATION_COMMAND_TYPES: ReadonlySet<ClientCommandType> = new Set([
   "START_ROOM",
   "RETRY_ITEM_GENERATION",
@@ -202,12 +201,36 @@ function HomeContent() {
   const [pendingCommands, setPendingCommands] = useState<
     ReadonlySet<ClientCommandType>
   >(new Set());
-  const [isGeneratingCustomItem, setIsGeneratingCustomItem] = useState(false);
+  // B5: set when the server reports the room as gone (purged/expired) or
+  // undecodable (persistence cutover). The stored session is cleared and
+  // the socket torn down so the tab shows an actionable "room has ended"
+  // state instead of freezing at a "Live" connection label.
+  const [roomEnded, setRoomEnded] = useState(false);
   const roomRef = useRef<PublicRoomSnapshot | null>(null);
   const setCurrentRoom = useCallback((nextRoom: PublicRoomSnapshot | null) => {
     roomRef.current = nextRoom;
     setRoomState(nextRoom);
   }, []);
+
+  // B5 invalidated-room handler: the server has purged the room (TTL) or its
+  // persisted envelope no longer decodes against this deploy's persistence
+  // version, so every future command/access will fail the same way. Drop
+  // the local session and room state — which unmounts the game view and
+  // tears down the supervisor socket via the socket effect's cleanup — and
+  // surface an explicit "room has ended" state instead of leaving the tab
+  // frozen at connectionStatus "Live".
+  const handleInvalidatedRoom = useCallback(
+    (roomId: string) => {
+      clearRoomSession(window.sessionStorage, roomId);
+      setPreview(null);
+      setCurrentRoom(null);
+      setSession(null);
+      setConnectionStatus("idle");
+      setError(null);
+      setRoomEnded(true);
+    },
+    [setCurrentRoom],
+  );
   const applyCurrentRoomSnapshot = useCallback(
     (
       incoming: PublicRoomSnapshot,
@@ -354,7 +377,11 @@ function HomeContent() {
         setError(null);
       } catch (caughtError) {
         if (!cancelled) {
-          setError(errorMessage(caughtError, "Room could not be loaded."));
+          if (isInvalidatedRoomError(caughtError)) {
+            handleInvalidatedRoom(roomId);
+          } else {
+            setError(errorMessage(caughtError, "Room could not be loaded."));
+          }
         }
       } finally {
         if (!cancelled) {
@@ -368,7 +395,7 @@ function HomeContent() {
     return () => {
       cancelled = true;
     };
-  }, [applyCurrentRoomSnapshot, setCurrentRoom]);
+  }, [applyCurrentRoomSnapshot, handleInvalidatedRoom, setCurrentRoom]);
 
   useEffect(() => {
     if (socketRoomId === null || socketToken === null) {
@@ -580,6 +607,11 @@ function HomeContent() {
 
         applyCurrentRoomSnapshot(response.room);
       } catch (caughtError) {
+        if (isInvalidatedRoomError(caughtError)) {
+          handleInvalidatedRoom(activeRoom.id);
+          return;
+        }
+
         setError(errorMessage(caughtError, "Room command failed."));
       } finally {
         pendingCommandsRef.current = withoutPendingCommand(
@@ -589,12 +621,17 @@ function HomeContent() {
         setPendingCommands(pendingCommandsRef.current);
       }
     },
-    [applyCurrentRoomSnapshot, room, session],
+    [applyCurrentRoomSnapshot, handleInvalidatedRoom, room, session],
   );
 
   async function handleCreateRoom(config: CreateRoomConfig) {
     setIsCreating(true);
     setError(null);
+
+    // Set when the stored-session access below hits an invalidated room
+    // (purged or persistence-cutover): the B5 handler has already reconciled
+    // state, so the generic create failure message must not overwrite it.
+    let handledInvalidatedRoom = false;
 
     try {
       const response = await createRoom({
@@ -618,11 +655,20 @@ function HomeContent() {
           response.room,
           storedSession,
           async (roomId, session) => {
-            const accessed = await accessRoom(roomId, {
-              credential: session.token,
-            });
+            try {
+              const accessed = await accessRoom(roomId, {
+                credential: session.token,
+              });
 
-            return accessed.room;
+              return accessed.room;
+            } catch (caughtError) {
+              if (isInvalidatedRoomError(caughtError)) {
+                handledInvalidatedRoom = true;
+                handleInvalidatedRoom(roomId);
+              }
+
+              throw caughtError;
+            }
           },
         );
 
@@ -652,7 +698,9 @@ function HomeContent() {
         `/?room=${encodeURIComponent(response.room.id)}`,
       );
     } catch (caughtError) {
-      setError(errorMessage(caughtError, "Room could not be created."));
+      if (!handledInvalidatedRoom) {
+        setError(errorMessage(caughtError, "Room could not be created."));
+      }
     } finally {
       setIsCreating(false);
     }
@@ -680,28 +728,6 @@ function HomeContent() {
       setError(errorMessage(caughtError, "Room could not be joined."));
     } finally {
       setIsJoining(false);
-    }
-  }
-
-  async function handleCustomAmazonQuerySubmit(query: string) {
-    if (room === null || session === null) {
-      return;
-    }
-
-    setIsGeneratingCustomItem(true);
-    setError(null);
-
-    try {
-      const response = await submitRoomCustomAmazonItem(room.id, {
-        credential: session.token,
-        query,
-      });
-
-      applyCurrentRoomSnapshot(response.room);
-    } catch (caughtError) {
-      setError(errorMessage(caughtError, "Failed to submit Amazon query."));
-    } finally {
-      setIsGeneratingCustomItem(false);
     }
   }
 
@@ -771,6 +797,29 @@ function HomeContent() {
         />
       ) : null}
 
+      {loadStatus === "ready" &&
+      roomEnded &&
+      room === null &&
+      preview === null &&
+      session === null ? (
+        <section className="phase-panel" data-testid="room-ended-panel">
+          <p className="eyebrow">Room unavailable</p>
+          <h2>This room has ended</h2>
+          <p>This room has ended — start a new one to keep playing.</p>
+          <button
+            className="primary-button"
+            data-testid="start-new-room-button"
+            onClick={() => {
+              setRoomEnded(false);
+              announce("Ready to start a new room.");
+            }}
+            type="button"
+          >
+            Start a new room
+          </button>
+        </section>
+      ) : null}
+
       {loadStatus === "ready" && room !== null && session !== null && game !== null ? (
         <>
           <RoomControls
@@ -807,13 +856,9 @@ function HomeContent() {
             actor={actor}
             game={game}
             isCommandPending={isCommandPending}
-            isGeneratingCustomItem={isGeneratingCustomItem}
             isHost={isHost}
             onAdvanceRound={() => {
               void runCommand({ type: "ADVANCE_ROUND" });
-            }}
-            onCustomAmazonQuerySubmit={(query) => {
-              void handleCustomAmazonQuerySubmit(query);
             }}
             onExecuteTrade={(side) => {
               void runCommand({ type: "EXECUTE_TRADE", side });
@@ -867,7 +912,6 @@ function CreateRoomPanel({ disabled, error, onCreate }: CreateRoomPanelProps) {
   const [hostName, setHostName] = useState("");
   const [mode, setMode] = useState<GameMode>(GAME_MODES[0]);
   const [totalRoundsInput, setTotalRoundsInput] = useState("3");
-  const [aiGenerated, setAiGenerated] = useState(false);
   const [fieldErrors, setFieldErrors] = useState<CreateRoomFieldErrors>({});
   const [formError, setFormError] = useState<string | null>(null);
   const totalRounds = useMemo(
@@ -882,7 +926,6 @@ function CreateRoomPanel({ disabled, error, onCreate }: CreateRoomPanelProps) {
       hostName,
       mode,
       totalRounds,
-      aiGenerated,
     });
     const nextErrors = validateCreateRoomFields(hostName, mode, totalRounds);
     setFieldErrors(nextErrors);
@@ -905,8 +948,6 @@ function CreateRoomPanel({ disabled, error, onCreate }: CreateRoomPanelProps) {
       roomConfig: {
         mode: payload.mode,
         totalRounds: payload.totalRounds,
-        customAmazonQuery: payload.customAmazonQuery,
-        aiGenerated: payload.aiGenerated,
       },
     });
   }
@@ -993,22 +1034,6 @@ function CreateRoomPanel({ disabled, error, onCreate }: CreateRoomPanelProps) {
                 {fieldErrors.totalRounds}
               </p>
             ) : null}
-          </div>
-
-          <div className="form-field room-checkbox-field">
-            <input
-              checked={aiGenerated}
-              className="form-field__checkbox"
-              id={`${formId}-ai-generated`}
-              onChange={(event) => setAiGenerated(event.target.checked)}
-              type="checkbox"
-            />
-            <label
-              className="form-field__label"
-              htmlFor={`${formId}-ai-generated`}
-            >
-              AI automated generated markets
-            </label>
           </div>
 
         </div>
@@ -1380,10 +1405,8 @@ type RoomGameViewProps = Readonly<{
    * outside the settlement phase).
    */
   isCommandPending: (...types: ClientCommandType[]) => boolean;
-  isGeneratingCustomItem: boolean;
   isHost: boolean;
   onAdvanceRound: () => void;
-  onCustomAmazonQuerySubmit: (query: string) => void;
   onExecuteTrade: (side: TradeSide) => void;
   onReset: () => void;
   onRetryItemGeneration: () => void;
@@ -1397,10 +1420,8 @@ function RoomGameView({
   actor,
   game,
   isCommandPending,
-  isGeneratingCustomItem,
   isHost,
   onAdvanceRound,
-  onCustomAmazonQuerySubmit,
   onExecuteTrade,
   onReset,
   onRetryItemGeneration,
@@ -1427,19 +1448,6 @@ function RoomGameView({
   }
 
   if (game.phase === "generatingItem") {
-    if (game.customAmazonQuery === true) {
-      return (
-        <>
-          {stepper}
-          <CustomAmazonQueryForm
-            disabled={isGeneratingCustomItem || actor !== game.roles.trader}
-            generatorName={game.players[game.roles.trader].name}
-            onSubmit={onCustomAmazonQuerySubmit}
-          />
-        </>
-      );
-    }
-
     return (
       <>
         {stepper}
@@ -2065,21 +2073,16 @@ function buildStartPayload(input: {
   hostName: string;
   mode: GameMode;
   totalRounds: number | null;
-  aiGenerated: boolean;
 }): StartGamePayload | null {
   if (input.totalRounds === null) {
     return null;
   }
 
-  // Player-entered queries are the default for every mode; AI pre-generated
-  // markets are the explicit opt-out.
   return {
     playerAName: input.hostName,
     playerBName: "Player B",
     mode: input.mode,
     totalRounds: input.totalRounds,
-    customAmazonQuery: !input.aiGenerated,
-    aiGenerated: input.aiGenerated,
   };
 }
 
@@ -2204,6 +2207,28 @@ function errorMessage(error: unknown, fallback: string): string {
 
 function isStaleGuestError(error: unknown): boolean {
   return error instanceof RoomClientRequestError && error.error.code === "stale_guest";
+}
+
+/**
+ * B5: the room this session points at can no longer be played — it was
+ * purged (expired/TTL) server-side, or its persisted envelope predates this
+ * deploy's persistence version and fails hard-cutover decode. Both codes
+ * are permanent for this room id, so callers reconcile local state (clear
+ * session, drop socket) and show the "room has ended" CTA instead of
+ * retrying or freezing at "Live".
+ */
+function isInvalidatedRoomError(error: unknown): boolean {
+  if (!(error instanceof RoomClientRequestError)) {
+    return false;
+  }
+
+  switch (error.error.code) {
+    case "persistence_version_unsupported":
+    case "room_not_found":
+      return true;
+    default:
+      return false;
+  }
 }
 
 function isStaleOrInvalidRoomAccessError(error: unknown): boolean {

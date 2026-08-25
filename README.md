@@ -1,6 +1,6 @@
 # Titan Trader
 
-Titan Trader is a local two-player Next.js trading game. Players take turns narrowing a proposed spread width around AI-generated quantitative items, then one player trades on the accepted width and the other fixes the bid/ask market for settlement.
+Titan Trader is a local two-player Next.js trading game. Players take turns narrowing a proposed spread width around quantitative items drawn from a built-in static deck, then one player trades on the accepted width and the other fixes the bid/ask market for settlement.
 
 ## Setup
 
@@ -14,29 +14,13 @@ Open the local Wrangler URL printed by the dev server. The multiplayer room
 flow depends on Worker routes and Durable Objects, so `npm run dev` is useful
 for isolated Next.js UI work but not for the full invite-room game.
 
-## Gemini Item Generation & Config
+## Item Generation
 
-Worker item generation uses `@google/genai/web` from the Durable Object room lifecycle, with shared provider code under `src/api/item-generation`. The Gemini API key is read from the server-only `GEMINI_API_KEY` Worker secret and should not be exposed to client-side code. For local Wrangler preview without Gemini, keep `WORKER_ITEM_PROVIDER=deterministic` in `.dev.vars`.
+Items are drawn from a static deck ([config/static-markets.json](config/static-markets.json)); no external AI provider or secrets are used.
 
-`WORKER_TEST_MODE` is a separate, narrower var: it gates only the test-only `POST /api/rooms/:id/test-expire-turn` route (see `testExpireTurnSoon` in `src/worker/index.ts`), which lets a caller fast-forward a room's turn clock. It has no other meaning anywhere in this codebase and is never read outside that one gate, unlike `WORKER_ITEM_PROVIDER` (a real provider-selection override with legitimate uses on a real deploy). Only `npm run test:e2e`'s own `wrangler dev` invocation (see `playwright.config.ts`) sets it - do not add it to `.dev.vars` or `wrangler.toml`.
-
-- **Amazon Market Config**: In [gemini-markets.json](config/gemini-markets.json), the guidance instructs Gemini to vary the types of items generated for the Amazon mode, including:
-  - Normal consumer electronics (e.g. iPad, PlayStation)
-  - Luxury/premium products (e.g. Herman Miller Aeron, Tumi suitcase)
-  - Funny and unhinged real Amazon items (e.g. Nicolas Cage mermaid pillow, Yodelling pickled cucumber)
+`WORKER_TEST_MODE` is a separate, narrower var: it gates only the test-only `POST /api/rooms/:id/test-expire-turn` route (see `testExpireTurnSoon` in `src/worker/index.ts`), which lets a caller fast-forward a room's turn clock. It has no other meaning anywhere in this codebase and is never read outside that one gate. Only `npm run test:e2e`'s own `wrangler dev` invocation (see `playwright.config.ts`) sets it - do not add it to `.dev.vars` or `wrangler.toml`.
 
 Generated true values live in `GameRoomDurableObject` private storage. The browser receives only a `round_id`, title, category, and clue until settlement. The Worker blocks legacy process-local game API routes in Cloudflare, and the UI sends gameplay commands through `/api/rooms`.
-
-## Amazon Organic Scraper & Custom Query Toggle
-
-- **Organic Price Parsing**: The Amazon scraper parses organic search results (filtering out sponsored ads) to find the first result's price as the source of truth (`true_value`).
-- **Post-Settlement Scraper Breakdown**: Upon round settlement, a premium UI panel displays:
-  - An **Amazon Source Link** to view the live search results on Amazon.
-  - A stylized list of **Scraped Listings** with prices from the search grid, clearly indicating which listing was used as the source of truth.
-- **Custom Query Toggle**: The game setup form provides a checkbox toggle: **"Player-entered Amazon product query"**. When enabled:
-  - In Round 1, **Player A** enters their own Amazon search term/query (while Player B looks away), and **Player B** proposes the spread width.
-  - In Round 2, **Player B** enters the query, and **Player A** proposes the width.
-  - The scraper fetches the price and lists the results live, making it a player-driven guessing game.
 
 ## Gameplay Flow
 

@@ -1,10 +1,8 @@
 import {
   GAME_MODES,
-  MAX_ROUNDS,
   type GameMode,
   type GeneratedItem,
   type Quote,
-  type ScrapedAmazonItem,
   type SettledGeneratedItem,
   type TradeSide,
 } from "../game/types";
@@ -20,12 +18,12 @@ import {
   type PresentedCapabilityToken,
   type TokenHash,
 } from "./tokens";
-import type { RoomGameConfig, UnixTimeMs } from "./types";
+import { roomMaxTotalRounds, type RoomGameConfig, type UnixTimeMs } from "./types";
 
 const COMMAND_ID_MIN_LENGTH = 1;
 const COMMAND_ID_MAX_LENGTH = 128;
 const COMMAND_ID_ALLOWED_CHARACTERS = /^[A-Za-z0-9_-]+$/u;
-const CONFIG_KEYS = ["mode", "totalRounds", "customAmazonQuery", "aiGenerated"] as const;
+const CONFIG_KEYS = ["mode", "totalRounds"] as const;
 const GENERATED_ITEM_KEYS = [
   "round_id",
   "item_title",
@@ -33,12 +31,9 @@ const GENERATED_ITEM_KEYS = [
   "context_clue",
 ] as const;
 const QUOTE_KEYS = ["bid", "ask"] as const;
-const SCRAPED_ITEM_KEYS = ["title", "price"] as const;
 const SETTLED_ITEM_KEYS = [
   ...GENERATED_ITEM_KEYS,
   "true_value",
-  "scraped_items",
-  "amazon_url",
 ] as const;
 
 export type HostRoomCommandType =
@@ -186,8 +181,6 @@ type ClientCommandType = ClientRoomCommand["type"];
 type MutableRoomGameConfigPatch = {
   mode?: RoomGameConfig["mode"];
   totalRounds?: RoomGameConfig["totalRounds"];
-  customAmazonQuery?: NonNullable<RoomGameConfig["customAmazonQuery"]>;
-  aiGenerated?: NonNullable<RoomGameConfig["aiGenerated"]>;
 };
 type SystemEventType = SystemRoomEvent["type"];
 
@@ -624,36 +617,12 @@ function decodeRoomGameConfigPatch(value: unknown): DecodeResult<Partial<RoomGam
     if (!isTotalRounds(value.totalRounds)) {
       return decodeFailure(
         "config_invalid",
-        `Total rounds must be an integer between 1 and ${MAX_ROUNDS}.`,
+        `Total rounds must be an integer between 1 and ${roomMaxTotalRounds()}.`,
         "config.totalRounds",
       );
     }
 
     config.totalRounds = value.totalRounds;
-  }
-
-  if (hasField(value, "customAmazonQuery")) {
-    if (typeof value.customAmazonQuery !== "boolean") {
-      return decodeFailure(
-        "config_invalid",
-        "Custom Amazon query must be a boolean.",
-        "config.customAmazonQuery",
-      );
-    }
-
-    config.customAmazonQuery = value.customAmazonQuery;
-  }
-
-  if (hasField(value, "aiGenerated")) {
-    if (typeof value.aiGenerated !== "boolean") {
-      return decodeFailure(
-        "config_invalid",
-        "AI generated must be a boolean.",
-        "config.aiGenerated",
-      );
-    }
-
-    config.aiGenerated = value.aiGenerated;
   }
 
   return { ok: true, value: config };
@@ -751,23 +720,9 @@ function decodeSettledGeneratedItem(
     return decodeFailure("item_invalid", "Settled item true value must be a number.", `${path}.true_value`);
   }
 
-  const scrapedItems = hasField(value, "scraped_items")
-    ? decodeScrapedItems(value.scraped_items, `${path}.scraped_items`)
-    : ({ ok: true, value: undefined } satisfies DecodeResult<ScrapedAmazonItem[] | undefined>);
-
-  if (!scrapedItems.ok) {
-    return scrapedItems;
-  }
-
-  if (hasField(value, "amazon_url") && typeof value.amazon_url !== "string") {
-    return decodeFailure("item_invalid", "Amazon URL must be a string.", `${path}.amazon_url`);
-  }
-
   const item: SettledGeneratedItem = {
     ...publicFields.value,
     true_value: value.true_value,
-    ...(scrapedItems.value === undefined ? {} : { scraped_items: scrapedItems.value }),
-    ...(typeof value.amazon_url === "string" ? { amazon_url: value.amazon_url } : {}),
   };
   const validation = validateProviderItem(item);
 
@@ -800,37 +755,6 @@ function decodeGeneratedItemFields(
   };
 }
 
-function decodeScrapedItems(
-  value: unknown,
-  path: string,
-): DecodeResult<ScrapedAmazonItem[]> {
-  if (!Array.isArray(value)) {
-    return decodeFailure("item_invalid", "Scraped items must be an array.", path);
-  }
-
-  const items: ScrapedAmazonItem[] = [];
-
-  for (const [index, item] of value.entries()) {
-    if (
-      !isRecord(item) ||
-      !hasOnlyKeys(item, SCRAPED_ITEM_KEYS) ||
-      typeof item.title !== "string" ||
-      typeof item.price !== "number" ||
-      !Number.isFinite(item.price)
-    ) {
-      return decodeFailure(
-        "item_invalid",
-        "Scraped item entries must contain a title string and finite price.",
-        `${path}.${index}`,
-      );
-    }
-
-    items.push({ title: item.title, price: item.price });
-  }
-
-  return { ok: true, value: items };
-}
-
 function decodeErrorMessage(value: unknown, path: string): DecodeResult<string> {
   return typeof value === "string"
     ? { ok: true, value }
@@ -844,7 +768,7 @@ function decodeNowMs(value: unknown): DecodeResult<UnixTimeMs> {
 }
 
 function isTotalRounds(value: unknown): value is number {
-  return Number.isInteger(value) && Number(value) >= 1 && Number(value) <= MAX_ROUNDS;
+  return Number.isInteger(value) && Number(value) >= 1 && Number(value) <= roomMaxTotalRounds();
 }
 
 function isUnixTimeMs(value: unknown): value is UnixTimeMs {
