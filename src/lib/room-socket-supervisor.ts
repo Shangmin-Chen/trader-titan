@@ -156,33 +156,6 @@ export const ASSUMED_SOCKET_OPEN_MS = 3_000;
 export const DEAD_SOCKET_RECOVERY_BUDGET_MS =
   HEARTBEAT_WORST_CASE_DETECTION_MS + RECONNECT_BACKOFF_WORST_CASE_MS + ASSUMED_SOCKET_OPEN_MS;
 
-/**
- * A separate, DELIBERATELY-not-derived-from-`intervalMs` constant for a
- * server-side liveness sweep (an open branch's F-08) to consume instead of
- * computing its own threshold as a multiple of the client's ping cadence.
- *
- * Why this exists: F-08 (not in this worktree) currently defines its
- * eviction threshold as `3 × DEFAULT_ROOM_SOCKET_HEARTBEAT.intervalMs`.
- * That was a reasonable derivation when intervalMs was 20s (a 60s
- * threshold) — comfortably above the ~60s a backgrounded tab's timers can
- * go throttled by the browser (Chrome and others cap background timers to
- * roughly one firing per minute), so a merely-backgrounded-but-alive tab
- * would not get evicted. Tightening intervalMs to 5s to close the
- * dead-socket-detection gap this file's `DEAD_SOCKET_RECOVERY_BUDGET_MS`
- * exists to close would, under that `3×` formula, shrink the server's
- * eviction threshold to 15s — well inside a single throttled background
- * interval — and start evicting live-but-backgrounded tabs, converting an
- * accidental disconnect into a *guaranteed* one on every tab switch.
- *
- * The two concerns are sized for different jobs (how fast can *this*
- * client notice its *own* socket died, vs. how long should the server
- * tolerate silence from a tab it cannot ask to hurry up) and should not
- * share one constant. This value keeps the previous, already-reasoned-
- * about 60s server-side tolerance; F-08 should read this constant instead
- * of deriving `3 × intervalMs`.
- */
-export const SERVER_PRESENCE_LIVENESS_TIMEOUT_MS = 60_000;
-
 /** Close code the watchdog uses when it force-closes a non-responsive socket. */
 export const HEARTBEAT_TIMEOUT_CLOSE_CODE = 4000;
 
