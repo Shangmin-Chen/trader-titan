@@ -14,7 +14,7 @@ The room protocol is the boundary between client transports and the pure room do
 - Public room snapshots include live presence booleans and never include capability secrets, token hashes, persistence envelopes, or pre-settlement private values.
 - Pre-settlement public item snapshots expose only `round_id`, `item_title`, `category`, and `context_clue`; they must redact `true_value` even if that field is present on an internal object.
 - Post-settlement public item snapshots expose `true_value`; no scrape metadata fields exist on the settled generated item.
-- Public room snapshots expose `turnDeadlineMs` on the `proposingWidth`, `negotiatingWidth`, `configuringMarket`, and `choosingSide` game phases: an absolute, server-stamped Unix millisecond deadline for the F-05 turn shot clock, never a client-computed or remaining-seconds value.
+- Public room snapshots carry no turn deadlines or countdown fields; there is no shot-clock layer and no client-side turn timer.
 
 ## Presence
 
@@ -22,7 +22,7 @@ The room protocol is the boundary between client transports and the pure room do
 - Occupied seats are not live presence. A joined guest with no accepted current WebSocket is offline.
 - Presence is public, non-secret, ephemeral, and Durable Object-authoritative in the Cloudflare runtime. It is computed from accepted WebSockets whose attached role and token hash still match the current room seats, and it is not persisted.
 - HTTP and WebSocket command handling use the same runtime presence source when building the public snapshot broadcast after a command.
-- Presence does not gate any room command (F-04). `START_ROOM` and `ADVANCE_ROUND` (final and non-final) all succeed regardless of Player B's live presence; an idle or absent opponent is instead handled by the F-05 turn shot clock forfeiting the round they are on the clock for. Presence is a purely cosmetic connection indicator in the public snapshot, not an authorization input to any room command.
+- Presence does not gate any room command (F-04). `START_ROOM` and `ADVANCE_ROUND` (final and non-final) all succeed regardless of Player B's live presence. There is no shot clock to force an idle player's hand; a missing opponent stalls only their own turn, and the host's recourse is `RESET_TO_LOBBY` or `KICK_GUEST`. Presence is a purely cosmetic connection indicator in the public snapshot, not an authorization input to any room command.
 - A room socket whose TCP connection has died without a close frame (killed tab, sleeping laptop, blackholed network path) is not distinguishable from a healthy idle socket by the accepted-WebSockets list alone, since the Durable Object never wakes on a client ping (see Transport Notes for the F-08 liveness sweep that reclaims it).
 
 ## Client Commands
@@ -50,21 +50,16 @@ The room protocol is the boundary between client transports and the pure room do
 
 ## System Events
 
-- `ITEM_RECEIVED`: generated public item.
-- `SETTLEMENT_RECEIVED`: settled private item. No caller-provided settlement is accepted; `EXECUTE_TRADE` composes it synchronously inside the same storage transaction that commits the trade, so there is no separate settlement-failure or retry path.
-- `TURN_EXPIRED`: F-05 turn shot-clock expiry. Carries no caller-supplied data beyond the server's own timestamp. For `proposingWidth`, `negotiatingWidth`, and `configuringMarket`, the room command layer derives who forfeits, who is awarded, and the penalty entirely from the room's own current state (active role for the phase, and the spread width in play, or a named fallback constant in `proposingWidth` where no width has been proposed yet). For `choosingSide`, F-06 instead settles the round synchronously against the worst possible side for the trader - the reducer composes that settlement from a transient `{ kind: "timeoutForcedWorstSide" }` pending trade, see room-domain.md - rather than forfeiting, since the trader has already seen a quote by that point. Valid only while the room is in `proposingWidth`, `negotiatingWidth`, `configuringMarket`, or `choosingSide`; rejected with `invalid_game_phase` everywhere else. Dispatched only by the Worker's Durable Object alarm when a stamped `turnDeadlineMs` elapses - never accepted from a client. Like every other successful mutation, committing `TURN_EXPIRED` (and any settlement effect it triggers via F-06) broadcasts a public snapshot - alarm-driven mutations are not a client request/response a caller is waiting on, so without an explicit broadcast a connected client would never learn a genuinely expired clock happened until its own next unrelated command.
+- `ITEM_RECEIVED`: public item dealt from the static deck.
+- `SETTLEMENT_RECEIVED`: settled private item. No caller-provided settlement is accepted; `EXECUTE_TRADE` composes it synchronously inside the same storage transaction that commits the trade, so there is no separate settlement-failure or retry path. Both events are produced only by the Worker's Durable Object as composed follow-ups to `START_ROOM`, `ADVANCE_ROUND`, and `EXECUTE_TRADE`; they are never accepted from a client.
 
 ## Transport Notes
 
 The Durable Object slice should implement one runtime decoder for these messages and one dispatcher that calls the pure room command functions. WebSocket broadcasts should contain public room snapshots, never persistence envelopes.
 
-### Test-only: `POST /api/rooms/:id/test-expire-turn`
-
-Fast-forwards a room's currently-armed F-05 `turnDeadlineMs` to a few seconds from now and re-arms the real Durable Object alarm against it, so an e2e test can observe a genuine clock expiry (the countdown reaching its urgent state, the alarm firing, `TURN_EXPIRED` committing, and the broadcast reaching connected clients) without sleeping out the real 30-60s duration. Takes the same `{ credential }` body as `access`, authorized the same way (any valid host or guest credential for the room); rejected with `invalid_game_phase` if the room has no active turn clock. The route only exists when `WORKER_ITEM_PROVIDER` is set (the same test/dev signal item generation already gates on - see `wrangler dev --var` in `playwright.config.ts`); it 404s like any other unknown route otherwise, so it cannot be reached in a real deploy. See `E2E_FAST_FORWARD_TURN_OFFSET_MS` in `src/worker/index.ts` and `fastForwardTurnClock` in `e2e/helpers.ts`.
-
 WebSocket connect, close, and error presence changes rebroadcast updated public snapshots to remaining authorized sockets. These snapshots may reuse the current room revision when only presence changed, and they must not expose secrets, token hashes, persistence metadata, or private generated values.
 
-The Durable Object registers a hibernation auto-response pair so a client's own heartbeat ping is answered at the edge without waking the object. A server-side liveness sweep, driven by the Durable Object's single alarm slot, independently detects a room socket that has gone silent for too long (no observed auto-response, and no recent accept) and closes it with a close code the client's reconnect supervisor treats as retryable - never one of the terminal eviction/teardown codes. This sweep is folded into the same alarm slot used for room TTL housekeeping and F-05 turn-clock expiry; it only contributes a deadline while at least one socket is connected, so a room with no connected sockets is not woken for this purpose.
+The Durable Object registers a hibernation auto-response pair so a client's own heartbeat ping is answered at the edge without waking the object. A server-side liveness sweep, driven by the Durable Object's single alarm slot, independently detects a room socket that has gone silent for too long (no observed auto-response, and no recent accept) and closes it with a close code the client's reconnect supervisor treats as retryable - never one of the terminal eviction/teardown codes. This sweep is folded into the same alarm slot used for room TTL housekeeping; it only contributes a deadline while at least one socket is connected, so a room with no connected sockets is not woken for this purpose.
 
 ## Client Snapshot Application
 
