@@ -7,7 +7,7 @@ The Cloudflare target uses OpenNext for the existing Next app and a Durable Obje
 - Wrangler `main` points to `src/worker/index.ts`.
 - The Worker delegates normal app requests to the generated OpenNext worker at `.open-next/worker.js`.
 - Worker tests alias that generated worker to a smoke implementation before the OpenNext build artifact exists.
-- Legacy process-local game routes (`/api/generate-item`, `/api/commit-market`, and `/api/settle-round`) are rejected by the Worker with `410` before OpenNext can serve them.
+- Legacy process-local game routes (`/api/generate-item`, `/api/generate-custom-amazon-item`, `/api/commit-market`, and `/api/settle-round`) are rejected by the Worker with `410` before OpenNext can serve them.
 
 ## Public Room Routes
 
