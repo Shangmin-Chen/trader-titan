@@ -2,7 +2,6 @@ import { toPublicItem } from "../game/reducer";
 import type {
   ChoosingSideGameState,
   ConfiguringMarketGameState,
-  ErrorGameState,
   GameOverState,
   GameState,
   GeneratingItemGameState,
@@ -70,7 +69,6 @@ export type PublicSettlementGameState = Omit<SettlementGameState, "item"> &
   Readonly<{ item: PublicSettledGeneratedItem }>;
 export type PublicRoundForfeitedGameState = RoundForfeitedGameState;
 export type PublicGameOverState = GameOverState;
-export type PublicErrorGameState = ErrorGameState;
 
 export type PublicRoomGameState =
   | PublicSetupGameState
@@ -82,8 +80,7 @@ export type PublicRoomGameState =
   | PublicSettlingGameState
   | PublicSettlementGameState
   | PublicRoundForfeitedGameState
-  | PublicGameOverState
-  | PublicErrorGameState;
+  | PublicGameOverState;
 
 export type PublicRoomPresence = Readonly<{
   players: Readonly<Record<PlayerId, boolean>>;
@@ -208,13 +205,6 @@ export function toPublicGameState(game: GameState): PublicRoomGameState {
         phase: "gameOver",
         winner: game.winner,
       };
-    case "error":
-      return {
-        ...publicGameBase(game),
-        phase: "error",
-        error: game.error,
-        previousPhase: game.previousPhase,
-      };
     case "proposingWidth":
       return {
         ...publicGameBase(game),
@@ -249,19 +239,6 @@ export function toPublicGameState(game: GameState): PublicRoomGameState {
           ask: game.quote.ask,
         },
         turnDeadlineMs: game.turnDeadlineMs,
-        // F-06/F-02: forwarded as-is (never derived from private data) so
-        // the client can tell a locked, retry-only choosingSide apart from
-        // a live one and render Buy/Sell honestly - see lockedPendingTrade's
-        // doc comment on ChoosingSideGameState.
-        ...(game.lockedPendingTrade === undefined
-          ? {}
-          : { lockedPendingTrade: game.lockedPendingTrade }),
-        // F-07: not privacy-sensitive (a small integer, never derived from
-        // private data) - forwarded alongside lockedPendingTrade so the
-        // client can tell how close a retrying round is to the terminal cap.
-        ...(game.settlementFailureCount === undefined
-          ? {}
-          : { settlementFailureCount: game.settlementFailureCount }),
       };
     case "roundForfeited":
       return {
@@ -270,6 +247,10 @@ export function toPublicGameState(game: GameState): PublicRoomGameState {
         forfeit: toPublicForfeit(game.forfeit),
       };
     case "settling":
+      // Transient-only since Phase 3: the Worker composes straight through
+      // settling into settlement in one storage transaction, so this branch
+      // only exists to keep the phase mapping exhaustive - no broadcast
+      // should ever carry it.
       return {
         ...publicGameBase(game),
         phase: "settling",
@@ -280,7 +261,6 @@ export function toPublicGameState(game: GameState): PublicRoomGameState {
           ask: game.quote.ask,
         },
         pendingTrade: game.pendingTrade,
-        settlementFailureCount: game.settlementFailureCount,
       };
     default:
       return assertNever(game);

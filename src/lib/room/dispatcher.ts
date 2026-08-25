@@ -3,14 +3,11 @@ import {
   configureRoom,
   executeTrade,
   expireRoomTurn,
-  failRoomItem,
-  failRoomSettlement,
   joinRoom,
   kickGuest,
   receiveRoomItem,
   receiveRoomSettlement,
   resetRoomToLobby,
-  retryRoomItemGeneration,
   startRoom,
   submitInitialWidth,
   submitMarketQuote,
@@ -72,12 +69,6 @@ export function dispatchRoomCommand(
         verifyToken: context.verifyToken,
         nowMs: command.nowMs,
       });
-    case "RETRY_ITEM_GENERATION":
-      return retryRoomItemGeneration(room, {
-        credential: command.credential,
-        verifyToken: context.verifyToken,
-        nowMs: command.nowMs,
-      });
     case "SUBMIT_INITIAL_WIDTH":
       return submitInitialWidth(room, command.width, {
         credential: command.credential,
@@ -124,12 +115,8 @@ export function dispatchSystemRoomEvent(
   switch (event.type) {
     case "ITEM_RECEIVED":
       return receiveRoomItem(room, event.item, event.nowMs);
-    case "ITEM_FAILED":
-      return failRoomItem(room, event.error, event.nowMs);
     case "SETTLEMENT_RECEIVED":
       return receiveRoomSettlement(room, event.item, event.nowMs);
-    case "SETTLEMENT_FAILED":
-      return failRoomSettlement(room, event.error, event.nowMs);
     case "TURN_EXPIRED":
       return expireRoomTurn(room, event.nowMs);
     default:

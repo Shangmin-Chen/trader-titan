@@ -22,7 +22,13 @@ import {
   createRoomCreationRateLimiter,
   isAllowedOrigin
 } from "../api/request-guards";
-import type { GameMode, SettledGeneratedItem } from "../lib/game";
+import type {
+  GameMode,
+  GeneratedItem,
+  GameState,
+  SettledGeneratedItem,
+  SettlingGameState
+} from "../lib/game";
 import {
   authorizeRoomAccess,
   authorizeRoomAction,
@@ -56,14 +62,6 @@ import {
   type TokenVerifier,
   type UnixTimeMs
 } from "../lib/room";
-import {
-  createSettledGeneratedItem,
-  loadPrivateGeneratedItemEnvelope,
-  privateGeneratedItemStoragePrefix,
-  privateGeneratedItemStorageKey,
-  toGeneratedItem,
-  toPrivateGeneratedItemEnvelope
-} from "./private-generated-items";
 import { itemForRound, maxRoundsForDeck } from "./static-deck";
 import {
   ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS,
@@ -105,12 +103,6 @@ const LEGACY_NEXT_GAME_API_PATHS = new Set([
   "/api/settle-round",
 ]);
 const ROOM_STORAGE_KEY = "room:persistence:v1";
-const PENDING_ROOM_EFFECT_STORAGE_KEY = "room:pending-effect:v1";
-const PENDING_SETTLE_EFFECT_MAX_ATTEMPTS = 5;
-const PENDING_SETTLE_EFFECT_BASE_BACKOFF_MS = 15_000;
-const PENDING_SETTLE_EFFECT_MAX_BACKOFF_MS = 5 * 60_000;
-const SETTLEMENT_RETRY_EXHAUSTED_MESSAGE =
-  "Automatic settlement retries were exhausted. A host can retry settlement manually.";
 const ROOM_COMMAND_DEDUPE_STORAGE_KEY = "room:command-dedupe:v1";
 // A rolling record of the most recently applied (actor, commandId) pairs.
 // Bounded so storage never grows with a room's lifetime: since each
@@ -135,7 +127,6 @@ const BYTE_HEX_PAD_LENGTH = 2;
 const TOKEN_HASH_ALGORITHM = "SHA-256";
 const TOKEN_HASH_PREFIX = "sha256";
 const TOKEN_HASH_INPUT_PREFIX = "trader-titan.room-token.v1";
-const PRIVATE_ITEM_UNAVAILABLE_MESSAGE = "Private generated item is unavailable for settlement.";
 const rejectTokenVerification: TokenVerifier = () => false;
 const publicRoomCreationRateLimiter = createRoomCreationRateLimiter();
 
@@ -237,35 +228,17 @@ type CreateOrLoadRoomResult =
   | Readonly<{ ok: false; status: number; error: RoomHttpError | RoomDomainError }>;
 
 /**
- * A durably-persisted marker for a room-level effect that must run outside
- * the storage transaction that committed the state transition requiring it
- * (see receiveStoredSettlement / F-02). A Durable Object has exactly one
- * alarm slot, so scheduleNextAlarm() always arms it for whichever of the
- * room's TTL, this marker's notBeforeMs, or F-05's turn-clock deadline is
- * soonest - see that function for the multiplexing contract. `kind` is a
- * discriminant for future effects that, like "settle", need their own retry
- * state; F-05's turn clock did not need one - its deadline is already
- * durable as `turnDeadlineMs` on `room.game` itself, so scheduleNextAlarm
- * derives it straight from `room` instead (see turnDeadlineForRoom()).
- */
-type PendingRoomEffect = Readonly<{
-  kind: "settle";
-  roundId: string;
-  attempts: number;
-  notBeforeMs: UnixTimeMs;
-}>;
-
-/**
  * runDueTurnExpiry's own transaction result: distinguishes "nothing about
  * the room actually changed" (a stale wake, a rejected event, or the room
  * having already expired) from "TURN_EXPIRED genuinely committed", since
- * only the latter needs a broadcast afterward. `enteredSettling` tells the
- * caller whether an F-06 settle-effect follow-up is also needed - a plain
- * roundForfeited commit has nothing further to do once broadcast.
+ * only the latter needs a broadcast afterward. A committed F-06
+ * choosingSide timeout settles in the SAME transaction (see
+ * settledDeckItemForRoom), so the caller only ever broadcasts the final,
+ * already-settled room.
  */
 type TurnExpiryOutcome =
   | Readonly<{ kind: "unchanged" }>
-  | Readonly<{ kind: "committed"; room: RoomState; enteredSettling: boolean }>;
+  | Readonly<{ kind: "committed"; room: RoomState }>;
 
 type RoomSocketAttachment = Readonly<{
   kind: "trader-titan.room-socket.v1";
@@ -544,7 +517,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         } as const;
       }
 
-      await this.persistRoomEnvelope(transaction, joined.room, null, nowMs);
+      await this.persistRoomEnvelope(transaction, joined.room, nowMs);
 
       return {
         ok: true,
@@ -681,17 +654,13 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         } as const;
       }
 
-      // A turn deadline never coexists with a pending settle effect (see
-      // the class-level alarm() comment), so having just confirmed this
-      // room IS on a turn clock, there is no pending effect to preserve
-      // here - passing null also self-heals any stale marker.
       const patchedRoom: RoomState = {
         ...loaded.room,
         game: { ...loaded.room.game, turnDeadlineMs: nowMs + E2E_FAST_FORWARD_TURN_OFFSET_MS },
         revision: loaded.room.revision + 1
       };
 
-      await this.persistRoomEnvelope(transaction, patchedRoom, null, nowMs);
+      await this.persistRoomEnvelope(transaction, patchedRoom, nowMs);
 
       return { ok: true, room: patchedRoom } as const;
     });
@@ -871,39 +840,32 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
   }
 
   /**
-   * Multiplexes the Durable Object's single alarm slot between four
-   * concerns: room TTL housekeeping (unchanged from before F-02), resuming a
-   * pending settlement effect that was durably committed but never ran (the
-   * F-02 trapdoor - see receiveStoredSettlement), F-05's turn shot clock,
-   * and the F-08 liveness sweep (closing room sockets the client-side
-   * heartbeat cannot itself detect as dead - see sweepStaleSockets).
+   * Multiplexes the Durable Object's single alarm slot between three
+   * concerns: room TTL housekeeping, F-05's turn shot clock, and the F-08
+   * liveness sweep (closing room sockets the client-side heartbeat cannot
+   * itself detect as dead - see sweepStaleSockets). Synchronous settlement
+   * (Phase 3) removed the fourth: a pending settle-effect marker and its
+   * retry/backoff machinery no longer exist, because EXECUTE_TRADE now
+   * settles inside its own single storage transaction.
    *
    * Each alarm invocation runs the liveness sweep unconditionally first (it
    * is cheap - a scan of this room's live sockets plus timestamp
    * comparisons, no storage I/O) and then figures out which *stored*
-   * deadline - TTL, pending settle effect, or turn clock - actually fired,
-   * handling only that one. Every write path that follows reschedules via
-   * scheduleNextAlarm() so the slot never falls out of sync with whichever
-   * deadline is now soonest. scheduleNextAlarm() recomputes the liveness
-   * deadline from live sockets on every call (it is never persisted), so
-   * once the sweep above has closed every stale socket (or there were none
-   * to begin with), a room with no remaining sockets naturally drops the
-   * liveness term and this alarm settles back to firing only for
-   * TTL/pending-effect/turn-clock purposes - it does not re-arm itself
-   * forever.
+   * deadline - TTL or turn clock - actually fired, handling only that one.
+   * Every write path that follows reschedules via scheduleNextAlarm() so
+   * the slot never falls out of sync with whichever deadline is now
+   * soonest. scheduleNextAlarm() recomputes the liveness deadline from live
+   * sockets on every call (it is never persisted), so once the sweep above
+   * has closed every stale socket (or there were none to begin with), a
+   * room with no remaining sockets naturally drops the liveness term and
+   * this alarm settles back to firing only for TTL/turn-clock purposes -
+   * it does not re-arm itself forever.
    *
-   * The pending-settle-effect and turn-clock deadlines can never both be
-   * due for the same room at once - a turn deadline only exists on the four
-   * actionable phases (proposingWidth / negotiatingWidth / configuringMarket
-   * / choosingSide) and a pending settle effect only exists in "settling",
-   * so there is no ordering to get wrong between them. (F-06's choosingSide
-   * timeout moves the room INTO "settling" as part of processing a
-   * turn-clock wake, so a turnExpiry tick can itself durably write a fresh
-   * pending settle effect - see runDueTurnExpiry - but that is a one-way
-   * transition, never a state where both were simultaneously due for the
-   * same tick.) The liveness sweep is independent of both: it acts directly
+   * The liveness sweep is independent of the turn clock: it acts directly
    * on live sockets rather than on stored room state, so it can fire
-   * alongside either (or neither) of them on the same tick.
+   * alongside either (or neither) of them on the same tick. While idle
+   * (no turn-clocked phase, no live sockets), the only armed deadline left
+   * is the room's TTL.
    */
   async alarm(): Promise<void> {
     const nowMs = currentUnixTimeMs();
@@ -921,57 +883,43 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         return null;
       }
 
-      const pendingEffect = loadPendingRoomEffect(
-        await transaction.get<unknown>(PENDING_ROOM_EFFECT_STORAGE_KEY)
-      );
       const turnDeadlineMs = turnDeadlineForRoom(loaded.room);
-      const pendingEffectDue = pendingEffect !== null && nowMs >= pendingEffect.notBeforeMs;
-      const turnDeadlineDue = turnDeadlineMs !== null && nowMs >= turnDeadlineMs;
 
-      if (!pendingEffectDue && !turnDeadlineDue) {
+      if (turnDeadlineMs === null || nowMs < turnDeadlineMs) {
         // The room's TTL hasn't actually expired (loadStoredRoomEnvelope
-        // would have reported that above), and neither the pending settle
-        // effect nor the turn clock is due yet, so this tick is a no-op
-        // besides keeping the single alarm slot pointed at whichever
-        // deadline - including the liveness sweep's - is now soonest.
-        await this.scheduleNextAlarm(transaction, loaded.room, pendingEffect, nowMs);
+        // would have reported that above), and the turn clock is not due,
+        // so this tick is a no-op besides keeping the single alarm slot
+        // pointed at whichever deadline - including the liveness sweep's -
+        // is now soonest.
+        await this.scheduleNextAlarm(transaction, loaded.room, nowMs);
         return null;
       }
 
-      return turnDeadlineDue
-        ? ({ kind: "turnExpiry", room: loaded.room } as const)
-        : ({ kind: "pendingEffect", room: loaded.room, pendingEffect: pendingEffect as PendingRoomEffect } as const);
+      return { kind: "turnExpiry", room: loaded.room } as const;
     });
 
     if (due === null) {
       return;
     }
 
-    if (due.kind === "turnExpiry") {
-      await this.runDueTurnExpiry(due.room, nowMs);
-      return;
-    }
-
-    await this.runDuePendingRoomEffect(due.room, due.pendingEffect, nowMs);
+    await this.runDueTurnExpiry(due.room, nowMs);
   }
 
   /**
    * F-05 turn-clock resume: re-validates the room is still on the same
-   * outstanding deadline before dispatching TURN_EXPIRED, exactly like
-   * runDueSettleEffect re-checks phase/round_id before resuming settlement.
-   * This is what keeps a stale alarm wake - the round already advanced past
-   * the deadline that armed this wake, between alarm()'s outer transaction
-   * and this one - from forfeiting a round that has already moved on.
+   * outstanding deadline before dispatching TURN_EXPIRED, exactly like the
+   * old runDueSettleEffect re-checked phase/round_id before resuming
+   * settlement. This is what keeps a stale alarm wake - the round already
+   * advanced past the deadline that armed this wake, between alarm()'s outer
+   * transaction and this one - from forfeiting a round that has already
+   * moved on.
    *
    * F-06: when the expired deadline was choosingSide's, TURN_EXPIRED moves
-   * the room into "settling" instead of "roundForfeited" (see the reducer).
-   * That is the exact same "committed a transition into settling but the
-   * settlement effect might never run" shape EXECUTE_TRADE's own commit path
-   * guards against (see the F-02 comment on applyDecodedRoomCommand and
-   * pendingEffectForCommittedRoom), so it needs the identical treatment: a
-   * fresh pending-settle-effect marker written in the SAME transaction as
-   * the phase transition, and an immediate attempt at the settle effect
-   * afterward rather than waiting for the alarm's own next tick.
+   * the room into "settling". Since synchronous settlement (Phase 3) there
+   * is no pending-effect marker to persist for it: the SETTLEMENT_RECEIVED
+   * that resolves settling is composed in THIS SAME transaction (see
+   * settledDeckItemForRoom), so the room is persisted and broadcast exactly
+   * once, already in its final settlement state.
    */
   private async runDueTurnExpiry(room: RoomState, nowMs: UnixTimeMs): Promise<void> {
     const outcome: TurnExpiryOutcome = await this.ctx.storage.transaction(async (transaction) => {
@@ -983,14 +931,11 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       if (!loaded.ok) {
         // The room expired in the gap between alarm()'s outer transaction
         // and this one. Purge fully rather than leaving an expired envelope
-        // and its private items behind with no alarm armed to clean them up.
+        // behind with no alarm armed to clean it up.
         await purgeExpiredRoomState(transaction);
         return { kind: "unchanged" };
       }
 
-      const pendingEffect = loadPendingRoomEffect(
-        await transaction.get<unknown>(PENDING_ROOM_EFFECT_STORAGE_KEY)
-      );
       const turnDeadlineMs = turnDeadlineForRoom(loaded.room);
 
       if (turnDeadlineMs === null || nowMs < turnDeadlineMs) {
@@ -999,7 +944,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         // armed this alarm) between this alarm firing and being processed.
         // Reschedule against the freshly-loaded room instead of forfeiting
         // a round that has already moved on.
-        await this.scheduleNextAlarm(transaction, loaded.room, pendingEffect, nowMs);
+        await this.scheduleNextAlarm(transaction, loaded.room, nowMs);
         return { kind: "unchanged" };
       }
 
@@ -1013,22 +958,40 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         // check above passed (should not happen - this guard mirrors the
         // reducer's own phase guard exactly). Reschedule rather than
         // looping on an alarm that cannot make progress.
-        await this.scheduleNextAlarm(transaction, loaded.room, pendingEffect, nowMs);
+        await this.scheduleNextAlarm(transaction, loaded.room, nowMs);
         return { kind: "unchanged" };
       }
 
       // Only an F-06 choosingSide timeout lands in "settling" here; a
-      // forfeit into "roundForfeited" carries no pending effect, same as
-      // before this case existed.
-      const enteredSettling =
-        eventResult.room.lifecycle === "active" && eventResult.room.game.phase === "settling";
-      const nextPendingEffect = enteredSettling
-        ? freshSettlePendingEffect(eventResult.room.game.item.round_id, nowMs)
-        : null;
+      // forfeit into "roundForfeited" carries nothing further to compose,
+      // same as before synchronous settlement existed. Settling is transient:
+      // resolve it in this same transaction so no un-decodable `settling`
+      // envelope is ever persisted (the persistence decoder rejects the
+      // phase outright as of v5).
+      let committed = eventResult.room;
 
-      await this.persistRoomEnvelope(transaction, eventResult.room, nextPendingEffect, nowMs);
+      if (isSettlingActiveRoom(committed)) {
+        const settledResult = dispatchSystemRoomEvent(committed, {
+          type: "SETTLEMENT_RECEIVED",
+          item: settledDeckItemForRound(committed),
+          nowMs
+        });
 
-      return { kind: "committed", room: eventResult.room, enteredSettling };
+        if (!settledResult.ok) {
+          // Structurally unreachable right after TURN_EXPIRED succeeded
+          // (settling -> settlement always mutates), but never loop on an
+          // alarm that cannot make progress: leave the pre-expiry room
+          // untouched and reschedule.
+          await this.scheduleNextAlarm(transaction, loaded.room, nowMs);
+          return { kind: "unchanged" };
+        }
+
+        committed = settledResult.room;
+      }
+
+      await this.persistRoomEnvelope(transaction, committed, nowMs);
+
+      return { kind: "committed", room: committed };
     });
 
     if (outcome.kind === "unchanged") {
@@ -1042,206 +1005,6 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
     // never reach a client sitting on an open WebSocket watching it happen,
     // which is exactly what the shot clock exists to do in real time.
     this.broadcastRoomSnapshot(outcome.room);
-
-    if (!outcome.enteredSettling) {
-      return;
-    }
-
-    // Mirrors applyAutomaticRoomEffects' EXECUTE_TRADE handling: attempt the
-    // settle effect immediately instead of waiting for the alarm's own next
-    // tick. If this isolate is evicted mid-effect, the pending-effect marker
-    // just persisted above is the same F-02 trapdoor that resumes it later.
-    const settled = await this.receiveStoredSettlement(outcome.room, nowMs);
-
-    if (settled.ok) {
-      this.broadcastRoomSnapshot(settled.room);
-    }
-  }
-
-  private async runDuePendingRoomEffect(
-    room: RoomState,
-    pendingEffect: PendingRoomEffect,
-    nowMs: UnixTimeMs
-  ): Promise<void> {
-    switch (pendingEffect.kind) {
-      case "settle":
-        await this.runDueSettleEffect(room, pendingEffect, nowMs);
-        return;
-      default:
-        assertNever(pendingEffect.kind);
-    }
-  }
-
-  /**
-   * F-02 auto-resume: re-runs the settlement effect for a room that
-   * committed choosingSide -> settling but whose settlement effect never
-   * ran (isolate evicted, request abandoned between the two storage
-   * transactions in applyDecodedRoomCommand). This calls the exact same
-   * receiveStoredSettlement() path as EXECUTE_TRADE's own follow-up effect
-   * and PR-3's manual RETRY_ITEM_GENERATION escape hatch, so it cannot
-   * diverge from or double-apply relative to either: receiveStoredSettlement
-   * re-checks phase === "settling" and round_id inside a fresh transaction
-   * before doing anything.
-   */
-  private async runDueSettleEffect(
-    room: RoomState,
-    pendingEffect: PendingRoomEffect,
-    nowMs: UnixTimeMs
-  ): Promise<void> {
-    if (
-      room.lifecycle !== "active" ||
-      room.game.phase !== "settling" ||
-      room.game.item.round_id !== pendingEffect.roundId
-    ) {
-      // The marker no longer matches the room it names (already resolved
-      // through another path, or invariant drift). Self-heal against a
-      // freshly-loaded room rather than acting on the possibly-stale `room`
-      // this method was called with.
-      await this.ctx.storage.transaction(async (transaction) => {
-        const loaded = loadStoredRoomEnvelope(
-          await transaction.get<unknown>(ROOM_STORAGE_KEY),
-          nowMs
-        );
-
-        if (!loaded.ok) {
-          // The room expired in the gap between alarm()'s outer transaction
-          // and this one. loadStoredRoomEnvelope reporting "not ok" here
-          // means nothing is left to reschedule for - purge fully so the
-          // expired envelope, its private items, and the stale marker don't
-          // outlive the alarm that would otherwise have cleaned them up.
-          await purgeExpiredRoomState(transaction);
-          return;
-        }
-
-        await writePendingRoomEffect(transaction, null);
-        await this.scheduleNextAlarm(transaction, loaded.room, null, nowMs);
-      });
-      return;
-    }
-
-    if (pendingEffect.attempts >= PENDING_SETTLE_EFFECT_MAX_ATTEMPTS) {
-      await this.forceFailStuckSettlement(pendingEffect.roundId, nowMs);
-      return;
-    }
-
-    const shouldAttempt = await this.ctx.storage.transaction(async (transaction) => {
-      const loaded = loadStoredRoomEnvelope(
-        await transaction.get<unknown>(ROOM_STORAGE_KEY),
-        nowMs
-      );
-
-      if (!loaded.ok) {
-        // Same gap as the self-heal branch above: the room expired between
-        // alarm()'s outer transaction and this one. Purge fully rather than
-        // leaving an expired envelope and its private items with no alarm
-        // armed to clean them up later.
-        await purgeExpiredRoomState(transaction);
-        return false;
-      }
-
-      if (
-        loaded.room.lifecycle !== "active" ||
-        loaded.room.game.phase !== "settling" ||
-        loaded.room.game.item.round_id !== pendingEffect.roundId
-      ) {
-        await writePendingRoomEffect(transaction, null);
-        await this.scheduleNextAlarm(transaction, loaded.room, null, nowMs);
-        return false;
-      }
-
-      // Record the attempt (with backoff for the next tick) before risking
-      // it, so a crash mid-effect still counts toward the cap on the next
-      // alarm wake rather than retrying forever.
-      const bumped = nextSettlePendingEffectAttempt(pendingEffect, nowMs);
-      await writePendingRoomEffect(transaction, bumped);
-      await this.scheduleNextAlarm(transaction, loaded.room, bumped, nowMs);
-      return true;
-    });
-
-    if (!shouldAttempt) {
-      return;
-    }
-
-    const refreshed = await this.loadStoredRoom(nowMs);
-
-    if (refreshed.ok) {
-      const settled = await this.receiveStoredSettlement(refreshed.room, nowMs);
-
-      // See the identical comment on runDueTurnExpiry's own broadcast: this
-      // retry runs off the alarm, not a request a client is waiting on, so
-      // without this a successful auto-resumed settlement would persist but
-      // never reach a connected client until its next unrelated command.
-      if (settled.ok) {
-        this.broadcastRoomSnapshot(settled.room);
-      }
-    }
-  }
-
-  /**
-   * Terminal fallback once PENDING_SETTLE_EFFECT_MAX_ATTEMPTS is exhausted.
-   * Forces the same SETTLEMENT_FAILED -> choosingSide transition the reducer
-   * already uses when the stored private item is missing, rather than
-   * inventing a new stuck state. A host can retry manually afterward.
-   */
-  private async forceFailStuckSettlement(
-    roundId: string,
-    nowMs: UnixTimeMs
-  ): Promise<void> {
-    const committed = await this.ctx.storage.transaction(async (transaction) => {
-      const loaded = loadStoredRoomEnvelope(
-        await transaction.get<unknown>(ROOM_STORAGE_KEY),
-        nowMs
-      );
-
-      if (!loaded.ok) {
-        // The room expired before this exhaustion fallback could run. Purge
-        // fully rather than leaving an expired envelope and its private
-        // items behind with no alarm armed to clean them up later.
-        await purgeExpiredRoomState(transaction);
-        return null;
-      }
-
-      if (
-        loaded.room.lifecycle !== "active" ||
-        loaded.room.game.phase !== "settling" ||
-        loaded.room.game.item.round_id !== roundId
-      ) {
-        await writePendingRoomEffect(transaction, null);
-        await this.scheduleNextAlarm(transaction, loaded.room, null, nowMs);
-        return null;
-      }
-
-      const eventResult = dispatchSystemRoomEvent(
-        loaded.room,
-        {
-          type: "SETTLEMENT_FAILED",
-          error: SETTLEMENT_RETRY_EXHAUSTED_MESSAGE,
-          nowMs
-        }
-      );
-
-      if (!eventResult.ok) {
-        // The reducer unexpectedly rejected SETTLEMENT_FAILED even though
-        // the phase/round_id check just above passed. Give up on this
-        // exhausted pending effect rather than looping, but re-arm the
-        // alarm against the room's TTL deadline so it isn't silently
-        // dropped - the marker itself is no longer trustworthy either way.
-        await writePendingRoomEffect(transaction, null);
-        await this.scheduleNextAlarm(transaction, loaded.room, null, nowMs);
-        return null;
-      }
-
-      await this.persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
-
-      return eventResult.room;
-    });
-
-    if (committed !== null) {
-      // Same reasoning as runDueTurnExpiry / runDueSettleEffect's own
-      // broadcasts: this fallback runs off the alarm's exhaustion path, not
-      // a request a client is waiting on.
-      this.broadcastRoomSnapshot(committed);
-    }
   }
 
   /**
@@ -1327,42 +1090,45 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         } as const;
       }
 
-      // F-02: if this command just committed choosingSide -> settling (or
-      // left an existing settling room unchanged), a pending-effect marker
-      // must be persisted in this SAME transaction as the phase transition -
-      // otherwise the marker itself has the same "committed but the effect
-      // never ran" hole this is meant to fix.
-      let pendingEffect: PendingRoomEffect | null = null;
+      // Synchronous settlement (Phase 3): EXECUTE_TRADE commits choosingSide
+      // -> settling -> settlement in ONE transaction. `settling` is a
+      // transient-only phase - it is never persisted and never broadcast -
+      // because the persistence decoder rejects it outright as of v5, so a
+      // crash mid-transaction rolls the whole thing back rather than
+      // stranding the room in an un-decodable state.
+      const settlingFromTrade =
+        command.type === "EXECUTE_TRADE" && isSettlingActiveRoom(commandResult.room)
+          ? commandResult.room
+          : null;
+      let committed = commandResult.room;
 
-      if (
-        commandResult.room.lifecycle === "active" &&
-        commandResult.room.game.phase === "settling"
-      ) {
-        const existingPendingEffect = loadPendingRoomEffect(
-          await transaction.get<unknown>(PENDING_ROOM_EFFECT_STORAGE_KEY)
-        );
-
-        pendingEffect = pendingEffectForCommittedRoom(
-          command,
-          commandResult.room,
-          existingPendingEffect,
+      if (settlingFromTrade !== null) {
+        const settledResult = dispatchSystemRoomEvent(settlingFromTrade, {
+          type: "SETTLEMENT_RECEIVED",
+          item: settledDeckItemForRound(settlingFromTrade),
           nowMs
-        );
+        });
+
+        if (!settledResult.ok) {
+          return {
+            ok: false,
+            status: statusForDomainError(settledResult.error),
+            error: settledResult.error
+          } as const;
+        }
+
+        committed = settledResult.room;
       }
 
-      await this.persistRoomEnvelope(transaction, commandResult.room, pendingEffect, nowMs);
+      await this.persistRoomEnvelope(transaction, committed, nowMs);
       await transaction.put(
         ROOM_COMMAND_DEDUPE_STORAGE_KEY,
-        withCommandDedupeEntry(dedupeEntries, command, commandResult.room.revision)
+        withCommandDedupeEntry(dedupeEntries, command, committed.revision)
       );
-
-      if (shouldDeletePrivateGeneratedItemsAfterCommand(command)) {
-        await deletePrivateGeneratedItems(transaction);
-      }
 
       return {
         ok: true,
-        room: commandResult.room,
+        room: committed,
         replay: false
       } as const;
     });
@@ -1373,9 +1139,9 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
 
     if (commandResult.replay) {
       // The mutation already committed on a prior attempt. Automatic effects
-      // (item generation, settlement fetch, ...) already ran then too, so
-      // running them again here would duplicate side effects rather than
-      // just re-deliver the response the client lost.
+      // (deck item receipt, ...) already ran then too, so running them again
+      // here would duplicate side effects rather than just re-deliver the
+      // response the client lost.
       return { ok: true, room: commandResult.room };
     }
 
@@ -1389,28 +1155,11 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
   ): Promise<StoredRoomCommandResult> {
     // The static deck (D3) makes item receipt synchronous with the command
     // that opened the round: the deck pick cannot fail, so there is no
-    // generation phase to retry and no provider error path.
+    // generation phase to retry and no provider error path. Settlement needs
+    // no follow-up effect at all - EXECUTE_TRADE composes it inside its own
+    // single transaction (see applyDecodedRoomCommand).
     if (shouldGenerateItemAfterCommand(command, room)) {
       return this.receiveDeckItem(room, nowMs);
-    }
-
-    if (command.type === "EXECUTE_TRADE" && room.lifecycle === "active" && room.game.phase === "settling") {
-      return this.receiveStoredSettlement(room, nowMs);
-    }
-
-    // F-02 mitigation: a host retry of a room durably stuck in `settling`
-    // (the settling transition committed, but this same effect never ran -
-    // isolate evicted, request abandoned) re-runs settlement for the
-    // current round from the untouched persisted item, quote, and
-    // pendingSide. retryRoomItemGeneration left the room state unchanged
-    // for this case, so this reuses the exact same settlement path
-    // EXECUTE_TRADE uses, which is why the outcome cannot be re-rolled.
-    if (
-      command.type === "RETRY_ITEM_GENERATION" &&
-      room.lifecycle === "active" &&
-      room.game.phase === "settling"
-    ) {
-      return this.receiveStoredSettlement(room, nowMs);
     }
 
     return {
@@ -1421,10 +1170,10 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
 
   /**
    * D3 (decided): attaches the round's static-deck item inside one storage
-   * transaction against the freshly-loaded room - same shape as the old
-   * provider receipt path, minus credentials and minus any way to fail
-   * mid-generation. The private-item write stays until Phase 3 so the
-   * existing settle-resume path keeps working unchanged.
+   * transaction against the freshly-loaded room. There is no private-item
+   * write anymore - settlement recomputes the same deck pick at settle time
+   * (see settledDeckItemForRoom), so nothing about the item is stored
+   * outside the public room envelope.
    */
   private async receiveDeckItem(
     room: RoomState,
@@ -1455,21 +1204,11 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         } as const;
       }
 
-      const privateItem = createSettledGeneratedItem(
-        generateRoundId(),
-        itemForRound(loaded.room.game.mode, loaded.room.game.roundNumber)
-      );
-
-      await transaction.put(
-        privateGeneratedItemStorageKey(privateItem.round_id),
-        privateGeneratedItemEnvelopeForStorage(privateItem)
-      );
-
       const eventResult = dispatchSystemRoomEvent(
         loaded.room,
         {
           type: "ITEM_RECEIVED",
-          item: toGeneratedItem(privateItem),
+          item: deckItemForRound(loaded.room),
           nowMs
         }
       );
@@ -1482,98 +1221,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         } as const;
       }
 
-      await this.persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
-
-      return {
-        ok: true,
-        room: eventResult.room
-      } as const;
-    });
-  }
-
-  private async receiveStoredSettlement(
-    room: RoomState,
-    nowMs: UnixTimeMs
-  ): Promise<StoredRoomCommandResult> {
-    if (room.lifecycle !== "active" || room.game.phase !== "settling") {
-      return {
-        ok: true,
-        room
-      };
-    }
-
-    const roundId = room.game.item.round_id;
-
-    return this.ctx.storage.transaction(async (transaction) => {
-      const loaded = loadStoredRoomEnvelope(
-        await transaction.get<unknown>(ROOM_STORAGE_KEY),
-        nowMs
-      );
-
-      if (!loaded.ok) {
-        return {
-          ok: false,
-          status: statusForStoredRoomLoadFailure(loaded),
-          error: loaded.error
-        } as const;
-      }
-
-      if (
-        loaded.room.lifecycle !== "active" ||
-        loaded.room.game.phase !== "settling" ||
-        loaded.room.game.item.round_id !== roundId
-      ) {
-        return {
-          ok: true,
-          room: loaded.room
-        } as const;
-      }
-
-      const stored = loadPrivateGeneratedItemEnvelope(
-        await transaction.get<unknown>(privateGeneratedItemStorageKey(roundId)),
-        roundId
-      );
-
-      const eventResult = stored.ok
-        ? dispatchSystemRoomEvent(
-            loaded.room,
-            {
-              type: "SETTLEMENT_RECEIVED",
-              item: stored.item,
-              nowMs
-            }
-          )
-        : dispatchSystemRoomEvent(
-            loaded.room,
-            {
-              type: "SETTLEMENT_FAILED",
-              error: PRIVATE_ITEM_UNAVAILABLE_MESSAGE,
-              nowMs
-            }
-          );
-
-      if (!eventResult.ok) {
-        return {
-          ok: false,
-          status: statusForDomainError(eventResult.error),
-          error: eventResult.error
-        } as const;
-      }
-
-      // dispatchSystemRoomEvent always moves settling -> settlement,
-      // settling -> choosingSide, or (once SETTLEMENT_FAILED has failed
-      // SETTLEMENT_FAILURE_EPISODE_CAP times in a row for this round, F-07)
-      // settling -> error, so the room is guaranteed to have left settling:
-      // no pending settle effect remains.
-      await this.persistRoomEnvelope(transaction, eventResult.room, null, nowMs);
-
-      if (
-        stored.ok &&
-        eventResult.room.lifecycle === "active" &&
-        eventResult.room.game.phase === "settlement"
-      ) {
-        await transaction.delete(privateGeneratedItemStorageKey(roundId));
-      }
+      await this.persistRoomEnvelope(transaction, eventResult.room, nowMs);
 
       return {
         ok: true,
@@ -1757,13 +1405,12 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
   /**
    * Folds a just-connected socket's liveness deadline into the single alarm
    * slot immediately (called from acceptRoomSocket right after
-   * ctx.acceptWebSocket()). Connect does not mutate persisted room or
-   * pending-effect state, so this deliberately does not go through
-   * persistRoomEnvelope - it only needs to re-run the same min-of-deadlines
-   * computation scheduleNextAlarm() already owns, now that
-   * ctx.getWebSockets() includes the new socket. No-op if the room can no
-   * longer be loaded (a race with expiry/purge - nothing left to schedule
-   * against).
+   * ctx.acceptWebSocket()). Connect does not mutate persisted room state, so
+   * this deliberately does not go through persistRoomEnvelope - it only
+   * needs to re-run the same min-of-deadlines computation
+   * scheduleNextAlarm() already owns, now that ctx.getWebSockets() includes
+   * the new socket. No-op if the room can no longer be loaded (a race with
+   * expiry/purge - nothing left to schedule against).
    */
   private async rearmAlarmForLiveSockets(nowMs: UnixTimeMs): Promise<void> {
     const loaded = await this.loadStoredRoom(nowMs);
@@ -1772,66 +1419,48 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       return;
     }
 
-    const pendingEffect = loadPendingRoomEffect(
-      await this.ctx.storage.get<unknown>(PENDING_ROOM_EFFECT_STORAGE_KEY)
-    );
-
     await this.ctx.storage.transaction(async (transaction) => {
-      await this.scheduleNextAlarm(transaction, loaded.room, pendingEffect, nowMs);
+      await this.scheduleNextAlarm(transaction, loaded.room, nowMs);
     });
   }
 
   /**
-   * Persists a room state and its pending-effect marker (if any) together,
-   * then reschedules the single alarm slot to match. `pendingEffect` must be
-   * `null` whenever the caller knows no effect is outstanding for this room
-   * state (which self-heals any stale marker) - only applyDecodedRoomCommand's
-   * settling commit and its alarm-driven successors pass a non-null value.
+   * Persists a room state, then reschedules the single alarm slot to match.
    */
   private async persistRoomEnvelope(
     transaction: DurableObjectTransaction,
     room: RoomState,
-    pendingEffect: PendingRoomEffect | null,
     nowMs: UnixTimeMs
   ): Promise<void> {
     await transaction.put(ROOM_STORAGE_KEY, persistenceEnvelopeForStorage(room, nowMs));
-    await writePendingRoomEffect(transaction, pendingEffect);
-    await this.scheduleNextAlarm(transaction, room, pendingEffect, nowMs);
+    await this.scheduleNextAlarm(transaction, room, nowMs);
   }
 
   /**
    * The reusable alarm multiplexer. A Durable Object has exactly one alarm
-   * slot, so every transaction that can change any of the four deadlines
-   * this folds together - room TTL, a pending settle effect's next-attempt
-   * time, F-05's turn shot clock, and (F-08) the earliest liveness-sweep
-   * deadline among currently connected room sockets - must call this rather
-   * than setAlarm() directly, or the concerns will race to clobber each
-   * other's schedule.
+   * slot, so every transaction that can change any of the three deadlines
+   * this folds together - room TTL, F-05's turn shot clock, and (F-08) the
+   * earliest liveness-sweep deadline among currently connected room sockets -
+   * must call this rather than setAlarm() directly, or the concerns will
+   * race to clobber each other's schedule.
    *
-   * The turn deadline is not a PendingRoomEffect: unlike the settle effect
-   * (which needs its own retry count and backoff state), it is already
-   * durably part of the committed `room.game` for exactly the four phases
-   * where a specific player must act, so it is derived straight from `room`
-   * here via turnDeadlineForRoom() rather than threaded through as a
-   * separate parameter.
+   * The turn deadline is not persisted separately from the room: it is
+   * already durably part of the committed `room.game` for exactly the four
+   * phases where a specific player must act, so it is derived straight from
+   * `room` here via turnDeadlineForRoom().
    *
    * The liveness term comes from nextLivenessSweepDeadline(), which reads
    * live socket state (ctx.getWebSockets() /
    * getWebSocketAutoResponseTimestamp()) rather than anything persisted, so
-   * it costs nothing extra in this already-open transaction and cannot itself
-   * fall out of sync the way a stored marker could.
+   * it costs nothing extra in this already-open transaction and cannot fall
+   * out of sync the way a stored marker could.
    */
   private async scheduleNextAlarm(
     transaction: DurableObjectTransaction,
     room: RoomState,
-    pendingEffect: PendingRoomEffect | null,
     nowMs: UnixTimeMs
   ): Promise<void> {
     const deadlines: UnixTimeMs[] = [roomExpiresAtMs(room)];
-
-    if (pendingEffect !== null) {
-      deadlines.push(pendingEffect.notBeforeMs);
-    }
 
     const turnDeadline = turnDeadlineForRoom(room);
 
@@ -1917,8 +1546,7 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
       nowMs
     });
 
-    await this.persistRoomEnvelope(transaction, room, null, nowMs);
-    await deletePrivateGeneratedItems(transaction);
+    await this.persistRoomEnvelope(transaction, room, nowMs);
     // A prior room in this same Durable Object may have expired without its
     // alarm having fired yet, leaving its command-dedupe record behind.
     // Clearing it here (as the alarm-driven full cleanup also does) keeps a
@@ -2193,8 +1821,7 @@ function shouldGenerateItemAfterCommand(
 ): boolean {
   return (
     command.type === "START_ROOM" ||
-    command.type === "ADVANCE_ROUND" ||
-    command.type === "RETRY_ITEM_GENERATION"
+    command.type === "ADVANCE_ROUND"
   ) &&
     room.lifecycle === "active" &&
     room.game.phase === "generatingItem";
@@ -2649,151 +2276,69 @@ function turnDeadlineForRoom(room: RoomState): UnixTimeMs | null {
   }
 }
 
-async function writePendingRoomEffect(
-  transaction: DurableObjectTransaction,
-  pendingEffect: PendingRoomEffect | null
-): Promise<void> {
-  if (pendingEffect === null) {
-    await transaction.delete(PENDING_ROOM_EFFECT_STORAGE_KEY);
-    return;
-  }
-
-  await transaction.put(
-    PENDING_ROOM_EFFECT_STORAGE_KEY,
-    pendingRoomEffectForStorage(pendingEffect)
-  );
-}
-
-function pendingRoomEffectForStorage(pendingEffect: PendingRoomEffect): unknown {
-  return { ...pendingEffect };
-}
-
-function loadPendingRoomEffect(value: unknown): PendingRoomEffect | null {
-  if (!isRecord(value)) {
-    return null;
-  }
-
-  if (
-    value.kind !== "settle" ||
-    typeof value.roundId !== "string" ||
-    !isNonNegativeInteger(value.attempts) ||
-    !isFiniteNonNegativeNumber(value.notBeforeMs)
-  ) {
-    return null;
-  }
-
+/**
+ * The public item attached to the round the given room state is in: deck
+ * fields from the pure modulo seam (D3), round_id freshly minted per round.
+ * Used by receiveDeckItem when a round opens.
+ */
+function deckItemForRound(room: RoomState): GeneratedItem {
   return {
-    kind: "settle",
-    roundId: value.roundId,
-    attempts: value.attempts,
-    notBeforeMs: value.notBeforeMs
+    ...itemForRound(room.game.mode, room.game.roundNumber),
+    round_id: generateRoundId()
   };
 }
 
-function freshSettlePendingEffect(
-  roundId: string,
-  nowMs: UnixTimeMs
-): PendingRoomEffect {
-  return {
-    kind: "settle",
-    roundId,
-    attempts: 0,
-    notBeforeMs: nowMs
-  };
-}
-
-function nextSettlePendingEffectAttempt(
-  pendingEffect: PendingRoomEffect,
-  nowMs: UnixTimeMs
-): PendingRoomEffect {
-  const attempts = pendingEffect.attempts + 1;
-  const backoffMs = Math.min(
-    PENDING_SETTLE_EFFECT_BASE_BACKOFF_MS * 2 ** (attempts - 1),
-    PENDING_SETTLE_EFFECT_MAX_BACKOFF_MS
-  );
-
-  return {
-    ...pendingEffect,
-    attempts,
-    notBeforeMs: nowMs + backoffMs
-  };
+function isSettlingActiveRoom(
+  room: RoomState
+): room is RoomState & { game: SettlingGameState } {
+  return room.lifecycle === "active" && room.game.phase === "settling";
 }
 
 /**
- * Decides the pending-effect marker for a room state that
- * applyDecodedRoomCommand just committed. Only reached when the committed
- * room is lifecycle "active" and phase "settling", which today only two
- * commands can produce: EXECUTE_TRADE (the transition into settling, which
- * always starts a fresh marker) and RETRY_ITEM_GENERATION's settling no-op
- * passthrough (which leaves the room, and therefore the marker, untouched).
+ * The settled item for the round a committed `settling` room state is in
+ * (Phase 3 synchronous settlement). LOAD-BEARING round_id continuation rule:
+ * the settled item MUST reuse `room.game.item.round_id` - the id attached by
+ * the composed ITEM_RECEIVED earlier in the same round - because
+ * SETTLEMENT_RECEIVED hard-rejects a mismatched round_id, and post-v5 a
+ * rejected settling state can no longer be persisted (the next touch would
+ * purge the room). Deck fields are recomputed from itemForRound(mode,
+ * roundNumber), which is exactly what ITEM_RECEIVED drew from. The identity
+ * assert immediately before dispatch is belt-and-suspenders: the spread
+ * above already makes it structurally true.
  */
-function pendingEffectForCommittedRoom(
-  command: DecodedRoomCommand,
-  room: RoomState,
-  existingPendingEffect: PendingRoomEffect | null,
-  nowMs: UnixTimeMs
-): PendingRoomEffect | null {
-  if (room.lifecycle !== "active" || room.game.phase !== "settling") {
-    return null;
+function settledDeckItemForRound(
+  room: RoomState & { game: Extract<GameState, { phase: "settling" }> }
+): SettledGeneratedItem {
+  const settled = {
+    ...itemForRound(room.game.mode, room.game.roundNumber),
+    round_id: room.game.item.round_id
+  };
+
+  if (settled.round_id !== room.game.item.round_id) {
+    throw new Error("Settlement round_id drifted from the active round's item.");
   }
 
-  if (command.type === "EXECUTE_TRADE") {
-    return freshSettlePendingEffect(room.game.item.round_id, nowMs);
-  }
-
-  if (existingPendingEffect !== null && existingPendingEffect.roundId === room.game.item.round_id) {
-    return existingPendingEffect;
-  }
-
-  // Self-heal: the room is settling but no marker matches it (should not
-  // normally happen). Without this, the room could become durably stuck
-  // with no alarm ever scheduled to resume it.
-  return freshSettlePendingEffect(room.game.item.round_id, nowMs);
-}
-
-function isNonNegativeInteger(value: unknown): value is number {
-  return typeof value === "number" && Number.isInteger(value) && value >= 0;
+  return settled;
 }
 
 function isFiniteNonNegativeNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
-async function deletePrivateGeneratedItems(
-  transaction: DurableObjectTransaction
-): Promise<void> {
-  const items = await transaction.list<unknown>({
-    prefix: privateGeneratedItemStoragePrefix()
-  });
-
-  if (items.size > 0) {
-    await transaction.delete([...items.keys()]);
-  }
-}
-
 /**
  * Full teardown for a room envelope that loadStoredRoomEnvelope has just
- * reported as missing/expired/invalid: private generated items (which hold
- * true_value), the room envelope itself, any pending-effect marker, and the
- * alarm slot. Every call site that discovers expiry this way must run this
- * rather than returning bare - alarms are one-shot, so leaving the alarm
- * unset here would strand the expired envelope and its private items with
- * nothing left to purge them.
+ * reported as missing/expired/invalid: the room envelope itself, its
+ * command-dedupe record, and the alarm slot. Every call site that discovers
+ * expiry this way must run this rather than returning bare - alarms are
+ * one-shot, so leaving the alarm unset here would strand the expired
+ * envelope with nothing left to purge it.
  */
 async function purgeExpiredRoomState(
   transaction: DurableObjectTransaction
 ): Promise<void> {
-  await deletePrivateGeneratedItems(transaction);
   await transaction.delete(ROOM_STORAGE_KEY);
-  await transaction.delete(PENDING_ROOM_EFFECT_STORAGE_KEY);
   await transaction.delete(ROOM_COMMAND_DEDUPE_STORAGE_KEY);
   await transaction.deleteAlarm();
-}
-
-function shouldDeletePrivateGeneratedItemsAfterCommand(
-  command: DecodedRoomCommand
-): boolean {
-  return command.type === "RESET_TO_LOBBY" || command.type === "KICK_GUEST";
 }
 
 /**
@@ -2852,10 +2397,6 @@ function loadCommandDedupeEntries(raw: unknown): CommandDedupeEntry[] {
   return entries.length > COMMAND_DEDUPE_MAX_ENTRIES
     ? entries.slice(entries.length - COMMAND_DEDUPE_MAX_ENTRIES)
     : entries;
-}
-
-function privateGeneratedItemEnvelopeForStorage(item: SettledGeneratedItem): unknown {
-  return JSON.parse(JSON.stringify(toPrivateGeneratedItemEnvelope(item))) as unknown;
 }
 
 function generateCapabilityToken(
@@ -3001,9 +2542,12 @@ function statusForDomainError(error: RoomDomainError): number {
     case "invalid_config":
       return 400;
     case "persistence_expired":
+    // A planned invalidation (hard persistence cutover), not a server bug:
+    // the room's stored envelope predates this build's floor version, so
+    // self-heal paths purge it and the room reads as never-created.
+    case "persistence_version_unsupported":
       return 410;
     case "persistence_invalid":
-    case "persistence_version_unsupported":
       return 500;
     case "room_not_in_lobby":
     case "room_not_active":
@@ -3012,7 +2556,6 @@ function statusForDomainError(error: RoomDomainError): number {
     case "guest_slot_empty":
     case "guest_required":
     case "invalid_game_phase":
-    case "round_settling":
       return 409;
     default:
       return assertNever(error.code);
