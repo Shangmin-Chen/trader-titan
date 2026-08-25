@@ -79,17 +79,6 @@ function serverSettlement(
   };
 }
 
-function toSideChoiceFromGeneratingItem(
-  state: Extract<GameState, { phase: "generatingItem" }>,
-  roundId: string,
-  quote: { bid: number; ask: number },
-): GameState {
-  const withItem = receiveItem(state, { ...item, round_id: roundId });
-  const opened = submitInitialWidth(withItem, 500);
-  const tightened = tightenWidth(opened, quote.ask - quote.bid);
-  const traded = tradeOnWidth(tightened);
-  return submitMarketQuote(traded, quote);
-}
 
 function settleTrade(
   state: GameState,

@@ -243,12 +243,12 @@ describe("room persistence", () => {
 
     const errorGame = {
       ...normalizeForPersistence(started.room).game,
-      phase: "error",
+      phase: "error" as const,
       error: "stale failure",
-      previousPhase: "generatingItem",
+      previousPhase: "generatingItem" as const,
     };
     const errorEnvelope = toPersistenceEnvelope(
-      { ...started.room, game: errorGame },
+      { ...started.room, game: errorGame as unknown as RoomState["game"] },
       NOW_MS + 4,
     );
 
@@ -367,13 +367,6 @@ function normalizeForPersistence<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
-function omitKey<T extends object, K extends keyof T>(value: T, key: K): Omit<T, K> {
-  const clone: Partial<T> = { ...value };
-
-  delete clone[key];
-
-  return clone as Omit<T, K>;
-}
 
 function settlingRoomChosen(
   room: RoomState,

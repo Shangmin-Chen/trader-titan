@@ -61,7 +61,7 @@ export const ROOM_PERSISTENCE_VERSION = 5;
  * `settling`, and `error` phases stopped being persistable (synchronous
  * settlement composes straight through `settling` in one Worker storage
  * transaction, and nothing produces `error` anymore), and the F-07 bounce
- * fields (`lockedPendingTrade`/`settlementFailureCount`) left `choosingSide`.
+ * fields left `choosingSide` with them.
  * Any older envelope fails decode (persistence_version_unsupported) and the
  * room's self-heal paths purge it, after which the room reads as
  * never-created. Blast radius per deploy: rooms live in the ≤2 h TTL window.

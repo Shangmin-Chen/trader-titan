@@ -23,9 +23,9 @@ import {
   isAllowedOrigin
 } from "../api/request-guards";
 import type {
-  GameMode,
   GeneratedItem,
   GameState,
+  GeneratingItemGameState,
   SettledGeneratedItem,
   SettlingGameState
 } from "../lib/game";
@@ -184,13 +184,6 @@ type JoinRoomResponse = Readonly<{
 type CommandRoomResponse = Readonly<{
   ok: true;
   room: PublicRoomSnapshot;
-}>;
-
-type PendingItemGeneration = Readonly<{
-  roomId: RoomId;
-  revision: number;
-  roundNumber: number;
-  mode: GameMode;
 }>;
 
 type CreateRoomBody = Readonly<{
@@ -1090,22 +1083,32 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         } as const;
       }
 
-      // Synchronous settlement (Phase 3): EXECUTE_TRADE commits choosingSide
-      // -> settling -> settlement in ONE transaction. `settling` is a
-      // transient-only phase - it is never persisted and never broadcast -
-      // because the persistence decoder rejects it outright as of v5, so a
-      // crash mid-transaction rolls the whole thing back rather than
-      // stranding the room in an un-decodable state.
-      const settlingFromTrade =
-        command.type === "EXECUTE_TRADE" && isSettlingActiveRoom(commandResult.room)
-          ? commandResult.room
-          : null;
+      // Synchronous composition (Phase 3): every round-opening or closing
+      // command resolves its follow-up system event inside THIS SAME
+      // transaction. `generatingItem` and `settling` are transient-only
+      // phases - the persistence decoder rejects them outright as of v5 -
+      // so persisting either would strand the room; composing here means a
+      // crash mid-command rolls the whole thing back instead.
       let committed = commandResult.room;
 
-      if (settlingFromTrade !== null) {
-        const settledResult = dispatchSystemRoomEvent(settlingFromTrade, {
+      if (isSettlingActiveRoom(committed)) {
+        if (command.type !== "EXECUTE_TRADE") {
+          // Only EXECUTE_TRADE can commit into settling (the reducer's
+          // TURN_EXPIRED path is composed separately on the alarm). Treat
+          // anything else as an invariant violation rather than guessing.
+          return {
+            ok: false,
+            status: 500,
+            error: {
+              code: "persistence_invalid",
+              message: "Room committed a transient settling state."
+            }
+          } as const;
+        }
+
+        const settledResult = dispatchSystemRoomEvent(committed, {
           type: "SETTLEMENT_RECEIVED",
-          item: settledDeckItemForRound(settlingFromTrade),
+          item: settledDeckItemForRound(committed),
           nowMs
         });
 
@@ -1118,6 +1121,25 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
         }
 
         committed = settledResult.room;
+      } else if (
+        (command.type === "START_ROOM" || command.type === "ADVANCE_ROUND") &&
+        isGeneratingActiveRoom(committed)
+      ) {
+        const itemResult = dispatchSystemRoomEvent(committed, {
+          type: "ITEM_RECEIVED",
+          item: deckItemForRound(committed),
+          nowMs
+        });
+
+        if (!itemResult.ok) {
+          return {
+            ok: false,
+            status: statusForDomainError(itemResult.error),
+            error: itemResult.error
+          } as const;
+        }
+
+        committed = itemResult.room;
       }
 
       await this.persistRoomEnvelope(transaction, committed, nowMs);
@@ -1138,96 +1160,15 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
     }
 
     if (commandResult.replay) {
-      // The mutation already committed on a prior attempt. Automatic effects
-      // (deck item receipt, ...) already ran then too, so running them again
-      // here would duplicate side effects rather than just re-deliver the
-      // response the client lost.
+      // The mutation already committed on a prior attempt - including the
+      // composed ITEM_RECEIVED / SETTLEMENT_RECEIVED follow-ups, which live
+      // in that same original transaction. Re-running them would duplicate
+      // side effects rather than just re-deliver the response the client
+      // lost.
       return { ok: true, room: commandResult.room };
     }
 
-    return this.applyAutomaticRoomEffects(command, commandResult.room, nowMs);
-  }
-
-  private async applyAutomaticRoomEffects(
-    command: DecodedRoomCommand,
-    room: RoomState,
-    nowMs: UnixTimeMs
-  ): Promise<StoredRoomCommandResult> {
-    // The static deck (D3) makes item receipt synchronous with the command
-    // that opened the round: the deck pick cannot fail, so there is no
-    // generation phase to retry and no provider error path. Settlement needs
-    // no follow-up effect at all - EXECUTE_TRADE composes it inside its own
-    // single transaction (see applyDecodedRoomCommand).
-    if (shouldGenerateItemAfterCommand(command, room)) {
-      return this.receiveDeckItem(room, nowMs);
-    }
-
-    return {
-      ok: true,
-      room
-    };
-  }
-
-  /**
-   * D3 (decided): attaches the round's static-deck item inside one storage
-   * transaction against the freshly-loaded room. There is no private-item
-   * write anymore - settlement recomputes the same deck pick at settle time
-   * (see settledDeckItemForRoom), so nothing about the item is stored
-   * outside the public room envelope.
-   */
-  private async receiveDeckItem(
-    room: RoomState,
-    nowMs: UnixTimeMs
-  ): Promise<StoredRoomCommandResult> {
-    const target = generationTargetForRoom(room);
-
-    return this.ctx.storage.transaction(async (transaction) => {
-      const loaded = loadStoredRoomEnvelope(
-        await transaction.get<unknown>(ROOM_STORAGE_KEY),
-        nowMs
-      );
-
-      if (!loaded.ok) {
-        return {
-          ok: false,
-          status: statusForStoredRoomLoadFailure(loaded),
-          error: loaded.error
-        } as const;
-      }
-
-      if (!samePendingGeneration(loaded.room, target)) {
-        // Stale wake: the room moved on between committing the command that
-        // opened the round and this effect running. Leave it untouched.
-        return {
-          ok: true,
-          room: loaded.room
-        } as const;
-      }
-
-      const eventResult = dispatchSystemRoomEvent(
-        loaded.room,
-        {
-          type: "ITEM_RECEIVED",
-          item: deckItemForRound(loaded.room),
-          nowMs
-        }
-      );
-
-      if (!eventResult.ok) {
-        return {
-          ok: false,
-          status: statusForDomainError(eventResult.error),
-          error: eventResult.error
-        } as const;
-      }
-
-      await this.persistRoomEnvelope(transaction, eventResult.room, nowMs);
-
-      return {
-        ok: true,
-        room: eventResult.room
-      } as const;
-    });
+    return { ok: true, room: commandResult.room };
   }
 
   private broadcastRoomSnapshot(
@@ -1815,43 +1756,6 @@ function generateRoundId(): string {
   return crypto.randomUUID();
 }
 
-function shouldGenerateItemAfterCommand(
-  command: DecodedRoomCommand,
-  room: RoomState
-): boolean {
-  return (
-    command.type === "START_ROOM" ||
-    command.type === "ADVANCE_ROUND"
-  ) &&
-    room.lifecycle === "active" &&
-    room.game.phase === "generatingItem";
-}
-
-function generationTargetForRoom(room: RoomState): PendingItemGeneration {
-  if (room.lifecycle !== "active" || room.game.phase !== "generatingItem") {
-    throw new Error("Generation target requires an active generating room.");
-  }
-
-  return {
-    roomId: room.id,
-    revision: room.revision,
-    roundNumber: room.game.roundNumber,
-    mode: room.game.mode
-  };
-}
-
-function samePendingGeneration(
-  room: RoomState,
-  target: PendingItemGeneration
-): boolean {
-  return room.id === target.roomId &&
-    room.revision === target.revision &&
-    room.lifecycle === "active" &&
-    room.game.phase === "generatingItem" &&
-    room.game.roundNumber === target.roundNumber &&
-    room.game.mode === target.mode;
-}
-
 function decodeRoomCommandText(
   text: string,
   nowMs: UnixTimeMs
@@ -2279,11 +2183,31 @@ function turnDeadlineForRoom(room: RoomState): UnixTimeMs | null {
 /**
  * The public item attached to the round the given room state is in: deck
  * fields from the pure modulo seam (D3), round_id freshly minted per round.
- * Used by receiveDeckItem when a round opens.
+ * Composed into ITEM_RECEIVED inside the same transaction that opened the
+ * round (see applyDecodedRoomCommand).
+ */
+
+function isGeneratingActiveRoom(
+  room: RoomState
+): room is RoomState & { game: GeneratingItemGameState } {
+  return room.lifecycle === "active" && room.game.phase === "generatingItem";
+}
+
+/**
+ * The public item attached to the round the given room state is in: deck
+ * fields from the pure modulo seam (D3), round_id freshly minted per round.
+ * Composed into ITEM_RECEIVED inside the same transaction that opened the
+ * round (see applyDecodedRoomCommand). The deck's private true_value is
+ * deliberately omitted here - it is recomputed at settle time by
+ * settledDeckItemForRoom instead of being carried on the public item.
  */
 function deckItemForRound(room: RoomState): GeneratedItem {
+  const deckItem = itemForRound(room.game.mode, room.game.roundNumber);
+
   return {
-    ...itemForRound(room.game.mode, room.game.roundNumber),
+    item_title: deckItem.item_title,
+    category: deckItem.category,
+    context_clue: deckItem.context_clue,
     round_id: generateRoundId()
   };
 }
@@ -2515,6 +2439,12 @@ function invalidProtocolRequest<T>(
 function statusForStoredRoomLoadFailure(
   result: Exclude<StoredRoomLoadResult, { ok: true }>
 ): number {
+  if (result.error.code === "persistence_version_unsupported") {
+    // Same rationale as statusForDomainError: a hard persistence cutover is
+    // a planned invalidation, not a server bug.
+    return 410;
+  }
+
   switch (result.reason) {
     case "missing":
       return 404;
