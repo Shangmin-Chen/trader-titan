@@ -27,7 +27,7 @@ The room domain models a private two-player game room. A room has exactly one ho
 
 Reset returns the room to `lobby`, clears the guest seat, and frees the guest slot for a new invite join. Kick removes the guest, returns the room to `lobby`, and also frees the guest slot.
 
-Reset and kick are otherwise unrestricted host-control commands, but both are rejected with `round_settling` while the active game is in the `settling` phase, and the room state is preserved. A trade's outcome is already fixed the instant `EXECUTE_TRADE` commits (the private true value was fixed when the item was generated; only the reveal and score update are still pending), so allowing either command mid-settle would let a host who is also this round's trader duck an unfavorable outcome by discarding the room before it resolves - and since reset/kick also delete the round's private item, the guest would never even learn what the outcome would have been. The same guard covers an F-06 forced-timeout settlement, which also lands in `settling`. Every other active phase - including `choosingSide` before a side is taken, `settlement` after the outcome is revealed, `roundForfeited`, and the terminal `error` phase an F-07 capped settlement failure ends in - leaves reset and kick fully available, so a genuinely abandoned guest or a stuck room is never unrecoverable. See Settlement below for how a room stuck in `settling` leaves that phase without reset or kick.
+Reset and kick are otherwise unrestricted host-control commands: they are valid in every phase the reducer accepts. There is no durable `settling` phase for a guard to protect - settlement now resolves synchronously inside the same storage transaction that commits `EXECUTE_TRADE`, so by the time any command response or public snapshot is observable the round's outcome is already computed and revealed. No mid-settle window exists in which discarding the room could hide the outcome from either player, so no special guard is needed.
 
 Starting a room requires a guest seat, but not live Player B presence: `START_ROOM` succeeds even while a joined guest has no live socket.
 
@@ -67,9 +67,7 @@ The F-06 bounce-back keeps a round self-healing, but nothing in F-06 itself limi
 
 ## Settlement
 
-Room settlement is server-authoritative. The room layer computes settlement from the active settling state and the private settled item value; callers cannot provide score-affecting settlement data.
-
-If the settlement effect that normally follows an `EXECUTE_TRADE` transition never runs, the room can remain durably in `settling`. The host can recover it with `RETRY_ITEM_GENERATION`, which re-runs settlement for the current round from the already-committed item, quote, and side. Settlement is a pure function of those three values, so retrying cannot change the outcome or restart the round. If settlement instead keeps failing outright for the same round, F-07 above bounds how many times it will retry before giving up.
+Room settlement is server-authoritative. `EXECUTE_TRADE` commits the `choosingSide` -> `settlement` transition atomically in a single storage transaction: the room layer derives the round's true value from the static deck (keyed by the active `round_id`), computes zero-sum PnL from it, persists once, and broadcasts once. Callers cannot provide score-affecting settlement data. Because nothing in the settlement path is asynchronous, there is no retry path - no durable `settling` state and no separate settlement effect that could fail after the trade commits.
 
 ## Persistence And Privacy
 
