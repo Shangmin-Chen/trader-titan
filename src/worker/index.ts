@@ -1251,13 +1251,13 @@ export class GameRoomDurableObject extends DurableObject<Cloudflare.Env> {
    * Earliest time at which some currently-connected room socket would go
    * stale if it received no further auto-response before then, or `null`
    * if there is nothing to watch (no live sockets right now). Recomputed
-   * from live socket state on every call rather than cached/persisted, so
-   * once the last socket disconnects this naturally stops contributing a
-   * deadline at all: scheduleNextAlarm() then arms only the TTL/pending-
-   * effect deadline, and the DO stops waking for liveness purposes until a
-   * new socket connects - this is how an idle (fully vacant) room settles
-   * back to quiescence instead of re-arming a liveness check forever.
-   */
+    * from live socket state on every call rather than cached/persisted, so
+    * once the last socket disconnects this naturally stops contributing a
+    * deadline at all: scheduleNextAlarm() then arms only the TTL/turn-
+    * clock deadline, and the DO stops waking for liveness purposes until a
+    * new socket connects - this is how an idle (fully vacant) room settles
+    * back to quiescence instead of re-arming a liveness check forever.
+    */
   private nextLivenessSweepDeadline(nowMs: UnixTimeMs): UnixTimeMs | null {
     let earliest: UnixTimeMs | null = null;
 
@@ -2179,13 +2179,6 @@ function turnDeadlineForRoom(room: RoomState): UnixTimeMs | null {
       return null;
   }
 }
-
-/**
- * The public item attached to the round the given room state is in: deck
- * fields from the pure modulo seam (D3), round_id freshly minted per round.
- * Composed into ITEM_RECEIVED inside the same transaction that opened the
- * round (see applyDecodedRoomCommand).
- */
 
 function isGeneratingActiveRoom(
   room: RoomState
