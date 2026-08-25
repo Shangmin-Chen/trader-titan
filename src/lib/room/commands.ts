@@ -3,20 +3,15 @@ import {
   gameReducer,
   startGame as startGameReducer,
 } from "../game/reducer";
-import { calculateSettlement, resolvePendingTradeSide } from "../game/settlement";
-import {
-  CHOOSING_SIDE_TURN_DURATION_MS,
-  CONFIGURING_MARKET_TURN_DURATION_MS,
-  NEGOTIATING_WIDTH_TURN_DURATION_MS,
-  PROPOSING_WIDTH_TURN_DURATION_MS,
-  type GameAction,
-  type GamePhase,
-  type GameState,
-  type GeneratedItem,
-  type PlayerId,
-  type Quote,
-  type SettledGeneratedItem,
-  type TradeSide,
+import { calculateSettlement } from "../game/settlement";
+import type {
+  GameAction,
+  GameState,
+  GeneratedItem,
+  PlayerId,
+  Quote,
+  SettledGeneratedItem,
+  TradeSide,
 } from "../game/types";
 import { validateStartGame } from "../game/validation";
 import { authorizeRoomAction } from "./authorization";
@@ -295,7 +290,7 @@ export function receiveRoomItem(
 
   return applySystemGameAction(
     room,
-    { type: "ITEM_RECEIVED", item, turnDeadlineMs: nowMs + PROPOSING_WIDTH_TURN_DURATION_MS },
+    { type: "ITEM_RECEIVED", item },
     nowMs,
   );
 }
@@ -309,11 +304,7 @@ export function submitInitialWidth(
     room,
     input,
     expectedPlayer(room.game, "SUBMIT_INITIAL_WIDTH"),
-    {
-      type: "SUBMIT_INITIAL_WIDTH",
-      width,
-      turnDeadlineMs: input.nowMs + NEGOTIATING_WIDTH_TURN_DURATION_MS,
-    },
+    { type: "SUBMIT_INITIAL_WIDTH", width },
   );
 }
 
@@ -326,11 +317,7 @@ export function tightenWidth(
     room,
     input,
     expectedPlayer(room.game, "TIGHTEN_WIDTH"),
-    {
-      type: "TIGHTEN_WIDTH",
-      width,
-      turnDeadlineMs: input.nowMs + NEGOTIATING_WIDTH_TURN_DURATION_MS,
-    },
+    { type: "TIGHTEN_WIDTH", width },
   );
 }
 
@@ -342,10 +329,7 @@ export function tradeOnWidth(
     room,
     input,
     expectedPlayer(room.game, "TRADE_ON_WIDTH"),
-    {
-      type: "TRADE_ON_WIDTH",
-      turnDeadlineMs: input.nowMs + CONFIGURING_MARKET_TURN_DURATION_MS,
-    },
+    { type: "TRADE_ON_WIDTH" },
   );
 }
 
@@ -358,11 +342,7 @@ export function submitMarketQuote(
     room,
     input,
     expectedPlayer(room.game, "SUBMIT_MARKET_QUOTE"),
-    {
-      type: "SUBMIT_MARKET_QUOTE",
-      quote,
-      turnDeadlineMs: input.nowMs + CHOOSING_SIDE_TURN_DURATION_MS,
-    },
+    { type: "SUBMIT_MARKET_QUOTE", quote },
   );
 }
 
@@ -392,20 +372,15 @@ export function receiveRoomSettlement(
     return commandFailure(room, "invalid_game_phase", "Settlements can only be received while the room is settling.");
   }
 
-  // F-06: pendingTrade is either a trader's own EXECUTE_TRADE choice or a
-  // choosingSide clock expiry deferred here specifically because this is the
-  // one place the private true_value (from `item`) and the pending decision
-  // are both in scope at once - see resolvePendingTradeSide and
-  // PendingTradeDecision.
-  const side = resolvePendingTradeSide(room.game.pendingTrade, room.game.quote, item.true_value);
+  // pendingTrade is the trader's own EXECUTE_TRADE side, chosen at
+  // choosingSide and settled here now that the private true_value is known.
   const settlement = calculateSettlement({
     roundNumber: room.game.roundNumber,
     itemTitle: room.game.item.item_title,
     trueValue: item.true_value,
     quote: room.game.quote,
-    side,
+    side: room.game.pendingTrade,
     roles: room.game.roles,
-    forcedByTimeout: room.game.pendingTrade.kind === "timeoutForcedWorstSide",
   });
 
   return applySystemGameAction(
@@ -413,35 +388,6 @@ export function receiveRoomSettlement(
     { type: "SETTLEMENT_RECEIVED", item, settlement },
     nowMs,
   );
-}
-
-/**
- * F-05: the Worker alarm dispatches this when a phase's turnDeadlineMs
- * elapses (see scheduleNextAlarm / alarm() in src/worker/index.ts). Routed
- * through the reducer exactly like receiveRoomSettlement routes
- * SETTLEMENT_RECEIVED, so the FSM stays the single source of truth: a
- * late-arriving player command against a room already moved on - to
- * roundForfeited for proposingWidth/negotiatingWidth/configuringMarket, or
- * to settling for an F-06 choosingSide timeout - is a harmless no-op via the
- * same phase guard every other command already relies on.
- */
-export function expireRoomTurn(
-  room: RoomState,
-  nowMs: UnixTimeMs,
-): RoomCommandResult {
-  if (room.lifecycle !== "active") {
-    return commandFailure(room, "room_not_active", "Turn expiry can only apply to active rooms.");
-  }
-
-  if (!isTurnClockedPhase(room.game.phase)) {
-    return commandFailure(
-      room,
-      "invalid_game_phase",
-      "Turn expiry can only apply while a player is on the clock.",
-    );
-  }
-
-  return applySystemGameAction(room, { type: "TURN_EXPIRED" }, nowMs);
 }
 
 export function advanceRoomRound(
@@ -463,11 +409,11 @@ export function advanceRoomRound(
     return commandFailure(room, "room_not_active", "Only active rooms can advance rounds.");
   }
 
-  if (room.game.phase !== "settlement" && room.game.phase !== "roundForfeited") {
+  if (room.game.phase !== "settlement") {
     return commandFailure(
       room,
       "invalid_game_phase",
-      "Rounds can only advance after settlement or a round forfeit.",
+      "Rounds can only advance after settlement.",
     );
   }
 
@@ -552,15 +498,6 @@ function expectedPlayer(game: GameState, actionType: GameAction["type"]): Player
 
 function lifecycleForGame(game: GameState): RoomState["lifecycle"] {
   return game.phase === "gameOver" ? "finished" : "active";
-}
-
-function isTurnClockedPhase(phase: GamePhase): boolean {
-  return (
-    phase === "proposingWidth" ||
-    phase === "negotiatingWidth" ||
-    phase === "configuringMarket" ||
-    phase === "choosingSide"
-  );
 }
 
 function buildLobbyGame(

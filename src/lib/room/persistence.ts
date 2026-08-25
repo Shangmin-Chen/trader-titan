@@ -9,7 +9,6 @@ import {
   type ProviderGeneratedItem,
   type Quote,
   type Roles,
-  type RoundForfeit,
   type RoundLogEntry,
   type RoundSettlement,
   type Scores,
@@ -52,16 +51,17 @@ export const FINISHED_ROOM_TTL_MS =
   FINISHED_ROOM_MINUTES * SECONDS_PER_MINUTE * MILLISECONDS_PER_SECOND;
 
 export const ROOM_PERSISTENCE_KIND = "trader-titan.room";
-export const ROOM_PERSISTENCE_VERSION = 5;
+export const ROOM_PERSISTENCE_VERSION = 6;
 
 /**
  * Hard persistence cutover (decision D2): the oldest envelope version this
- * decoder accepts equals ROOM_PERSISTENCE_VERSION. Version 5 is the first
- * shape without the provider-failure machinery: the `generatingItem`,
- * `settling`, and `error` phases stopped being persistable (synchronous
- * settlement composes straight through `settling` in one Worker storage
- * transaction, and nothing produces `error` anymore), and the F-07 bounce
- * fields left `choosingSide` with them.
+ * decoder accepts equals ROOM_PERSISTENCE_VERSION. Version 6 is the first
+ * shape without the shot-clock layer: `roundForfeited` stopped being a
+ * persistable phase, `turnDeadlineMs` left every actionable phase, and
+ * forfeit/forced-timeout fields (`RoundForfeit`,
+ * `RoundSettlement.forcedByTimeout`) no longer exist. Version 5 before it
+ * dropped the provider-failure machinery (`generatingItem`, `settling`, and
+ * `error` phases, plus the F-07 bounce fields on `choosingSide`).
  * Any older envelope fails decode (persistence_version_unsupported) and the
  * room's self-heal paths purge it, after which the room reads as
  * never-created. Blast radius per deploy: rooms live in the ≤2 h TTL window.
@@ -70,7 +70,7 @@ export const ROOM_PERSISTENCE_VERSION = 5;
  * with MIN_SUPPORTED moved up to match - no cross-version migration is
  * written at any point.
  */
-const ROOM_PERSISTENCE_MIN_SUPPORTED_VERSION = 5;
+const ROOM_PERSISTENCE_MIN_SUPPORTED_VERSION = 6;
 
 export type PersistedRoomEnvelope = Readonly<{
   kind: typeof ROOM_PERSISTENCE_KIND;
@@ -259,18 +259,16 @@ function decodeGameState(value: unknown): GameState | null {
     case "setup":
       return hasOnlyKeys(value, baseGameKeysFor(value)) ? value as GameState : null;
     case "proposingWidth":
-      return hasOnlyKeys(value, [...baseGameKeysFor(value), "item", "turnDeadlineMs"]) &&
+      return hasOnlyKeys(value, [...baseGameKeysFor(value), "item"]) &&
         isGeneratedItem(value.item) &&
-        isUnixTimeMs(value.turnDeadlineMs) &&
         isActiveRoundNumber(value)
         ? value as GameState
         : null;
     case "negotiatingWidth":
     case "configuringMarket":
-      return hasOnlyKeys(value, [...baseGameKeysFor(value), "item", "spreadWidth", "turnDeadlineMs"]) &&
+      return hasOnlyKeys(value, [...baseGameKeysFor(value), "item", "spreadWidth"]) &&
         isGeneratedItem(value.item) &&
         isValidSpreadWidth(value.spreadWidth) &&
-        isUnixTimeMs(value.turnDeadlineMs) &&
         isActiveRoundNumber(value)
         ? value as GameState
         : null;
@@ -280,12 +278,10 @@ function decodeGameState(value: unknown): GameState | null {
         "item",
         "spreadWidth",
         "quote",
-        "turnDeadlineMs",
       ]) &&
         isGeneratedItem(value.item) &&
         isValidSpreadWidth(value.spreadWidth) &&
         isQuoteForWidth(value.quote, value.spreadWidth) &&
-        isUnixTimeMs(value.turnDeadlineMs) &&
         isActiveRoundNumber(value)
         ? value as GameState
         : null;
@@ -293,7 +289,8 @@ function decodeGameState(value: unknown): GameState | null {
     // synchronous-deck / synchronous-settlement cutovers: no committed room
     // state ever carries them anymore, so a persisted envelope that does is
     // rejected outright (and, being un-decodable, purges on first touch).
-    // The `error` phase died with the provider-failure machinery.
+    // The `error` phase died with the provider-failure machinery, and the
+    // `roundForfeited` phase died with the shot-clock layer (v6).
     case "settlement":
       return hasOnlyKeys(value, [...baseGameKeysFor(value), "item", "spreadWidth", "quote", "settlement"]) &&
         isSettledGeneratedItem(value.item) &&
@@ -302,12 +299,6 @@ function decodeGameState(value: unknown): GameState | null {
         isRoundSettlement(value.settlement) &&
         isActiveRoundNumber(value) &&
         isSettlementConsistent(value)
-        ? value as GameState
-        : null;
-    case "roundForfeited":
-      return hasOnlyKeys(value, [...baseGameKeysFor(value), "forfeit"]) &&
-        isRoundForfeit(value.forfeit) &&
-        isActiveRoundNumber(value)
         ? value as GameState
         : null;
     case "gameOver":
@@ -445,19 +436,7 @@ function isRoundSettlement(value: unknown): value is RoundSettlement {
     isPlayerId(value.marketMaker) &&
     value.trader !== value.marketMaker &&
     isFiniteNumber(value.traderPnL) &&
-    isFiniteNumber(value.marketMakerPnL) &&
-    typeof value.forcedByTimeout === "boolean";
-}
-
-function isRoundForfeit(value: unknown): value is RoundForfeit {
-  return isRecord(value) &&
-    isPositiveInteger(value.roundNumber) &&
-    typeof value.itemTitle === "string" &&
-    isGamePhase(value.phase) &&
-    isPlayerId(value.forfeitedBy) &&
-    isPlayerId(value.awardedTo) &&
-    value.forfeitedBy !== value.awardedTo &&
-    isFiniteNumber(value.penalty);
+    isFiniteNumber(value.marketMakerPnL);
 }
 
 function isSettlementConsistent(value: Record<string, unknown>): boolean {
@@ -480,7 +459,6 @@ function isSettlementConsistent(value: Record<string, unknown>): boolean {
     quote: value.quote,
     side: settlement.side,
     roles: value.roles,
-    forcedByTimeout: settlement.forcedByTimeout,
   });
 
   return roundSettlementsEqual(settlement, expected);
@@ -498,8 +476,7 @@ function roundSettlementsEqual(
     left.trader === right.trader &&
     left.marketMaker === right.marketMaker &&
     left.traderPnL === right.traderPnL &&
-    left.marketMakerPnL === right.marketMakerPnL &&
-    left.forcedByTimeout === right.forcedByTimeout;
+    left.marketMakerPnL === right.marketMakerPnL;
 }
 
 function decodeTokenHash(value: unknown): TokenHash | null {
@@ -522,7 +499,6 @@ function isGamePhase(value: unknown): value is GamePhase {
       value === "choosingSide" ||
       value === "settling" ||
       value === "settlement" ||
-      value === "roundForfeited" ||
       value === "gameOver"
     );
 }

@@ -2,7 +2,6 @@ import {
   advanceRoomRound,
   configureRoom,
   executeTrade,
-  expireRoomTurn,
   joinRoom,
   kickGuest,
   receiveRoomItem,
@@ -117,8 +116,6 @@ export function dispatchSystemRoomEvent(
       return receiveRoomItem(room, event.item, event.nowMs);
     case "SETTLEMENT_RECEIVED":
       return receiveRoomSettlement(room, event.item, event.nowMs);
-    case "TURN_EXPIRED":
-      return expireRoomTurn(room, event.nowMs);
     default:
       return assertNever(event);
   }
