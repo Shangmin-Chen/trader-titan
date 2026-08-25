@@ -113,6 +113,17 @@ describe("room protocol", () => {
         },
         code: "command_id_invalid",
       },
+      {
+        // Retired command (Phase 3): synchronous settlement removed the
+        // retry affordance entirely, so an old client POSTing it gets a
+        // decode error rather than a dispatch.
+        value: {
+          type: "RETRY_ITEM_GENERATION",
+          credential,
+          commandId: "command-retry-item-generation-retired",
+        },
+        code: "message_type_unknown",
+      },
     ] as const;
 
     for (const testCase of cases) {
@@ -138,27 +149,6 @@ describe("room protocol", () => {
 
     expect("settlement" in event).toBe(false);
     expect(typeCheck).toBe(false);
-  });
-
-  it("decodes retry item generation as a host room command", () => {
-    const result = parseClientRoomCommand(
-      {
-        type: "RETRY_ITEM_GENERATION",
-        credential,
-        commandId: "command-retry-item-generation-1",
-      },
-      NOW_MS,
-    );
-
-    expect(result).toEqual({
-      ok: true,
-      command: {
-        type: "RETRY_ITEM_GENERATION",
-        credential,
-        commandId: "command-retry-item-generation-1",
-        nowMs: NOW_MS,
-      },
-    });
   });
 
   it("requires a bounded, character-restricted commandId on every non-JOIN_ROOM command", () => {
