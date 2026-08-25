@@ -32,10 +32,8 @@ import {
 import {
   GAME_MODES,
   MAX_ROUNDS,
-  SETTLEMENT_FAILURE_EPISODE_CAP,
   formatGamePhase,
   formatSignedNumber,
-  formatTradeSide,
   parseNumericInput,
   validateStartGame,
   type GameMode,
@@ -55,7 +53,6 @@ import {
   clearRoomSession,
   createRoom,
   getRoomPreview,
-  ITEM_GENERATION_REQUEST_TIMEOUT_MS,
   joinRoom,
   loadRoomSession,
   openRoomSocket,
@@ -64,7 +61,6 @@ import {
   saveRoomSession,
   sendRoomCommand,
   type RoomClientCommand,
-  type RoomClientOptions,
   type RoomSession,
   type RoomSocketMessage,
 } from "../lib/room-client";
@@ -130,7 +126,6 @@ type ClientCommandInput =
   | Readonly<{ type: "RESET_TO_LOBBY" }>
   | Readonly<{ type: "KICK_GUEST" }>
   | Readonly<{ type: "ADVANCE_ROUND" }>
-  | Readonly<{ type: "RETRY_ITEM_GENERATION" }>
   | Readonly<{ type: "SUBMIT_INITIAL_WIDTH"; width: number }>
   | Readonly<{ type: "TIGHTEN_WIDTH"; width: number }>
   | Readonly<{ type: "TRADE_ON_WIDTH" }>
@@ -143,18 +138,6 @@ type ClientCommandInput =
 // (there are ~10 of them) is a compile error instead of a control that
 // silently never gets gated.
 type ClientCommandType = ClientCommandInput["type"];
-
-// START_ROOM (round 1) and RETRY_ITEM_GENERATION historically needed a
-// longer client-side timeout because their worker-side handling could run
-// real external network calls synchronously in the request path. Item
-// receipt is now a synchronous static-deck pick with no external I/O, so
-// this special-casing — and ITEM_GENERATION_REQUEST_TIMEOUT_MS in
-// room-client.ts — remains only until cleanup plan Phase 3 removes the
-// leftover item-generation plumbing.
-const ITEM_GENERATION_COMMAND_TYPES: ReadonlySet<ClientCommandType> = new Set([
-  "START_ROOM",
-  "RETRY_ITEM_GENERATION",
-]);
 
 // ---------------------------------------------------------------------------
 // Root export — wraps the tree in LiveAnnouncerProvider so every descendant
@@ -587,12 +570,6 @@ function HomeContent() {
       setPendingCommands(pendingCommandsRef.current);
       setError(null);
 
-      const commandOptions: RoomClientOptions = ITEM_GENERATION_COMMAND_TYPES.has(
-        input.type,
-      )
-        ? { signal: AbortSignal.timeout(ITEM_GENERATION_REQUEST_TIMEOUT_MS) }
-        : {};
-
       try {
         const response = await sendRoomCommand(
           activeRoom.id,
@@ -602,7 +579,6 @@ function HomeContent() {
             commandId: crypto.randomUUID(),
             nowMs: Date.now(),
           } as RoomClientCommand,
-          commandOptions,
         );
 
         applyCurrentRoomSnapshot(response.room);
@@ -865,9 +841,6 @@ function HomeContent() {
             }}
             onReset={() => {
               void runCommand({ type: "RESET_TO_LOBBY" });
-            }}
-            onRetryItemGeneration={() => {
-              void runCommand({ type: "RETRY_ITEM_GENERATION" });
             }}
             onSubmitInitialWidth={(width) => {
               void runCommand({ type: "SUBMIT_INITIAL_WIDTH", width });
@@ -1409,7 +1382,6 @@ type RoomGameViewProps = Readonly<{
   onAdvanceRound: () => void;
   onExecuteTrade: (side: TradeSide) => void;
   onReset: () => void;
-  onRetryItemGeneration: () => void;
   onSubmitInitialWidth: (width: number) => void;
   onSubmitMarketQuote: (quote: Quote) => void;
   onTightenWidth: (width: number) => void;
@@ -1424,7 +1396,6 @@ function RoomGameView({
   onAdvanceRound,
   onExecuteTrade,
   onReset,
-  onRetryItemGeneration,
   onSubmitInitialWidth,
   onSubmitMarketQuote,
   onTightenWidth,
@@ -1444,23 +1415,6 @@ function RoomGameView({
         <h2>Waiting to start</h2>
         <p>The host can start once player B joins.</p>
       </section>
-    );
-  }
-
-  if (game.phase === "generatingItem") {
-    return (
-      <>
-        {stepper}
-        <section className="phase-panel" data-testid="generation-panel">
-          <p className="eyebrow">Generating item</p>
-          <h2>Preparing a quantitative market</h2>
-          <p>
-            {game.players[game.roles.marketMaker].name} will propose the first
-            spread width.
-          </p>
-          <div className="loading-line" aria-label="Loading" />
-        </section>
-      </>
     );
   }
 
@@ -1566,73 +1520,6 @@ function RoomGameView({
     const waitingForName = !isYourTurn
       ? game.players[game.roles.trader].name
       : undefined;
-    const traderName = game.players[game.roles.trader].name;
-
-    // F-02/F-06: a settlement failure bounced this round back out of
-    // `settling` with a pendingTrade already locked in (see
-    // lockedPendingTrade's doc comment). Buy/Sell must not be shown as a
-    // live choice here - whichever button is clicked, the server ignores
-    // it and retries the same already-decided side, so presenting them as
-    // meaningfully different would be dishonest.
-    if (game.lockedPendingTrade) {
-      const lockedTrade = game.lockedPendingTrade;
-      // F-07: how many settling episodes have already failed for this
-      // round (see settlementFailureCount on ChoosingSideGameState). Always
-      // set alongside lockedPendingTrade - the `?? 0` is only a defensive
-      // fallback, not an expected case - and always strictly less than
-      // SETTLEMENT_FAILURE_EPISODE_CAP: reaching the cap routes to the
-      // terminal `error` phase instead, which renders a different panel
-      // entirely (see the fallback error-panel branch below).
-      const failureCount = game.settlementFailureCount ?? 0;
-
-      return (
-        <>
-          {stepper}
-          <TurnBanner isYourTurn={isYourTurn} waitingForName={waitingForName} />
-          <TurnCountdown turnDeadlineMs={game.turnDeadlineMs} />
-          <div className="play-stack">
-            <ItemPanel item={game.item} />
-            <section className="phase-panel" data-testid="settlement-retry-panel">
-              <p className="eyebrow">Settlement failed</p>
-              <h2>Retrying {traderName}&rsquo;s trade</h2>
-              <p
-                className="settlement-panel__forced-note"
-                data-testid="settlement-locked-note"
-              >
-                {lockedTrade.kind === "chosen"
-                  ? `${traderName}'s trade already went through, but settling it failed. `
-                  : `${traderName}'s clock ran out before choosing a side, and settling the forced side failed. `}
-                The decision is locked in - retrying will not let {traderName}{" "}
-                choose a different side, and the clock will retry
-                automatically if it runs out again. This round has failed to
-                settle {failureCount}{" "}
-                {failureCount === 1 ? "time" : "times"} so far; if it fails{" "}
-                {SETTLEMENT_FAILURE_EPISODE_CAP} times in a row it will stop
-                retrying and the host will need to reset the lobby.
-              </p>
-              <div className="room-actions">
-                {/* The side argument is a placeholder: the reducer ignores
-                    it entirely while lockedPendingTrade is set and re-uses
-                    the locked decision instead (see EXECUTE_TRADE in
-                    reducer.ts), so this button just triggers a retry
-                    attempt rather than making any real choice. */}
-                <button
-                  className="secondary-button"
-                  disabled={
-                    isCommandPending("EXECUTE_TRADE") || actor !== game.roles.trader
-                  }
-                  onClick={() => onExecuteTrade("BUY")}
-                  type="button"
-                >
-                  Retry settlement
-                </button>
-              </div>
-              <LastError game={game} />
-            </section>
-          </div>
-        </>
-      );
-    }
 
     return (
       <>
@@ -1652,61 +1539,6 @@ function RoomGameView({
             roles={game.roles}
           />
           <LastError game={game} />
-        </div>
-      </>
-    );
-  }
-
-  if (game.phase === "settling") {
-    const canRetry = canRetryItemGeneration(game, isHost);
-
-    return (
-      <>
-        {stepper}
-        <div className="play-stack">
-          <ItemPanel item={game.item} />
-          <section className="phase-panel" data-testid="settling-panel">
-            <p className="eyebrow">Settling trade</p>
-            {game.pendingTrade.kind === "chosen" ? (
-              <>
-                <h2>
-                  {game.players[game.roles.trader].name} chose{" "}
-                  {formatTradeSide(game.pendingTrade.side)}
-                </h2>
-                <p>The server is revealing the true value and computing PnL.</p>
-              </>
-            ) : (
-              <>
-                <h2>{game.players[game.roles.trader].name} ran out of time</h2>
-                <p
-                  className="settlement-panel__forced-note"
-                  data-testid="settling-forced-note"
-                >
-                  The clock expired before a side was chosen, so the round
-                  will settle against whichever side is worse for{" "}
-                  {game.players[game.roles.trader].name}.
-                </p>
-              </>
-            )}
-            <div className="loading-line" aria-label="Loading" />
-            {canRetry ? (
-              <div className="room-actions">
-                <p>
-                  Taking a while? The round may be stuck. Retrying safely
-                  re-settles this round from the trade already made - it
-                  cannot change the outcome or the score.
-                </p>
-                <button
-                  className="secondary-button"
-                  disabled={isCommandPending("RETRY_ITEM_GENERATION")}
-                  onClick={onRetryItemGeneration}
-                  type="button"
-                >
-                  Retry settlement
-                </button>
-              </div>
-            ) : null}
-          </section>
         </div>
       </>
     );
@@ -1801,58 +1633,7 @@ function RoomGameView({
     );
   }
 
-  const canRetry = canRetryItemGeneration(game, isHost);
-  // F-07: a settlement that failed SETTLEMENT_FAILURE_EPISODE_CAP times in a
-  // row for the same round lands here with previousPhase "settling" instead
-  // of "generatingItem" - see the terminal branch of SETTLEMENT_FAILED in
-  // reducer.ts. Unlike an item-generation error (transient, and retryable
-  // via canRetry above), this is a permanent give-up: there is no
-  // RoundSettlement and no true_value to fall back on, so the copy must say
-  // so plainly instead of reusing the generic "Game error" wording that a
-  // host has already seen mean "retry and it'll probably work."
-  const isPermanentSettlementFailure = game.previousPhase === "settling";
-
-  return (
-    <section className="phase-panel" data-testid="error-panel">
-      <p className="eyebrow">
-        {isPermanentSettlementFailure ? "Settlement failed permanently" : "Game error"}
-      </p>
-      <h2>
-        {isPermanentSettlementFailure
-          ? "This round could not be settled"
-          : "Round stopped"}
-      </h2>
-      <p>{game.error}</p>
-      {isPermanentSettlementFailure ? (
-        <p data-testid="settlement-permanently-failed-note">
-          Automatic retries were exhausted for this round. It cannot be
-          resumed - the host can only reset the lobby.
-        </p>
-      ) : null}
-      {isHost ? (
-        <div className="room-actions">
-          {canRetry ? (
-            <button
-              className="primary-button"
-              disabled={isCommandPending("RETRY_ITEM_GENERATION")}
-              onClick={onRetryItemGeneration}
-              type="button"
-            >
-              Retry generation
-            </button>
-          ) : null}
-          <button
-            className={canRetry ? "secondary-button" : "primary-button"}
-            disabled={isCommandPending("RESET_TO_LOBBY")}
-            onClick={onReset}
-            type="button"
-          >
-            Reset lobby
-          </button>
-        </div>
-      ) : null}
-    </section>
-  );
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1953,43 +1734,14 @@ function publicRoomStateWithoutPresenceJson(room: PublicRoomSnapshot): string {
 }
 
 /**
- * F-02 mitigation: also true while the room is durably stuck in `settling`
- * (EXECUTE_TRADE committed the transition, but the settlement effect that
- * should follow it never ran). The host's RETRY_ITEM_GENERATION command
- * covers both cases server-side; this predicate must match that widened
- * guard so the retry control actually appears for a settling failure, not
- * just an item-generation failure. See retryRoomItemGeneration in
- * src/lib/room/commands.ts.
- */
-/**
- * Server-side, `settlingRoundFailure` in src/lib/room/commands.ts already
- * rejects RESET_TO_LOBBY/KICK_GUEST while the room is `settling`: the
- * trade's outcome is already fixed at that point (true_value was set back
- * when the item was generated) but not yet revealed or scored, so allowing
- * either command there would let a host-as-trader duck a bad outcome by
- * nuking the room before it resolves - and the guest would never even learn
- * what it would have been. This predicate only keeps the controls from
- * offering an action the server will reject; it must match that guard
- * exactly; it does not add any additional restriction of its own; every
- * other phase (including before a trade is executed, and after settlement
- * has resolved) leaves the controls enabled.
+ * True when the host controls ("Reset lobby"/"Kick guest") may be offered
+ * for the current game state. Blocks only the transient in-memory `settling`
+ * window, mirroring the server-side guard that rejects aborts while a trade
+ * outcome is mid-settlement; kept until Phase 4 removes the transient phase
+ * machinery.
  */
 export function canAbortRound(game: PublicRoomGameState | null): boolean {
   return game === null || game.phase !== "settling";
-}
-
-export function canRetryItemGeneration(
-  game: PublicRoomGameState,
-  isHost: boolean,
-): boolean {
-  if (!isHost) {
-    return false;
-  }
-
-  return (
-    (game.phase === "error" && game.previousPhase === "generatingItem") ||
-    game.phase === "settling"
-  );
 }
 
 type ExistingRoomCreateStateAccess = (
