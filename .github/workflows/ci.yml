@@ -108,10 +108,10 @@ jobs:
         if: steps.pw-cache.outputs.cache-hit == 'true'
 
       # playwright.config.ts starts its own server via `webServer`
-      # (`npm run build:cloudflare && wrangler dev ... --port 8787`) and passes
-      # `--var WORKER_TEST_MODE:1`, so the test-only clock route is reachable.
-      # Items come from config/static-markets.json, so no external API key is
-      # required and no secret blanking/scanning step is needed for the build.
+      # (`npm run build:cloudflare && wrangler dev ... --port 8787`), so no
+      # separately deployed worker is needed. Items come from
+      # config/static-markets.json, so no external API key is required and no
+      # secret blanking/scanning step is needed for the build.
       #
       # Only chromium runs here. The mobile-chrome project uses the same engine
       # and only changes viewport, so it doubles the wall clock for very little
