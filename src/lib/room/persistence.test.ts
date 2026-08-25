@@ -3,7 +3,6 @@ import {
   FINISHED_ROOM_TTL_MS,
   createLobbyRoom,
   executeTrade,
-  expireRoomTurn,
   isRoomExpired,
   joinRoom,
   loadPersistenceEnvelope,
@@ -11,7 +10,6 @@ import {
   parseRoomId,
   parseTokenHash,
   receiveRoomItem,
-  receiveRoomSettlement,
   roomExpiresAtMs,
   startRoom,
   submitInitialWidth,
@@ -118,12 +116,13 @@ describe("room persistence", () => {
     const { room } = joinedRoom();
     const envelope = toPersistenceEnvelope(room, NOW_MS + 2);
 
-    // Only the current version (5) is supported: the v1→v3 migration chain
-    // was deleted with the v4 hard cutover, and v5 dropped the persistable
-    // provider-failure phases/keys, so every older envelope fails decode
-    // and the room self-heals as never-created. A future version this build
-    // predates is likewise rejected.
-    for (const badVersion of [6, 4, 3, 2, 1, 0, -1]) {
+    // Only the current version (6) is supported: the v1→v3 migration chain
+    // was deleted with the v4 hard cutover, v5 dropped the persistable
+    // provider-failure phases/keys, and v6 dropped the shot-clock layer
+    // (the roundForfeited phase and turnDeadlineMs), so every older envelope
+    // fails decode and the room self-heals as never-created. A future
+    // version this build predates is likewise rejected.
+    for (const badVersion of [7, 5, 4, 3, 2, 1, 0, -1]) {
       expect(loadPersistenceEnvelope({ ...envelope, version: badVersion }, envelope.expiresAtMs - 1)).toEqual({
         ok: false,
         error: {
@@ -197,12 +196,14 @@ describe("room persistence", () => {
     });
   });
 
-  // Phase 3 (synchronous settlement) + v5 cutover: `generatingItem`,
-  // `settling`, and `error` are no longer persistable phases at all. A
-  // committed room never carries them, so a planted envelope that does is
-  // rejected outright - and, being un-decodable, purges on first touch
-  // (see the worker-level cutover regression for the end-to-end purge).
-  it("rejects transient-only generatingItem and settling phases, and the retired error phase", () => {
+  // Phase 4 (shot-clock cut) + v6 cutover: `roundForfeited` is no longer a
+  // persistable phase and `turnDeadlineMs` left every actionable phase, and
+  // Phase 3 (synchronous settlement) + v5 already made `generatingItem`,
+  // `settling`, and `error` unpersistable. A committed room never carries
+  // them, so a planted envelope that does is rejected outright - and, being
+  // un-decodable, purges on first touch (see the worker-level cutover
+  // regression for the end-to-end purge).
+  it("rejects transient-only generatingItem and settling phases, and the retired error and roundForfeited phases", () => {
     const { room, hostToken, guestToken } = joinedRoom();
     const settling = settlingRoomChosen(room, hostToken, guestToken);
     const settlingEnvelope = toPersistenceEnvelope(settling, NOW_MS + 12);
@@ -259,96 +260,31 @@ describe("room persistence", () => {
         message: "Room persistence envelope is invalid.",
       },
     });
-  });
 
-  it("round-trips a forced settlement (F-06) with forcedByTimeout intact", () => {
-    const { room, hostToken, guestToken } = joinedRoom();
-    const settling = settlingRoomForcedByTimeout(room, hostToken, guestToken);
-
-    if (settling.game.phase !== "settling") {
-      throw new Error("Expected settling phase.");
-    }
-
-    const settled = normalizeForPersistence(
-      expectOk(
-        receiveRoomSettlement(
-          settling,
-          { ...settling.game.item, true_value: 3600 },
-          NOW_MS + 9,
-        ),
-      ),
-    );
-
-    expect(settled.game.phase).toBe("settlement");
-
-    if (settled.game.phase !== "settlement") {
-      throw new Error("Expected settlement phase.");
-    }
-    expect(settled.game.settlement.forcedByTimeout).toBe(true);
-
-    const envelope = toPersistenceEnvelope(settled, NOW_MS + 12);
-
-    expect(loadPersistenceEnvelope(envelope, envelope.expiresAtMs - 1)).toEqual({
-      ok: true,
-      room: settled,
-    });
-  });
-
-  it("rejects a settlement whose forcedByTimeout is missing or not a boolean", () => {
-    const { room, hostToken, guestToken } = joinedRoom();
-    const settling = settlingRoomForcedByTimeout(room, hostToken, guestToken);
-
-    if (settling.game.phase !== "settling") {
-      throw new Error("Expected settling phase.");
-    }
-
-    const settled = normalizeForPersistence(
-      expectOk(
-        receiveRoomSettlement(
-          settling,
-          { ...settling.game.item, true_value: 3600 },
-          NOW_MS + 9,
-        ),
-      ),
-    );
-
-    if (settled.game.phase !== "settlement") {
-      throw new Error("Expected settlement phase.");
-    }
-
-    const envelope = toPersistenceEnvelope(settled, NOW_MS + 12);
-
-    const settlementWithoutForcedByTimeout: Record<string, unknown> = {
-      ...settled.game.settlement,
+    const forfeitGame = {
+      ...normalizeForPersistence(started.room).game,
+      phase: "roundForfeited" as const,
+      forfeit: {
+        roundNumber: 1,
+        itemTitle: "Widget",
+        phase: "proposingWidth" as const,
+        forfeitedBy: "A" as const,
+        awardedTo: "B" as const,
+        penalty: 100,
+      },
     };
-    delete settlementWithoutForcedByTimeout.forcedByTimeout;
+    const forfeitEnvelope = toPersistenceEnvelope(
+      { ...started.room, game: forfeitGame as unknown as RoomState["game"] },
+      NOW_MS + 5,
+    );
 
-    for (const badSettlement of [
-      // forcedByTimeout entirely missing.
-      settlementWithoutForcedByTimeout,
-      // forcedByTimeout present but the wrong type.
-      { ...settled.game.settlement, forcedByTimeout: "true" },
-    ]) {
-      expect(loadPersistenceEnvelope(
-        {
-          ...envelope,
-          room: {
-            ...settled,
-            game: {
-              ...settled.game,
-              settlement: badSettlement,
-            },
-          },
-        },
-        envelope.expiresAtMs - 1,
-      )).toEqual({
-        ok: false,
-        error: {
-          code: "persistence_invalid",
-          message: "Room persistence envelope is invalid.",
-        },
-      });
-    }
+    expect(loadPersistenceEnvelope(forfeitEnvelope, forfeitEnvelope.expiresAtMs - 1)).toEqual({
+      ok: false,
+      error: {
+        code: "persistence_invalid",
+        message: "Room persistence envelope is invalid.",
+      },
+    });
   });
 });
 
@@ -408,48 +344,6 @@ function settlingRoomChosen(
 
   return settling as RoomState & { game: Extract<RoomState["game"], { phase: "settling" }> };
 }
-
-function settlingRoomForcedByTimeout(
-  room: RoomState,
-  hostToken: RoomCapabilityToken,
-  guestToken: RoomCapabilityToken,
-): RoomState & { game: Extract<RoomState["game"], { phase: "settling" }> } {
-  const started = expectOk(
-    startRoom(room, { credential: present(hostToken), verifyToken, nowMs: NOW_MS + 2 }),
-  );
-  const item = {
-    round_id: "round-persist-forced-settling",
-    item_title: "Widget",
-    category: "Chaos Quant",
-    context_clue: "A test item.",
-  };
-  const withItem = expectOk(receiveRoomItem(started, item, NOW_MS + 3));
-  const width = expectOk(
-    submitInitialWidth(withItem, 200, { credential: present(hostToken), verifyToken, nowMs: NOW_MS + 4 }),
-  );
-  const configuring = expectOk(
-    tradeOnWidth(width, { credential: present(guestToken), verifyToken, nowMs: NOW_MS + 5 }),
-  );
-  const choosing = expectOk(
-    submitMarketQuote(configuring, { bid: 3600, ask: 3800 }, {
-      credential: present(hostToken),
-      verifyToken,
-      nowMs: NOW_MS + 6,
-    }),
-  );
-  const settling = normalizeForPersistence(expectOk(expireRoomTurn(choosing, NOW_MS + 7)));
-
-  if (settling.game.phase !== "settling") {
-    throw new Error("Expected settling phase.");
-  }
-
-  return settling as RoomState & { game: Extract<RoomState["game"], { phase: "settling" }> };
-}
-
-
-
-
-
 
 function joinedRoom(): {
   room: RoomState;

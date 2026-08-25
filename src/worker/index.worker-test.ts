@@ -71,22 +71,11 @@ const LIVENESS_LEGACY_ATTACHMENT_REAL_PING_ROOM_NAME =
 const TIGHTEN_REPLAY_SAME_ID_ROOM_NAME = "worker-room-tighten-replay-same-id";
 const TIGHTEN_REPLAY_DIFFERENT_ID_ROOM_NAME = "worker-room-tighten-replay-different-id";
 const KICKED_GUEST_REPLAY_ROOM_NAME = "worker-room-kicked-guest-replay";
-const NEAREST_OF_THREE_ROOM_NAME = "worker-room-nearest-of-three";
 const PURGE_DEDUPE_ROOM_NAME = "worker-room-purge-dedupe";
-const TURN_EXPIRY_ALARM_ROOM_NAME = "worker-room-turn-expiry-alarm";
-const TURN_EXPIRY_TTL_ROOM_NAME = "worker-room-turn-expiry-ttl";
-const STALE_TURN_EXPIRY_ROOM_NAME = "worker-room-stale-turn-expiry";
-const CHOOSING_SIDE_TIMEOUT_BUY_WORSE_ROOM_NAME = "worker-room-choosing-side-timeout-buy-worse";
-const CHOOSING_SIDE_TIMEOUT_SELL_WORSE_ROOM_NAME = "worker-room-choosing-side-timeout-sell-worse";
-const CHOOSING_SIDE_TIMEOUT_TIE_ROOM_NAME = "worker-room-choosing-side-timeout-tie";
-const TEST_EXPIRE_TURN_GATE_ROOM_NAME = "worker-room-test-expire-turn-gate";
-const TEST_EXPIRE_TURN_CREDENTIALS_ROOM_NAME = "worker-room-test-expire-turn-credentials";
-const TEST_EXPIRE_TURN_OTHER_ROOM_NAME = "worker-room-test-expire-turn-other-room";
 const GAME_ROOM_SMOKE_URL = "https://trader-titan.worker.test/room";
 const ROOM_COMMAND_URL = `${GAME_ROOM_SMOKE_URL}/command`;
 const ROOM_JOIN_URL = `${GAME_ROOM_SMOKE_URL}/join`;
 const ROOM_SOCKET_URL = `${GAME_ROOM_SMOKE_URL}/socket`;
-const ROOM_TEST_EXPIRE_TURN_URL = `${GAME_ROOM_SMOKE_URL}/test-expire-turn`;
 const PUBLIC_ROOMS_URL = "https://trader-titan.worker.test/api/rooms";
 const TEST_ROOM_STORAGE_KEY = "room:persistence:v1";
 // Mirrors ROOM_COMMAND_DEDUPE_STORAGE_KEY in src/worker/index.ts.
@@ -287,13 +276,6 @@ describe("Cloudflare worker scaffold", () => {
         body: JSON.stringify({ type: "START_ROOM", credential: "invalid" }),
         headers,
         method: "POST"
-      }),
-      // Retired route (P1+2): unknown subpaths 404 before origin checks
-      // would even matter, but a cross-origin probe must never leak anything.
-      new Request(`${PUBLIC_ROOMS_URL}/room-cross-origin/test-expire-turn`, {
-        body: "{}",
-        headers,
-        method: "POST"
       })
     ]) {
       const response = await fetchPublicWorker(request);
@@ -302,6 +284,23 @@ describe("Cloudflare worker scaffold", () => {
       expect(response.status).toBe(HTTP_FORBIDDEN_STATUS);
       expect(rejected.error.code).toBe("origin_not_allowed");
     }
+
+    // Retired route (P4): test-expire-turn degraded into an unknown subpath,
+    // which 404s before origin checks would even matter - a cross-origin
+    // probe must learn nothing about the room, including whether the route
+    // ever existed.
+    const retiredResponse = await fetchPublicWorker(new Request(
+      `${PUBLIC_ROOMS_URL}/room-cross-origin/test-expire-turn`,
+      {
+        body: "{}",
+        headers,
+        method: "POST"
+      }
+    ));
+    const retiredRejected = await expectPublicJson<RoomErrorResponse>(retiredResponse);
+
+    expect(retiredResponse.status).toBe(HTTP_NOT_FOUND_STATUS);
+    expect(retiredRejected.error.code).toBe("not_found");
 
     const socketResponse = await fetchPublicWorker(new Request(
       `${PUBLIC_ROOMS_URL}/room-cross-origin/socket`,
@@ -1038,476 +1037,6 @@ describe("Cloudflare worker scaffold", () => {
     expect(loaded.game.phase).toBe("settlement");
   });
 
-  it("fires a due F-05 turn deadline via the alarm and forfeits the round into roundForfeited", async () => {
-    const stub = roomStub(TURN_EXPIRY_ALARM_ROOM_NAME);
-    const created = await createRoom(stub, "Host");
-
-    if (!created.created) {
-      throw new Error("Expected a newly created turn-expiry room.");
-    }
-
-    const joined = await joinRoom(stub, "Guest");
-    const guestConnection = await openRoomSocket(stub, joined.guestToken);
-    const started = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "START_ROOM",
-      credential: created.hostToken
-    });
-
-    if (started.room.game.phase !== "proposingWidth") {
-      throw new Error("Expected generated item to be ready.");
-    }
-
-    const forced = await forcePastTurnDeadline(stub);
-
-    if (forced.game.phase !== "proposingWidth") {
-      throw new Error("Expected proposingWidth after forcing the deadline.");
-    }
-
-    const { marketMaker, trader } = forced.game.roles;
-
-    // Registered before the alarm runs, mirroring how openRoomSocket itself
-    // registers its own "initial" listener before accept() - the alarm's
-    // broadcast (see runDueTurnExpiry's own broadcastRoomSnapshot call)
-    // happens synchronously inside runRoomCleanupAlarm below, so listening
-    // for it must start first or the message could already have been sent.
-    const forfeitBroadcast = nextSocketMessage<RoomSnapshotSocketMessage>(
-      guestConnection.socket
-    );
-
-    await runRoomCleanupAlarm(stub);
-
-    const resumed = await accessRoom(stub, created.hostToken);
-
-    expect(resumed.room.game.phase).toBe("roundForfeited");
-
-    if (resumed.room.game.phase !== "roundForfeited") {
-      throw new Error("Expected roundForfeited after the alarm fired.");
-    }
-    expect(resumed.room.game.forfeit).toMatchObject({
-      roundNumber: 1,
-      phase: "proposingWidth",
-      forfeitedBy: marketMaker,
-      awardedTo: trader
-    });
-    expect(resumed.room.revision).toBe(forced.revision + 1);
-
-    // The alarm-driven forfeit is not a response to any request the client
-    // is waiting on, so a connected client only ever learns about it
-    // through an explicit broadcast - closing a gap where the round
-    // genuinely forfeited and persisted correctly but a connected client's
-    // own socket never heard about it until some unrelated later command.
-    const broadcast = await forfeitBroadcast;
-
-    expect(broadcast.room.game.phase).toBe("roundForfeited");
-    expect(broadcast.room.revision).toBe(resumed.room.revision);
-
-    guestConnection.socket.close();
-  });
-
-  // F-06: closes the shot-clock exploit where a trader who reads the quote
-  // as badly mispriced against them could deliberately stall choosingSide's
-  // clock to cap their loss at the spread width instead of taking a larger
-  // settlement loss. A choosingSide timeout must settle - via the exact same
-  // settling -> SETTLEMENT_RECEIVED path EXECUTE_TRADE uses, not a
-  // roundForfeited shortcut - against whichever side is worse for the
-  // trader, so stalling can never beat acting. The static deck fixes round 1's
-  // Chaos Quant true_value at 42 for every room in this file.
-
-  it("settles a choosingSide timeout against BUY when BUY is the worse side for the trader (F-06)", async () => {
-    const stub = roomStub(CHOOSING_SIDE_TIMEOUT_BUY_WORSE_ROOM_NAME);
-    // trueValue 42, quote 40/60: buyPnL = 42-60 = -18,
-    // sellPnL = 42-40 = 2. BUY is worse.
-    const { hostToken, guestToken, quoted } = await readyChoosingSide(stub, { bid: 40, ask: 60 });
-    // Opened after the room reaches choosingSide (a socket does not need to
-    // have been present since room creation to receive a later broadcast),
-    // so runDueTurnExpiry's own broadcastRoomSnapshot call - not just the
-    // committed storage - can be asserted on below.
-    const guestConnection = await openRoomSocket(stub, guestToken);
-
-    const forced = await forcePastTurnDeadline(stub);
-
-    if (forced.game.phase !== "choosingSide") {
-      throw new Error("Expected choosingSide after forcing the deadline.");
-    }
-
-    // Registered before the alarm runs (see the identical comment on the
-    // F-05 forfeit-broadcast test above) so the listener is armed before
-    // runDueTurnExpiry's own broadcastRoomSnapshot call fires.
-    const settlementBroadcast = nextSocketMessage<RoomSnapshotSocketMessage>(
-      guestConnection.socket
-    );
-
-    await runRoomCleanupAlarm(stub);
-
-    const resumed = await accessRoom(stub, hostToken);
-
-    expect(resumed.room.game.phase).toBe("settlement");
-
-    if (resumed.room.game.phase !== "settlement") {
-      throw new Error("Expected settlement after the F-06 forced settle ran.");
-    }
-    expect(resumed.room.game.settlement.side).toBe("BUY");
-    expect(resumed.room.game.settlement.forcedByTimeout).toBe(true);
-    expect(resumed.room.game.settlement.traderPnL).toBe(-18);
-    expect(resumed.room.game.item.true_value).toBe(42);
-    expect(resumed.room.revision).toBe(quoted.room.revision + 2);
-    await expect(readCommandDedupeEntries(stub)).resolves.not.toEqual([]);
-
-    // Since synchronous settlement, TURN_EXPIRED and its composed
-    // SETTLEMENT_RECEIVED commit in ONE transaction and broadcast exactly
-    // once - already in the final settlement state. No transient settling
-    // snapshot ever reaches the client.
-    const broadcast = await settlementBroadcast;
-
-    expect(broadcast.room.game.phase).toBe("settlement");
-    expect(broadcast.room.revision).toBe(resumed.room.revision);
-
-    guestConnection.socket.close();
-  });
-
-  it("settles a choosingSide timeout against SELL when SELL is the worse side for the trader (F-06)", async () => {
-    const stub = roomStub(CHOOSING_SIDE_TIMEOUT_SELL_WORSE_ROOM_NAME);
-    // trueValue 42, quote 30/50: buyPnL = 42-50 = -8,
-    // sellPnL = 30-42 = -12. SELL is worse.
-    const { hostToken } = await readyChoosingSide(stub, { bid: 30, ask: 50 });
-
-    const forced = await forcePastTurnDeadline(stub);
-
-    if (forced.game.phase !== "choosingSide") {
-      throw new Error("Expected choosingSide after forcing the deadline.");
-    }
-
-    await runRoomCleanupAlarm(stub);
-
-    const resumed = await accessRoom(stub, hostToken);
-
-    expect(resumed.room.game.phase).toBe("settlement");
-
-    if (resumed.room.game.phase !== "settlement") {
-      throw new Error("Expected settlement after the F-06 forced settle effect ran.");
-    }
-    expect(resumed.room.game.settlement.side).toBe("SELL");
-    expect(resumed.room.game.settlement.forcedByTimeout).toBe(true);
-    expect(resumed.room.game.settlement.traderPnL).toBe(-12);
-  });
-
-  it("breaks an exact choosingSide-timeout PnL tie by deterministically forcing BUY (F-06)", async () => {
-    const stub = roomStub(CHOOSING_SIDE_TIMEOUT_TIE_ROOM_NAME);
-    // trueValue 42, quote 32/52: buyPnL = 42-52 = -10,
-    // sellPnL = 32-42 = -10. Tied - must resolve to BUY, not depend on
-    // iteration order or floating point.
-    const { hostToken } = await readyChoosingSide(stub, { bid: 32, ask: 52 });
-
-    const forced = await forcePastTurnDeadline(stub);
-
-    if (forced.game.phase !== "choosingSide") {
-      throw new Error("Expected choosingSide after forcing the deadline.");
-    }
-
-    await runRoomCleanupAlarm(stub);
-
-    const resumed = await accessRoom(stub, hostToken);
-
-    expect(resumed.room.game.phase).toBe("settlement");
-
-    if (resumed.room.game.phase !== "settlement") {
-      throw new Error("Expected settlement after the F-06 forced settle effect ran.");
-    }
-    expect(resumed.room.game.settlement.side).toBe("BUY");
-    expect(resumed.room.game.settlement.forcedByTimeout).toBe(true);
-    expect(resumed.room.game.settlement.traderPnL).toBe(-10);
-  });
-
-  // testExpireTurnSoon's own gate: WORKER_TEST_MODE is the *only* thing
-  // standing between this route and production, since wrangler.toml sets no
-  // vars at all (so the var is unset in every real deploy) and the route's
-  // own authorization is deliberately access-level, not activePlayer-level
-  // (see testExpireTurnSoon's doc comment) - either seated player can force
-  // the *other* player's clock. That is safe only because the gate makes the
-  // route unreachable outside test/dev; these tests pin both halves of that
-  // safety property directly, since nothing previously asserted either one.
-
-  it("404s POST /room/test-expire-turn, and its public /api/rooms alias, when WORKER_TEST_MODE is unset - even for an otherwise-valid, well-authenticated request", async () => {
-    const stub = roomStub(TEST_EXPIRE_TURN_GATE_ROOM_NAME);
-    const created = await createRoom(stub, "Host");
-
-    if (!created.created) {
-      throw new Error("Expected a newly created test-expire-turn gate room.");
-    }
-
-    await joinRoom(stub, "Guest");
-    const started = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "START_ROOM",
-      credential: created.hostToken
-    });
-
-    if (started.room.game.phase !== "proposingWidth") {
-      throw new Error("Expected generated item to be ready.");
-    }
-
-    // A perfectly well-formed, correctly-authenticated request from the
-    // room's own host, while the room genuinely has a turn clock running -
-    // every other precondition the route checks is satisfied. Only the
-    // env-var gate stands between this and a successful fast-forward.
-    const directResponse = await stub.fetch(ROOM_TEST_EXPIRE_TURN_URL, {
-      body: JSON.stringify({ credential: created.hostToken }),
-      method: "POST"
-    });
-    const directRejected = await expectPublicJson<RoomErrorResponse>(directResponse);
-
-    expect(directResponse.status).toBe(HTTP_NOT_FOUND_STATUS);
-    expect(directRejected.error.code).toBe("not_found");
-
-    const publicResponse = await fetchPublicWorker(new Request(
-      `${PUBLIC_ROOMS_URL}/${created.room.id}/test-expire-turn`,
-      {
-        body: JSON.stringify({ credential: created.hostToken }),
-        headers: { "content-type": "application/json" },
-        method: "POST"
-      }
-    ));
-    const publicRejected = await expectPublicJson<RoomErrorResponse>(publicResponse);
-
-    expect(publicResponse.status).toBe(HTTP_NOT_FOUND_STATUS);
-    expect(publicRejected.error.code).toBe("not_found");
-
-    // Neither rejected request mutated the room: the turn clock the request
-    // would have fast-forwarded is untouched.
-    const persisted = await accessRoom(stub, created.hostToken);
-
-    expect(persisted.room.revision).toBe(started.room.revision);
-    expect(persisted.room.game).toEqual(started.room.game);
-  });
-
-  it("rejects missing, malformed, and wrong-room credentials for POST /room/test-expire-turn once WORKER_TEST_MODE is enabled, but fast-forwards the clock for a valid one", async () => {
-    const stub = roomStub(TEST_EXPIRE_TURN_CREDENTIALS_ROOM_NAME);
-    const otherStub = roomStub(TEST_EXPIRE_TURN_OTHER_ROOM_NAME);
-
-    await withWorkerTestModeEnabled(stub, async () => {
-      const created = await createRoom(stub, "Host");
-
-      if (!created.created) {
-        throw new Error("Expected a newly created test-expire-turn credentials room.");
-      }
-
-      const joined = await joinRoom(stub, "Guest");
-      const started = await applyRoomCommandWithoutTrueValue(stub, {
-        type: "START_ROOM",
-        credential: created.hostToken
-      });
-
-      if (started.room.game.phase !== "proposingWidth") {
-        throw new Error("Expected generated item to be ready.");
-      }
-
-      // Missing credential: rejected the same way every other room POST
-      // endpoint rejects an absent `credential` field, before authorization
-      // is ever reached (see decodeAccessRoomBody).
-      const missingResponse = await stub.fetch(ROOM_TEST_EXPIRE_TURN_URL, {
-        body: JSON.stringify({}),
-        method: "POST"
-      });
-      const missingRejected = await expectPublicJson<RoomErrorResponse>(missingResponse);
-
-      expect(missingResponse.status).toBe(HTTP_BAD_REQUEST_STATUS);
-      expect(missingRejected.error.code).toBe("invalid_request");
-
-      // Malformed credential: a string is not a capability token object.
-      const malformedResponse = await stub.fetch(ROOM_TEST_EXPIRE_TURN_URL, {
-        body: JSON.stringify({ credential: "not-a-token" }),
-        method: "POST"
-      });
-      const malformedRejected = await expectPublicJson<RoomErrorResponse>(malformedResponse);
-
-      expect(malformedResponse.status).toBe(HTTP_BAD_REQUEST_STATUS);
-      expect(malformedRejected.error.code).toBe("invalid_request");
-
-      // Wrong-room credential: structurally a valid token, correctly signed,
-      // but minted for a different room entirely.
-      const otherCreated = await createRoom(otherStub, "Someone Else");
-
-      if (!otherCreated.created) {
-        throw new Error("Expected a newly created unrelated room.");
-      }
-
-      const wrongRoomResponse = await stub.fetch(ROOM_TEST_EXPIRE_TURN_URL, {
-        body: JSON.stringify({ credential: otherCreated.hostToken }),
-        method: "POST"
-      });
-      const wrongRoomRejected = await expectPublicJson<RoomErrorResponse>(wrongRoomResponse);
-
-      expect(wrongRoomResponse.status).toBe(HTTP_FORBIDDEN_STATUS);
-      expect(wrongRoomRejected.error.code).toBe("wrong_room");
-
-      // None of the three rejections above touched the room.
-      const afterRejections = await accessRoom(stub, created.hostToken);
-
-      expect(afterRejections.room.revision).toBe(started.room.revision);
-      expect(afterRejections.room.game).toEqual(started.room.game);
-
-      // A valid credential from the room's own guest (proving this is not
-      // merely "the host's own request succeeds" but genuinely
-      // access-level, per testExpireTurnSoon's own comment - either seated
-      // player, not just the active one, can fast-forward the clock) still
-      // works once the gate is enabled.
-      const validResponse = await stub.fetch(ROOM_TEST_EXPIRE_TURN_URL, {
-        body: JSON.stringify({ credential: joined.guestToken }),
-        method: "POST"
-      });
-      const validAccepted = await expectPublicJson<CommandRoomResponse>(validResponse);
-
-      expect(validResponse.status).toBe(HTTP_OK_STATUS);
-
-      if (validAccepted.room.game.phase !== "proposingWidth") {
-        throw new Error("Expected the room to remain in proposingWidth after fast-forwarding.");
-      }
-
-      expect(validAccepted.room.game.turnDeadlineMs).toBeLessThan(
-        started.room.game.turnDeadlineMs
-      );
-      expect(validAccepted.room.game.turnDeadlineMs).toBeGreaterThan(Date.now());
-      expect(validAccepted.room.revision).toBe(started.room.revision + 1);
-    });
-  });
-
-  it("schedules the nearest of all three deadlines: the F-05 turn clock outranks the TTL when no settle effect is pending", async () => {
-    // Extends "schedules the nearer of the two deadlines..." above to the
-    // third deadline scheduleNextAlarm now multiplexes. A pending settle
-    // effect and a turn deadline are mutually exclusive (settle only exists
-    // in "settling"; a turn deadline only exists in the four other
-    // actionable phases - see the class-level alarm() comment), so this
-    // needs its own case: proposingWidth with a null pending effect, so
-    // Math.min's third argument is the only thing standing between the far
-    // TTL and the near turn clock. Flipping scheduleNextAlarm's Math.min to
-    // Math.max would pick Infinity (the null pending effect's placeholder)
-    // over both real deadlines, which the assertion below rules out.
-    const stub = roomStub(NEAREST_OF_THREE_ROOM_NAME);
-    const created = await createRoom(stub, "Host");
-
-    if (!created.created) {
-      throw new Error("Expected a newly created nearest-of-three room.");
-    }
-
-    await joinRoom(stub, "Guest");
-    const started = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "START_ROOM",
-      credential: created.hostToken
-    });
-
-    if (started.room.game.phase !== "proposingWidth") {
-      throw new Error("Expected generated item to be ready.");
-    }
-
-    const ttlDeadline = await storedRoomExpiresAt(stub);
-    const turnDeadline = started.room.game.turnDeadlineMs;
-
-    expect(turnDeadline).toBeLessThan(ttlDeadline);
-
-    // Force the scheduled alarm to look overdue, then let alarm() re-derive
-    // and reschedule purely from the freshly-loaded room's candidate
-    // deadlines (none of which is actually due yet).
-    await setStoredRoomAlarm(stub, Date.now() - 1);
-    await runRoomCleanupAlarm(stub);
-
-    await expect(storedRoomAlarm(stub)).resolves.toBe(turnDeadline);
-  });
-
-  it("keeps a turn deadline outstanding reachable by TTL purge (regression)", async () => {
-    // Mirrors "still purges an expired room and its pending settlement
-    // marker when the TTL deadline wins the race" for F-05: a turn-clocked
-    // room whose TTL has also elapsed must still be purged, not stranded
-    // because the multiplexer favored the nearer turn deadline.
-    const stub = roomStub(TURN_EXPIRY_TTL_ROOM_NAME);
-    const created = await createRoom(stub, "Host");
-
-    if (!created.created) {
-      throw new Error("Expected a newly created turn-expiry TTL room.");
-    }
-
-    const joined = await joinRoom(stub, "Guest");
-    const guestConnection = await openRoomSocket(stub, joined.guestToken);
-    const started = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "START_ROOM",
-      credential: created.hostToken
-    });
-
-    if (started.room.game.phase !== "proposingWidth") {
-      throw new Error("Expected generated item to be ready.");
-    }
-
-    await expireStoredRoomEnvelope(stub);
-    await runRoomCleanupAlarm(stub);
-
-    await expect(storedRoomEnvelopeExists(stub)).resolves.toBe(false);
-    await expect(storedRoomAlarm(stub)).resolves.toBeNull();
-
-    guestConnection.socket.close();
-  });
-
-  it("does not forfeit a round that already advanced past a stale turn-expiry wake (TOCTOU regression)", async () => {
-    // Mirrors "ignores a settlement effect whose round no longer matches
-    // the stored room" for F-05: runDueTurnExpiry is invoked directly with
-    // a deliberately stale room snapshot (proposingWidth, an old past
-    // deadline) while the actually-persisted room has already moved past
-    // that phase via a genuine player command - precisely the TOCTOU
-    // window between alarm()'s outer transaction and this method's own
-    // re-validating one.
-    const stub = roomStub(STALE_TURN_EXPIRY_ROOM_NAME);
-    const created = await createRoom(stub, "Host");
-
-    if (!created.created) {
-      throw new Error("Expected a newly created stale turn-expiry room.");
-    }
-
-    const joined = await joinRoom(stub, "Guest");
-    const guestConnection = await openRoomSocket(stub, joined.guestToken);
-    const started = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "START_ROOM",
-      credential: created.hostToken
-    });
-
-    if (started.room.game.phase !== "proposingWidth") {
-      throw new Error("Expected generated item to be ready.");
-    }
-
-    const staleRoom = await loadInternalRoomState(stub);
-
-    if (staleRoom.game.phase !== "proposingWidth") {
-      throw new Error("Expected internal room state in proposingWidth.");
-    }
-
-    const marketMakerToken = tokenForPlayer(
-      staleRoom.game.roles.marketMaker,
-      created.hostToken,
-      joined.guestToken
-    );
-
-    // The round genuinely advances out of proposingWidth before the stale
-    // wake is processed.
-    const advanced = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_INITIAL_WIDTH",
-      credential: marketMakerToken,
-      width: 100
-    });
-
-    expect(advanced.room.game.phase).toBe("negotiatingWidth");
-
-    const staleRoomWithPastDeadline: RoomState = {
-      ...staleRoom,
-      game: { ...staleRoom.game, turnDeadlineMs: Date.now() - 1 }
-    };
-
-    await runDueTurnExpiryDirect(stub, staleRoomWithPastDeadline, Date.now());
-
-    // The stale wake must not forfeit a round that already moved on.
-    const after = await accessRoom(stub, created.hostToken);
-
-    expect(after.room.game.phase).toBe("negotiatingWidth");
-    expect(after.room.revision).toBe(advanced.room.revision);
-
-    guestConnection.socket.close();
-  });
-
   it("purges the command dedupe table along with the rest of an expired room's state", async () => {
     // Closes a mutation gap: deleting the dedupe-table line from
     // purgeExpiredRoomState previously passed the entire suite, because every
@@ -1735,6 +1264,69 @@ describe("Cloudflare worker scaffold", () => {
     expect(secondRejected.error.code).toBe("room_not_found");
   });
 
+  // Persistence v6 cutover regression (decision D2): a room persisted by the
+  // previous build as a version-5 envelope must fail decode with
+  // persistence_version_unsupported and then purge on first touch, exactly
+  // like an undecodable envelope - the room reads back as never-created
+  // instead of erroring forever.
+
+  it("purges a planted version-5 envelope on first touch (v6 hard-cutover regression)", async () => {
+    const stub = roomStub(COMMAND_PURGE_ON_INVALID_ROOM_NAME + "-v5");
+    const created = await createRoom(stub, "Host");
+
+    if (!created.created) {
+      throw new Error("Expected a newly created v5-cutover room.");
+    }
+
+    const joined = await joinRoom(stub, "Guest");
+
+    expect(joined.room.seats.guest.occupied).toBe(true);
+
+    const started = await applyRoomCommandWithoutTrueValue(stub, {
+      type: "START_ROOM",
+      credential: created.hostToken
+    });
+
+    expect(started.room.game.phase).toBe("proposingWidth");
+
+    // Plant a v5 envelope: same current shape minus the shot-clock fields
+    // (which no longer exist anywhere), tagged with the retired version. The
+    // strict allowlists no longer carry a migration chain, so this is
+    // rejected by version alone.
+    await runInDurableObject(stub, async (_instance, state) => {
+      const envelope = (await state.storage.get<Record<string, unknown>>(TEST_ROOM_STORAGE_KEY)) as {
+        version?: unknown;
+      };
+
+      if (envelope === undefined) {
+        throw new Error("Expected a stored room envelope to downgrade.");
+      }
+
+      await state.storage.put(TEST_ROOM_STORAGE_KEY, { ...envelope, version: 5 });
+    });
+
+    const firstResponse = await postRoomCommand(stub, {
+      type: "SUBMIT_INITIAL_WIDTH",
+      credential: created.hostToken,
+      width: 10
+    });
+    const firstRejected = await expectPublicJson<RoomErrorResponse>(firstResponse);
+
+    expect(firstResponse.status).toBe(HTTP_GONE_STATUS);
+    expect(firstRejected.error.code).toBe("persistence_version_unsupported");
+    await expect(storedRoomEnvelopeExists(stub)).resolves.toBe(false);
+
+    const secondResponse = await postRoomCommand(stub, {
+      type: "SUBMIT_INITIAL_WIDTH",
+      credential: created.hostToken,
+      width: 10
+    });
+    const secondRejected = await expectPublicJson<RoomErrorResponse>(secondResponse);
+
+    expect(secondResponse.status).toBe(HTTP_NOT_FOUND_STATUS);
+    expect(secondRejected.error.code).toBe("room_not_found");
+  });
+
   it("purges an undecodable room envelope when a join is attempted against it, so the next request sees a fresh room instead of another 500", async () => {
     const stub = roomStub(JOIN_PURGE_ON_INVALID_ROOM_NAME);
     const created = await createRoom(stub, "Host");
@@ -1819,12 +1411,10 @@ describe("Cloudflare worker scaffold", () => {
       B: false
     });
 
-    // The room is in proposingWidth, which now carries its own F-05 turn
-    // deadline - and that deadline (60s out) is far nearer than the
-    // two-hour TTL, so a reschedule must arm the alarm there, not at TTL.
-    const expectedAlarm = started.room.game.turnDeadlineMs;
-
-    expect(expectedAlarm).toBeLessThan(await storedRoomExpiresAt(stub));
+    // Since the shot-clock cut, no game phase carries a turn deadline, so a
+    // valid room's only stored deadline is its TTL: the reschedule must arm
+    // exactly there - not purge, not drop the alarm entirely.
+    const expectedAlarm = await storedRoomExpiresAt(stub);
 
     await setStoredRoomAlarm(stub, Date.now() - 1);
     await runRoomCleanupAlarm(stub);
@@ -1842,11 +1432,12 @@ describe("Cloudflare worker scaffold", () => {
 
     const ttlDeadline = await storedRoomExpiresAt(stub);
 
-    // Idle posture: lobby phase carries no turn deadline, no sockets are
-    // connected to contribute a liveness deadline, and synchronous
-    // settlement removed the pending-effect marker entirely - so the only
-    // deadline left for the multiplexer to arm is the room's TTL. Force a
-    // premature tick and confirm it is a stable no-op re-arm at exactly TTL.
+    // Idle posture: no phase carries a turn deadline anymore (the shot-clock
+    // layer was cut), no sockets are connected to contribute a liveness
+    // deadline, and synchronous settlement removed the pending-effect marker
+    // entirely - so the only deadline left for the multiplexer to arm is the
+    // room's TTL. Force a premature tick and confirm it is a stable no-op
+    // re-arm at exactly TTL.
     await setStoredRoomAlarm(stub, Date.now() - 1);
     await runRoomCleanupAlarm(stub);
 
@@ -2884,108 +2475,10 @@ function roomStub(roomName: string) {
 }
 
 /**
- * Enables the WORKER_TEST_MODE gate (see testExpireTurnSoon in
- * src/worker/index.ts) for exactly the duration of `run`, then restores it.
- * vitest.worker.config.ts deliberately does NOT set this var globally: the
- * suite's default posture should mirror production (unset), so a test that
- * wants the gate open has to say so explicitly, and "unset" stays the
- * meaningful default for the 404 test above.
- */
-async function withWorkerTestModeEnabled<T>(
-  stub: GameRoomStub,
-  run: () => Promise<T>
-): Promise<T> {
-  const previous = await setDurableObjectTestModeEnv(stub, "1");
-
-  try {
-    return await run();
-  } finally {
-    await setDurableObjectTestModeEnv(stub, previous);
-  }
-}
-
-async function setDurableObjectTestModeEnv(
-  stub: GameRoomStub,
-  next: string | undefined
-): Promise<string | undefined> {
-  return runInDurableObject(stub, (instance) => {
-    const mutableEnv = (instance as unknown as { env: { WORKER_TEST_MODE?: string } }).env;
-    const previous = mutableEnv.WORKER_TEST_MODE;
-
-    mutableEnv.WORKER_TEST_MODE = next;
-
-    return previous;
-  });
-}
-
-
-/**
- * F-05 test helper: directly patches the persisted
- * room's turnDeadlineMs into the past (production code has no way to stamp
- * a past deadline, since it always computes nowMs + a positive duration),
- * so a test can exercise the alarm's due-turn-clock path without waiting
- * out a real 30-60s duration. Requires the room to already be in one of
- * the four turn-clocked phases. Like the other forced fixtures, the *scheduled* DO
- * alarm is deliberately left at the room's TTL rather than the forced past
- * deadline, so it does not fire opportunistically before a test explicitly
- * ticks it via runRoomCleanupAlarm().
- */
-async function forcePastTurnDeadline(stub: GameRoomStub): Promise<RoomState> {
-  return runInDurableObject(stub, async (_instance, state) => {
-    const nowMs = Date.now();
-    const loaded = loadPersistenceEnvelope(
-      await state.storage.get<unknown>(TEST_ROOM_STORAGE_KEY),
-      nowMs
-    );
-
-    if (!loaded.ok) {
-      throw new Error(`Expected loadable room envelope: ${loaded.error.code}`);
-    }
-
-    if (
-      loaded.room.game.phase !== "proposingWidth" &&
-      loaded.room.game.phase !== "negotiatingWidth" &&
-      loaded.room.game.phase !== "configuringMarket" &&
-      loaded.room.game.phase !== "choosingSide"
-    ) {
-      throw new Error(`Expected a turn-clocked phase, got ${loaded.room.game.phase}.`);
-    }
-
-    const patchedRoom: RoomState = {
-      ...loaded.room,
-      game: { ...loaded.room.game, turnDeadlineMs: nowMs - 1 }
-    };
-
-    await state.storage.put(
-      TEST_ROOM_STORAGE_KEY,
-      JSON.parse(JSON.stringify(toPersistenceEnvelope(patchedRoom, nowMs))) as unknown
-    );
-    await state.storage.setAlarm(roomExpiresAtMs(patchedRoom));
-
-    return patchedRoom;
-  });
-}
-
-async function runDueTurnExpiryDirect(
-  stub: GameRoomStub,
-  room: RoomState,
-  nowMs: number
-): Promise<void> {
-  await runInDurableObject(stub, async (instance) => {
-    await (
-      instance as unknown as {
-        runDueTurnExpiry(room: RoomState, nowMs: number): Promise<void>;
-      }
-    ).runDueTurnExpiry(room, nowMs);
-  });
-}
-
-/**
  * Reads the private, internal RoomState straight out of storage - unlike
  * CommandRoomResponse.room (a PublicRoomSnapshot), this carries host/guest
- * seat token hashes and is what runDueTurnExpiryDirect
- * expect, since production only ever passes internal RoomState objects
- * between these methods, never redacted public snapshots.
+ * seat token hashes, since production only ever passes internal RoomState
+ * objects between these paths, never redacted public snapshots.
  */
 async function loadInternalRoomState(stub: GameRoomStub): Promise<RoomState> {
   return runInDurableObject(stub, async (_instance, state) => {
@@ -3430,69 +2923,6 @@ async function applyRoomCommandWithoutTrueValue(
   expect(response.status).toBe(HTTP_OK_STATUS);
 
   return expectPublicJsonWithoutTrueValue<CommandRoomResponse>(response);
-}
-
-/**
- * Builds a fresh room up through choosingSide with a caller-controlled
- * quote, for the F-06 forced-worst-side-settlement tests: they each need a
- * specific bid/ask against the static deck's fixed round-1 Chaos Quant
- * true_value (42) to steer which side ends up worse for the trader. Width is
- * derived from the quote itself so the two always agree.
- */
-async function readyChoosingSide(
-  stub: GameRoomStub,
-  quote: { bid: number; ask: number }
-): Promise<{
-  hostToken: RoomCapabilityToken;
-  guestToken: RoomCapabilityToken;
-  quoted: CommandRoomResponse;
-}> {
-  const created = await createRoom(stub, "Host");
-
-  if (!created.created) {
-    throw new Error("Expected a newly created room.");
-  }
-
-  const joined = await joinRoom(stub, "Guest");
-  const started = await applyRoomCommandWithoutTrueValue(stub, {
-    type: "START_ROOM",
-    credential: created.hostToken
-  });
-
-  if (started.room.game.phase !== "proposingWidth") {
-    throw new Error("Expected generated item to be ready.");
-  }
-
-  const width = await applyRoomCommandWithoutTrueValue(stub, {
-    type: "SUBMIT_INITIAL_WIDTH",
-    credential: created.hostToken,
-    width: quote.ask - quote.bid
-  });
-
-  if (width.room.game.phase !== "negotiatingWidth") {
-    throw new Error("Expected negotiatingWidth phase.");
-  }
-
-  const configuring = await applyRoomCommandWithoutTrueValue(stub, {
-    type: "TRADE_ON_WIDTH",
-    credential: joined.guestToken
-  });
-
-  if (configuring.room.game.phase !== "configuringMarket") {
-    throw new Error("Expected configuringMarket phase.");
-  }
-
-  const quoted = await applyRoomCommandWithoutTrueValue(stub, {
-    type: "SUBMIT_MARKET_QUOTE",
-    credential: created.hostToken,
-    quote
-  });
-
-  if (quoted.room.game.phase !== "choosingSide") {
-    throw new Error("Expected choosingSide phase.");
-  }
-
-  return { hostToken: created.hostToken, guestToken: joined.guestToken, quoted };
 }
 
 async function settleCurrentRound(

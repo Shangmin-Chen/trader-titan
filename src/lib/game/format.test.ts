@@ -24,7 +24,6 @@ describe("formatGamePhase", () => {
     expect(formatGamePhase("negotiatingWidth")).toBe("Negotiating width");
     expect(formatGamePhase("configuringMarket")).toBe("Setting market");
     expect(formatGamePhase("choosingSide")).toBe("Choosing side");
-    expect(formatGamePhase("roundForfeited")).toBe("Round forfeited");
     expect(formatGamePhase("gameOver")).toBe("Game over");
   });
 
