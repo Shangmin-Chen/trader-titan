@@ -21,8 +21,8 @@ const checks = [
   },
   {
     path: "src/worker/index.ts",
-    needle: "applyAutomaticRoomEffects",
-    description: "The Durable Object drives automatic deck-item receipt after round-opening commands.",
+    needle: "applyDecodedRoomCommand",
+    description: "The Durable Object composes every command with its system events in one transaction.",
   },
   {
     path: "src/worker/index.ts",
