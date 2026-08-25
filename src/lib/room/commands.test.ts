@@ -13,8 +13,6 @@ import {
   createLobbyRoom,
   executeTrade,
   expireRoomTurn,
-  failRoomItem,
-  failRoomSettlement,
   joinRoom,
   kickGuest,
   parseCapabilityToken,
@@ -23,7 +21,6 @@ import {
   receiveRoomItem,
   receiveRoomSettlement,
   resetRoomToLobby,
-  retryRoomItemGeneration,
   startRoom,
   submitInitialWidth,
   submitMarketQuote,
@@ -284,98 +281,6 @@ describe("room commands", () => {
     expect(result.revision).toBe(room.revision + 1);
   });
 
-  it("lets the host retry a failed item generation without changing game context", () => {
-    const { room, hostToken } = activeRoom();
-    const failed = expectOk(failRoomItem(room, "Provider timed out.", NOW_MS + 3));
-    const retried = expectOk(
-      retryRoomItemGeneration(failed, {
-        credential: present(hostToken),
-        verifyToken,
-        nowMs: NOW_MS + 4,
-      }),
-    );
-
-    expect(retried.lifecycle).toBe("active");
-    expect(retried.revision).toBe(failed.revision + 1);
-    expect(retried.game.phase).toBe("generatingItem");
-    expect(retried.game.mode).toBe(failed.game.mode);
-    expect(retried.game.players).toEqual(failed.game.players);
-    expect(retried.game.scores).toEqual(failed.game.scores);
-    expect(retried.game.roles).toEqual(failed.game.roles);
-    expect(retried.game.roundNumber).toBe(failed.game.roundNumber);
-    expect(retried.game.totalRounds).toBe(failed.game.totalRounds);
-    expect(retried.game.lastError).toBeUndefined();
-    expect("error" in retried.game).toBe(false);
-    expect("previousPhase" in retried.game).toBe(false);
-    expect(retried.game.log.slice(0, -1)).toEqual(failed.game.log);
-  });
-
-  it("rejects item generation retries for guests and wrong phases without mutating", () => {
-    const { room, hostToken, guestToken } = activeRoom();
-    const failed = expectOk(failRoomItem(room, "Provider timed out.", NOW_MS + 3));
-    const guestRetry = retryRoomItemGeneration(failed, {
-      credential: present(guestToken),
-      verifyToken,
-      nowMs: NOW_MS + 4,
-    });
-    const wrongPhaseRetry = retryRoomItemGeneration(room, {
-      credential: present(hostToken),
-      verifyToken,
-      nowMs: NOW_MS + 5,
-    });
-
-    expect(guestRetry).toEqual({
-      ok: false,
-      room: failed,
-      error: {
-        code: "host_control_denied",
-        message: "Only the host can perform this room command.",
-      },
-    });
-    expect(wrongPhaseRetry).toEqual({
-      ok: false,
-      room,
-      error: {
-        code: "invalid_game_phase",
-        message: "Item generation or settlement can only be retried after a failure.",
-      },
-    });
-  });
-
-  it("lets the host retry a stuck settlement without mutating the room or the private item", () => {
-    // The room command layer does not resolve the settlement itself; it
-    // leaves the room exactly as EXECUTE_TRADE committed it (same item,
-    // quote, pendingTrade) and reports success so the Worker layer can
-    // re-run the settlement effect for the current round. See the
-    // worker-level F-02 recovery test for the full end-to-end path.
-    const { room, hostToken } = settlingRoom();
-    const retried = retryRoomItemGeneration(room, {
-      credential: present(hostToken),
-      verifyToken,
-      nowMs: NOW_MS + 9,
-    });
-
-    expect(retried).toEqual({ ok: true, room });
-  });
-
-  it("rejects guest recovery of a stuck settlement without mutating the room", () => {
-    const { room, guestToken } = settlingRoom();
-    const guestRetry = retryRoomItemGeneration(room, {
-      credential: present(guestToken),
-      verifyToken,
-      nowMs: NOW_MS + 9,
-    });
-
-    expect(guestRetry).toEqual({
-      ok: false,
-      room,
-      error: {
-        code: "host_control_denied",
-        message: "Only the host can perform this room command.",
-      },
-    });
-  });
-
   it("rejects a full guest slot until the host kicks the guest", () => {
     const { room, hostToken } = joinedRoom();
     const nextGuestToken = mustToken("guest", NEXT_GUEST_SECRET, room.id);
@@ -431,49 +336,6 @@ describe("room commands", () => {
     expect(reset.game.roundNumber).toBe(0);
   });
 
-  it("rejects RESET_TO_LOBBY while a trade is settling, without mutating the room", () => {
-    // The trade's outcome is already fixed the instant EXECUTE_TRADE lands
-    // (true_value was fixed back when the item was generated); only the
-    // reveal and score update are still pending. Letting a host-as-trader
-    // nuke the room here would let them duck a bad outcome, and the guest
-    // would never even learn what it would have been.
-    const { room, hostToken } = settlingRoom();
-    const result = resetRoomToLobby(room, {
-      credential: present(hostToken),
-      verifyToken,
-      nowMs: NOW_MS + 9,
-    });
-
-    expect(result).toEqual({
-      ok: false,
-      room,
-      error: {
-        code: "round_settling",
-        message:
-          "This round's trade is locked in and settling. Wait for it to resolve, or use Retry if it's stuck, before resetting or kicking.",
-      },
-    });
-  });
-
-  it("rejects KICK_GUEST while a trade is settling, without mutating the room", () => {
-    const { room, hostToken } = settlingRoom();
-    const result = kickGuest(room, {
-      credential: present(hostToken),
-      verifyToken,
-      nowMs: NOW_MS + 9,
-    });
-
-    expect(result).toEqual({
-      ok: false,
-      room,
-      error: {
-        code: "round_settling",
-        message:
-          "This round's trade is locked in and settling. Wait for it to resolve, or use Retry if it's stuck, before resetting or kicking.",
-      },
-    });
-  });
-
   it("allows RESET_TO_LOBBY and KICK_GUEST again once settlement resolves", () => {
     const { room, hostToken } = settlingRoom();
     const settled = expectOk(
@@ -500,14 +362,32 @@ describe("room commands", () => {
     expect(kicked.guest).toBeNull();
   });
 
-  it("still allows RESET_TO_LOBBY and KICK_GUEST before a trade is executed (choosingSide)", () => {
-    // Only the determined-but-unrevealed window (`settling`) is restricted.
+  it("allows RESET_TO_LOBBY and KICK_GUEST while the trader is still choosing a side (choosingSide)", () => {
     // A host must still be able to abandon a round that hasn't committed to
     // an outcome yet - e.g. an abandoned guest before either player has
     // acted on the quote.
-    const { room, hostToken } = settlingRoom();
+    const { room, hostToken, guestToken } = activeRoom();
+    const withItem = expectOk(receiveRoomItem(room, item, NOW_MS + 4));
+    const opened = expectOk(
+      submitInitialWidth(withItem, 200, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 5,
+      }),
+    );
+    const configuring = expectOk(
+      tradeOnWidth(opened, {
+        credential: present(guestToken),
+        verifyToken,
+        nowMs: NOW_MS + 6,
+      }),
+    );
     const choosingSide = expectOk(
-      failRoomSettlement(room, "forced back to choosingSide", NOW_MS + 9),
+      submitMarketQuote(configuring, { bid: 200, ask: 400 }, {
+        credential: present(hostToken),
+        verifyToken,
+        nowMs: NOW_MS + 7,
+      }),
     );
 
     expect(choosingSide.game.phase).toBe("choosingSide");
@@ -516,7 +396,7 @@ describe("room commands", () => {
       resetRoomToLobby(choosingSide, {
         credential: present(hostToken),
         verifyToken,
-        nowMs: NOW_MS + 10,
+        nowMs: NOW_MS + 8,
       }),
     );
     expect(reset.lifecycle).toBe("lobby");

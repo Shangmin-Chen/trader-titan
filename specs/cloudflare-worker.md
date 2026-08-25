@@ -44,18 +44,18 @@ The Durable Object owns one room per object id. Named ids must also be valid roo
 
 Implemented HTTP endpoints on the Durable Object stub:
 
-- `POST /room`: creates a lobby if no loadable, non-expired private room envelope exists, or loads the existing room. Missing, expired, or corrupt envelopes are replaced by a new lobby and any stored private generated item keys for the object are deleted. The host capability token and full public snapshot are returned only for a newly created room; existing rooms return only an invite preview.
+- `POST /room`: creates a lobby if no loadable, non-expired private room envelope exists, or loads the existing room. Missing, expired, or corrupt envelopes are replaced by a new lobby, and any leftover command-dedupe record from a prior room lifetime in the same object is cleared. The host capability token and full public snapshot are returned only for a newly created room; existing rooms return only an invite preview.
 - `GET /room`: returns only the invite preview.
 - `POST /room/access`: accepts `{ credential }`, authorizes access for the host or current guest, and returns the full public room snapshot.
 - `POST /room/join`: joins one guest through the room command layer and returns the guest capability token only for the successful join.
 - `POST /room/command`: decodes known host/player protocol commands and dispatches to the pure room command functions.
 - `GET /room/socket` with `Upgrade: websocket`: validates the capability token from `Sec-WebSocket-Protocol`, authorizes room access, and upgrades to a hibernatable Durable Object WebSocket using `acceptWebSocket`.
 
-Both `POST /room/join` and `POST /room/command` purge a missing, expired, or invalid stored envelope (private generated items, the room envelope, any pending-effect marker, and the alarm) in the same storage transaction as the error they return, mirroring the cleanup-alarm behavior below. Without this, an envelope that fails to decode would return the same error on every subsequent request against that room object until its already-scheduled alarm eventually fired - up to `ABANDONED_ROOM_TTL_MS` later for a room with no sooner turn-clock or pending-settlement deadline armed. The next request against the same room object instead sees `room_not_found` (missing), not a repeat of the original error.
+Both `POST /room/join` and `POST /room/command` purge a missing, expired, or invalid stored envelope (the room envelope, its command-dedupe record, and the alarm) in the same storage transaction as the error they return, mirroring the cleanup-alarm behavior below. Without this, an envelope that fails to decode would return the same error on every subsequent request against that room object until its already-scheduled alarm eventually fired - up to `ABANDONED_ROOM_TTL_MS` later for a room with no sooner turn-clock or socket-liveness deadline armed. The next request against the same room object instead sees `room_not_found` (missing), not a repeat of the original error.
 
 Private room state is stored through the room persistence envelope and loaded through the persistence decoder. Unauthenticated invite reads never include game state. Authenticated clients receive public snapshots only; persistence metadata and token hashes must never be returned. Capability token secrets and hashes are generated with Worker crypto, and Durable Object storage stores only hashes.
 
-The persistence envelope carries a version, and decoding is a hard cutover: `ROOM_PERSISTENCE_VERSION` and `ROOM_PERSISTENCE_MIN_SUPPORTED_VERSION` in `src/lib/room/persistence.ts` move together (currently 4) and there is no read-time migration chain, so an envelope tagged with any other version fails decode with `persistence_version_unsupported` and the existing self-heal paths purge it so the room reads as never-created. Version bumps happen once per phase that changes persisted shapes (see D2 in `specs/cleanup/MVP_CLEANUP_PLAN.md`).
+The persistence envelope carries a version, and decoding is a hard cutover: `ROOM_PERSISTENCE_VERSION` and `ROOM_PERSISTENCE_MIN_SUPPORTED_VERSION` in `src/lib/room/persistence.ts` move together (currently 5) and there is no read-time migration chain, so an envelope tagged with any other version fails decode with `persistence_version_unsupported` and the existing self-heal paths purge it so the room reads as never-created.
 
 ## Room Presence
 
@@ -74,26 +74,24 @@ Presence does not gate any room command (F-04). `START_ROOM` and `ADVANCE_ROUND`
 
 The Durable Object is the gameplay authority for generated item values and settlement:
 
-- Private generated items are stored separately from the room envelope under keys derived from `round_id`.
-- The stored private item includes `true_value`. The public room state receives only `round_id`, `item_title`, `category`, and `context_clue` until settlement.
-- After a successful `START_ROOM` or `ADVANCE_ROUND` command leaves the room in `active/generatingItem`, the Durable Object derives the round's item from the static deck (`itemForRound` in `src/worker/static-deck.ts`) and synchronously stores the private item, dispatches `ITEM_RECEIVED`, persists the updated room envelope, and broadcasts only the final public snapshot - all inside the same storage transaction as the command itself.
+- There is no separate private item storage. The public room state receives only `round_id`, `item_title`, `category`, and `context_clue` until settlement; the deck's `true_value` is never persisted anywhere.
+- After a successful `START_ROOM` or `ADVANCE_ROUND` command, the Durable Object derives the round's item from the static deck (`itemForRound` in `src/worker/static-deck.ts`) and synchronously dispatches `ITEM_RECEIVED`, persists the updated room envelope once, and broadcasts only the final public snapshot - all inside the same storage transaction as the command itself; the intermediate `generatingItem` state never persists or broadcasts.
 - There is no provider-failure path: the deck pick cannot fail, so the Durable Object never dispatches `ITEM_FAILED`.
-- After a successful `EXECUTE_TRADE` command leaves the room in `settling`, the Durable Object loads the private item by the active `round_id`, dispatches `SETTLEMENT_RECEIVED`, persists the room envelope, deletes that round's private item key in the same storage transaction after the room envelope write, and broadcasts the final settlement snapshot. Settlement is computed by the room command layer from the stored private item and active quote; clients never supply settlement fields.
-- If the private settlement item is missing, the Durable Object dispatches `SETTLEMENT_FAILED` rather than accepting client-provided values. Below `SETTLEMENT_FAILURE_EPISODE_CAP` consecutive `SETTLEMENT_FAILED`s for the same round this bounces the room back to `choosingSide(locked)` (F-06); at the cap it lands in the terminal `error` phase instead (F-07) - the reducer in the room command layer decides this, not the Worker, so the Worker's own per-episode attempt/backoff bound on the settle effect (item 2 below) is unaffected and orthogonal to it.
-- Successful `RESET_TO_LOBBY` and `KICK_GUEST` commands persist the lobby replacement and delete all `room:private-generated-item:v1:*` keys for the room object in the same storage transaction.
-- Room envelope writes schedule a Durable Object alarm for the room persistence expiration. When the alarm runs and the room envelope is missing, expired, or invalid, the Durable Object deletes all `room:private-generated-item:v1:*` keys and clears the alarm; if the room is still loadable, the alarm is rescheduled to the current room expiration.
+- After a successful `EXECUTE_TRADE` command commits the trade, settlement completes synchronously inside the same storage transaction: the Durable Object derives the settled item from the static deck keyed by the active `round_id` (`settledDeckItemForRoom`), dispatches `SETTLEMENT_RECEIVED` through the room command layer, persists the room envelope once, and broadcasts the final public settlement snapshot. Clients never supply settlement fields.
+- Successful `RESET_TO_LOBBY` and `KICK_GUEST` commands persist the lobby replacement in the same storage transaction as the command dispatch.
+- Room envelope writes schedule a Durable Object alarm for the room persistence expiration. When the alarm runs and the room envelope is missing, expired, or invalid, the Durable Object deletes the room envelope and its command-dedupe record and clears the alarm; if the room is still loadable, the alarm is rescheduled to the current room expiration.
 
 ## Turn Shot Clock Alarm (F-05)
 
 A Durable Object has exactly one alarm slot. `scheduleNextAlarm` multiplexes it across up to three candidate deadlines and arms it at whichever is soonest:
 
 1. The room's TTL expiration (unchanged, see above).
-2. A pending settlement-retry marker's next-attempt time (F-02; see the settlement retry/backoff behavior).
+2. The F-08 socket-liveness sweep deadline: the earliest time at which some currently-connected room socket would go stale with no further auto-response (`nextLivenessSweepDeadline`, recomputed from live socket state on every call; `null` - contributing no deadline - when no sockets are connected).
 3. The F-05 turn shot clock's `turnDeadlineMs`, read directly off the room's current game state rather than a separate persisted marker - it is already durable as part of the committed room envelope for the four turn-clocked phases (`proposingWidth`, `negotiatingWidth`, `configuringMarket`, `choosingSide`).
 
-A pending settlement marker and a turn deadline can never both be outstanding for the same room at once: the former only exists while the game is `settling`, the latter only in the four other actionable phases. When the alarm fires and a turn deadline is the one that is due, the Durable Object re-loads the room in a fresh transaction, re-validates that the same phase and deadline are still outstanding, and only then dispatches `TURN_EXPIRED` through the room command layer and persists the result. This re-validation is what keeps a stale alarm wake from forfeiting a round that has already advanced past that phase.
+When the alarm fires and a turn deadline is the one that is due, the Durable Object re-loads the room in a fresh transaction, re-validates that the same phase and deadline are still outstanding, and only then dispatches `TURN_EXPIRED` through the room command layer and persists the result. This re-validation is what keeps a stale alarm wake from forfeiting a round that has already advanced past that phase.
 
-If the alarm fires while the room envelope is missing, expired, or invalid, the Durable Object purges the room's private items, envelope, and any pending markers exactly as the plain TTL case above - a turn deadline being simultaneously outstanding does not suppress this cleanup.
+If the alarm fires while the room envelope is missing, expired, or invalid, the Durable Object purges the room envelope and its command-dedupe record exactly as the plain TTL case above - a turn deadline being simultaneously outstanding does not suppress this cleanup.
 
 ## Room WebSocket Contract
 

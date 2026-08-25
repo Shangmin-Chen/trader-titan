@@ -21,23 +21,18 @@ const checks = [
   },
   {
     path: "src/worker/index.ts",
-    needle: "applyAutomaticRoomEffects",
-    description: "The Durable Object drives automatic generation and settlement.",
+    needle: "applyDecodedRoomCommand",
+    description: "The Durable Object composes every command with its system events in one transaction.",
   },
   {
     path: "src/worker/index.ts",
-    needle: "privateGeneratedItemStorageKey",
-    description: "Private generated items are stored outside public room snapshots.",
+    needle: "itemForRound",
+    description: "Settlement derives the true value from the static deck inside the command transaction.",
   },
   {
-    path: "src/worker/index.ts",
-    needle: "loadPrivateGeneratedItemEnvelope",
-    description: "Settlement loads Durable Object private item state.",
-  },
-  {
-    path: "src/worker/private-generated-items.ts",
-    needle: "createSettledGeneratedItem",
-    description: "Private item storage can reconstruct settlement items.",
+    path: "src/worker/static-deck.ts",
+    needle: "itemForRound",
+    description: "The static deck exposes the pure modulo pick seam.",
   },
 ];
 

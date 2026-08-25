@@ -24,7 +24,6 @@ import {
   GAME_MODES,
   MAX_ROUNDS,
   PROPOSING_WIDTH_FORFEIT_PENALTY,
-  SETTLEMENT_FAILURE_EPISODE_CAP,
 } from "./types";
 import {
   validateQuoteForWidth,
@@ -186,23 +185,18 @@ function assertNeverPhase(value: never): never {
 
 /**
  * Builds the settling state a choosingSide clock expiry transitions into
- * (F-06), or that a locked choosingSide's own re-expiry re-enters (see
- * `lockedPendingTrade` on ChoosingSideGameState). Deliberately not
- * `...state`, for the exact same reason EXECUTE_TRADE above spells out:
- * choosingSide carries turnDeadlineMs (F-05) and may carry
- * lockedPendingTrade, but settling is not a turn-clocked phase and has no
- * locked-marker concept of its own - it must not inherit either stray field,
- * or the persistence decoder's per-phase key allowlist
- * (src/lib/room/persistence.ts) would reject it.
+ * (F-06). Deliberately not `...state`, for the exact same reason EXECUTE_TRADE
+ * spells out: choosingSide carries turnDeadlineMs (F-05), but settling is not
+ * a turn-clocked phase - it must not inherit the stray field, or the
+ * persistence decoder's per-phase key allowlist (src/lib/room/persistence.ts)
+ * would reject it.
  *
  * `pendingTrade` is supplied by the caller rather than decided here: a plain
- * (unlocked) expiry has no true_value to decide which side is worse for the
- * trader with - only the Worker, once it has fetched the private item, does
- * (see receiveRoomSettlement in src/lib/room/commands.ts) - so the caller
- * passes the sentinel `{ kind: "timeoutForcedWorstSide" }` for that case. A
- * locked choosingSide re-expiring passes its own `lockedPendingTrade`
- * through unchanged instead, so the decision that was already locked in
- * cannot get reset or re-rolled just because the clock ran out a second time.
+ * expiry has no true_value to decide which side is worse for the trader with
+ * - only the Worker, once it has composed settlement from the deck item,
+ * does (see receiveRoomSettlement in src/lib/room/commands.ts) - so the
+ * caller passes the sentinel `{ kind: "timeoutForcedWorstSide" }` for that
+ * case.
  */
 function settlingStateFromChoosingSideTimeout(
   state: Extract<GameState, { phase: "choosingSide" }>,
@@ -221,12 +215,6 @@ function settlingStateFromChoosingSideTimeout(
     spreadWidth: state.spreadWidth,
     quote: state.quote,
     pendingTrade,
-    // F-07: inherited unchanged - a plain (unlocked) choosingSide has no
-    // prior failures for this round, and a locked one carries its own count
-    // forward exactly like it carries lockedPendingTrade forward. Entering
-    // (or re-entering) `settling` is not itself a failure - only
-    // SETTLEMENT_FAILED increments this.
-    settlementFailureCount: state.settlementFailureCount ?? 0,
     lastError: undefined,
   };
 }
@@ -325,49 +313,6 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         nextState,
         "proposingWidth",
         `${roleName(state, state.roles.marketMaker)} is proposing the opening spread width for "${action.item.item_title}".`,
-      );
-    }
-
-    case "ITEM_FAILED": {
-      if (state.phase !== "generatingItem") {
-        return state;
-      }
-
-      const nextState: GameState = {
-        ...state,
-        phase: "error",
-        error: action.error,
-        previousPhase: state.phase,
-        lastError: action.error,
-      };
-
-      return {
-        ...nextState,
-        log: addLog(nextState, "error", `Item generation failed: ${action.error}`),
-      };
-    }
-
-    case "RETRY_ITEM_GENERATION": {
-      if (state.phase !== "error" || state.previousPhase !== "generatingItem") {
-        return state;
-      }
-
-      const nextState: GameState = {
-        phase: "generatingItem",
-        mode: state.mode,
-        players: state.players,
-        scores: state.scores,
-        roles: state.roles,
-        roundNumber: state.roundNumber,
-        totalRounds: state.totalRounds,
-        log: state.log,
-        lastError: undefined,
-      };
-
-      return withLog(
-        nextState,
-        "generatingItem",
-        `Retrying item generation for round ${state.roundNumber}.`,
       );
     }
 
@@ -481,23 +426,11 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         return state;
       }
 
-      // If this choosingSide was re-entered locked (SETTLEMENT_FAILED
-      // bounced back with a pendingTrade already in flight - see
-      // lockedPendingTrade's doc comment), the requested side is ignored:
-      // settling is re-entered with the same locked decision instead of a
-      // fresh "chosen" one. Without this, a trader who stalled the clock to
-      // force a worst-side settlement (F-06) could get an unlocked
-      // re-choice for free any time settlement happened to fail, reopening
-      // the exact exploit F-06 closed.
-      const pendingTrade: PendingTradeDecision =
-        state.lockedPendingTrade ?? { kind: "chosen", side: action.side };
-
       // Deliberately not `...state`: choosingSide carries turnDeadlineMs
-      // (F-05) and may carry lockedPendingTrade, but settling is not a
-      // turn-clocked phase and has no locked-marker concept of its own -
-      // the persistence decoder's per-phase key allowlist
-      // (src/lib/room/persistence.ts) rejects either unexpected field, and
-      // a leftover deadline would otherwise dangle unused.
+      // (F-05), but settling is not a turn-clocked phase - the persisted
+      // state must not inherit a stray deadline. Since Phase 3 this settling
+      // value is also transient-only: the Worker composes straight through
+      // it into "settlement" within one storage transaction.
       const nextState: GameState = {
         phase: "settling",
         mode: state.mode,
@@ -510,19 +443,15 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
         item: state.item,
         spreadWidth: state.spreadWidth,
         quote: state.quote,
-        pendingTrade,
-        // F-07: see the identical field on settlingStateFromChoosingSideTimeout -
-        // inherited unchanged, since choosing to trade (or retry a locked
-        // trade) is not itself a settlement failure.
-        settlementFailureCount: state.settlementFailureCount ?? 0,
+        pendingTrade: { kind: "chosen", side: action.side },
         lastError: undefined,
       };
 
-      const message = state.lockedPendingTrade
-        ? `Retrying the settlement already locked in for ${roleName(state, state.roles.trader)} after a previous settlement failure.`
-        : `${roleName(state, state.roles.trader)} chose to ${action.side === "BUY" ? "buy" : "sell"}. Settling round.`;
-
-      return withLog(nextState, "settling", message);
+      return withLog(
+        nextState,
+        "settling",
+        `${roleName(state, state.roles.trader)} chose to ${action.side === "BUY" ? "buy" : "sell"}. Settling round.`,
+      );
     }
 
     case "SETTLEMENT_RECEIVED": {
@@ -557,85 +486,6 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
       );
     }
 
-    case "SETTLEMENT_FAILED": {
-      if (state.phase !== "settling") {
-        return state;
-      }
-
-      const failureCount = state.settlementFailureCount + 1;
-
-      // F-07: a persistent (non-transient) failure cause must not bounce
-      // choosingSide <-> settling forever - see SETTLEMENT_FAILURE_EPISODE_CAP.
-      // Route to the same terminal `error` phase ITEM_FAILED already uses
-      // instead of inventing a new "stuck" phase: a permanently failed
-      // settlement has no RoundSettlement and no revealed true_value, which
-      // is exactly the shape `error` already has (see ErrorGameState) and
-      // `settlement`/`roundForfeited` do not. `previousPhase: "settling"`
-      // (rather than "generatingItem") is what keeps
-      // canRetryItemGeneration in src/app/page.tsx from offering a
-      // misleading "Retry generation" button here - the host's only path
-      // forward is RESET_TO_LOBBY, already wired for every `error` state
-      // regardless of previousPhase.
-      if (failureCount >= SETTLEMENT_FAILURE_EPISODE_CAP) {
-        const nextState: GameState = {
-          phase: "error",
-          mode: state.mode,
-          players: state.players,
-          scores: state.scores,
-          roles: state.roles,
-          roundNumber: state.roundNumber,
-          totalRounds: state.totalRounds,
-          log: state.log,
-          error: action.error,
-          previousPhase: "settling",
-          lastError: action.error,
-        };
-
-        return {
-          ...nextState,
-          log: addLog(
-            nextState,
-            "error",
-            `Settlement failed ${failureCount} times in a row for this round and will not be retried automatically again: ${action.error}`,
-          ),
-        };
-      }
-
-      // Carry the pendingTrade that was already in flight forward as a
-      // lockedPendingTrade instead of discarding it: without this, a
-      // trader whose choosingSide clock expired (F-06's
-      // timeoutForcedWorstSide) and whose settlement then failed to commit
-      // (missing private item, or F-02's forceFailStuckSettlement
-      // exhaustion) would land back in an ordinary, fully-live choosingSide
-      // - free to EXECUTE_TRADE whichever side is actually better for them,
-      // silently reopening the exact exploit F-06 closed. See
-      // lockedPendingTrade's doc comment on ChoosingSideGameState.
-      const nextState: GameState = {
-        phase: "choosingSide",
-        mode: state.mode,
-        players: state.players,
-        scores: state.scores,
-        roles: state.roles,
-        roundNumber: state.roundNumber,
-        totalRounds: state.totalRounds,
-        log: state.log,
-        item: state.item,
-        spreadWidth: state.spreadWidth,
-        quote: state.quote,
-        turnDeadlineMs: action.turnDeadlineMs,
-        lockedPendingTrade: state.pendingTrade,
-        // F-07: this episode's failure, counted. See
-        // SETTLEMENT_FAILURE_EPISODE_CAP.
-        settlementFailureCount: failureCount,
-        lastError: action.error,
-      };
-
-      return {
-        ...nextState,
-        log: addLog(nextState, "choosingSide", `Settlement failed: ${action.error}`),
-      };
-    }
-
     case "TURN_EXPIRED": {
       // F-06: choosingSide's clock expiring does NOT forfeit like the other
       // three turn-clocked phases (see PROPOSING_WIDTH_FORFEIT_PENALTY's and
@@ -647,22 +497,10 @@ export function gameReducer(state: GameState, action: GameAction): GameState {
       // trader" with here; see resolvePendingTradeSide in settlement.ts for
       // where that happens once true_value is known server-side.
       if (state.phase === "choosingSide") {
-        // A locked choosingSide (see lockedPendingTrade's doc comment)
-        // re-expiring must resolve to the *same* decision, not a fresh
-        // "timeoutForcedWorstSide" sentinel - resetting it here would
-        // silently discard a trader's own "chosen" side (from before
-        // settlement failed) and replace it with the worst-side sentinel,
-        // which is wrong for that case even though it happens to coincide
-        // with the already-correct behavior for an originally-timed-out
-        // decision.
-        const pendingTrade: PendingTradeDecision =
-          state.lockedPendingTrade ?? { kind: "timeoutForcedWorstSide" };
-        const message = state.lockedPendingTrade
-          ? `${roleName(state, state.roles.trader)}'s clock ran out again before the locked settlement retry completed. Retrying automatically.`
-          : `${roleName(state, state.roles.trader)} ran out of time. Settling the round against ${roleName(state, state.roles.trader)}'s worse side.`;
+        const message = `${roleName(state, state.roles.trader)} ran out of time. Settling the round against ${roleName(state, state.roles.trader)}'s worse side.`;
 
         return withLog(
-          settlingStateFromChoosingSideTimeout(state, pendingTrade),
+          settlingStateFromChoosingSideTimeout(state, { kind: "timeoutForcedWorstSide" }),
           "settling",
           message,
         );
@@ -788,10 +626,6 @@ export function receiveItem(
   turnDeadlineMs: UnixTimeMs = UNSET_TURN_DEADLINE_MS,
 ): GameState {
   return gameReducer(state, { type: "ITEM_RECEIVED", item, turnDeadlineMs });
-}
-
-export function retryItemGeneration(state: GameState): GameState {
-  return gameReducer(state, { type: "RETRY_ITEM_GENERATION" });
 }
 
 export function submitInitialWidth(

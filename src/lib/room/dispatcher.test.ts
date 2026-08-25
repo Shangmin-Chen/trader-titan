@@ -169,35 +169,6 @@ describe("room dispatcher", () => {
     expect(settled.game.settlement.marketMakerPnL).toBe(-100);
     expect(settled.game.scores).toEqual({ A: -100, B: 100 });
   });
-
-  it("dispatches retry item generation after an item failure", () => {
-    const { room, hostToken } = activeRoom();
-    const failed = expectOk(
-      dispatchSystemRoomEvent(room, {
-        type: "ITEM_FAILED",
-        error: "Provider timed out.",
-        nowMs: NOW_MS + 3,
-      }),
-    );
-    const retried = expectOk(
-      dispatchRoomCommand(
-        failed,
-        mustClientCommand(
-          {
-            type: "RETRY_ITEM_GENERATION",
-            credential: present(hostToken),
-            commandId: "command-retry-item-generation-1",
-          },
-          NOW_MS + 4,
-        ),
-        dispatchContext(),
-      ),
-    );
-
-    expect(retried.game.phase).toBe("generatingItem");
-    expect(retried.game.lastError).toBeUndefined();
-    expect(retried.revision).toBe(failed.revision + 1);
-  });
 });
 
 function settlingRoom(): {

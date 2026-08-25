@@ -3,7 +3,6 @@ import {
   clearRoomSession,
   createRoom,
   getRoomPreview,
-  ITEM_GENERATION_REQUEST_TIMEOUT_MS,
   joinRoom,
   loadRoomSession,
   openRoomSocket,
@@ -223,69 +222,6 @@ describe("room client", () => {
         { fetchImpl },
       ),
     ).resolves.toEqual({ ok: true, room: SNAPSHOT });
-  });
-
-  it("exposes a longer timeout budget for item-generation commands than the default", async () => {
-    // START_ROOM / RETRY_ITEM_GENERATION get this dedicated budget instead
-    // of the default. The budget itself is legacy — item receipt is now a
-    // synchronous static-deck pick with no external I/O (see the constant's
-    // doc comment) and it is slated for removal in cleanup plan Phase 3 —
-    // but callers still pass this via `options.signal` for those two command
-    // types specifically, not for every room HTTP call.
-    expect(ITEM_GENERATION_REQUEST_TIMEOUT_MS).toBeGreaterThan(30_000);
-
-    let capturedSignal: AbortSignal | undefined;
-    const fetchImpl = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
-      capturedSignal = init?.signal ?? undefined;
-      return Response.json({ ok: true, room: SNAPSHOT });
-    });
-
-    await sendRoomCommand(
-      ROOM_ID,
-      { type: "RETRY_ITEM_GENERATION", credential: HOST_TOKEN, commandId: "test-command-2", nowMs: 1 },
-      { fetchImpl, signal: AbortSignal.timeout(ITEM_GENERATION_REQUEST_TIMEOUT_MS) },
-    );
-
-    expect(capturedSignal).toBeInstanceOf(AbortSignal);
-    expect(capturedSignal?.aborted).toBe(false);
-  });
-
-  it("serializes retry item generation commands through the room command route", async () => {
-    const requests: Array<Readonly<{ input: string; body: unknown }>> = [];
-    const fetchImpl = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-      requests.push({
-        input: String(input),
-        body: JSON.parse(String(init?.body)) as unknown,
-      });
-
-      return Response.json({
-        ok: true,
-        room: SNAPSHOT,
-      });
-    });
-
-    await sendRoomCommand(
-      ROOM_ID,
-      {
-        type: "RETRY_ITEM_GENERATION",
-        credential: HOST_TOKEN,
-        commandId: "command-retry-item-generation-1",
-        nowMs: 2,
-      },
-      { baseUrl: "https://example.test", fetchImpl },
-    );
-
-    expect(requests).toEqual([
-      {
-        input: `https://example.test/api/rooms/${ROOM_ID}/command`,
-        body: {
-          type: "RETRY_ITEM_GENERATION",
-          credential: HOST_TOKEN,
-          commandId: "command-retry-item-generation-1",
-          nowMs: 2,
-        },
-      },
-    ]);
   });
 
   it("builds websocket URLs from explicit base URLs or browser location", () => {

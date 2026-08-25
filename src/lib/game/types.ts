@@ -62,26 +62,6 @@ export const MIN_TURN_DURATION_MS = Math.min(
 // worse for them, so stalling can never beat acting.
 export const PROPOSING_WIDTH_FORFEIT_PENALTY = 100;
 
-// F-07: bounds cross-episode SETTLEMENT_FAILED bounces (choosingSide(locked)
-// -> settling -> SETTLEMENT_FAILED -> choosingSide(locked)), i.e. how many
-// separate `settling` episodes a single round may burn through before this
-// is treated as a persistent, non-transient failure rather than a one-off
-// hiccup. This is a different axis from PENDING_SETTLE_EFFECT_MAX_ATTEMPTS
-// (src/worker/index.ts), which bounds alarm-driven retries *within* one
-// settling episode with its own exponential backoff (up to 5 attempts, up
-// to 5 minutes apart) before that episode itself bounces back to
-// choosingSide - this constant instead bounds how many times that bounce
-// itself may happen for the same round. Each episode is already fairly
-// resilient to a transient blip (network hiccup, a momentarily evicted
-// isolate) via its own attempt budget, so recovering from a genuinely
-// transient cause rarely needs more than a bounce or two; 3 total episodes
-// allows one retry beyond that margin while still keeping the worst case
-// (a structurally broken round - e.g. corrupted private item storage) to a
-// handful of bounded episodes instead of an unbounded cycle with no
-// terminal state. See settlementFailureCount on ChoosingSideGameState and
-// SettlingGameState, and the SETTLEMENT_FAILED case in reducer.ts.
-export const SETTLEMENT_FAILURE_EPISODE_CAP = 3;
-
 export type GameMode = (typeof GAME_MODES)[number];
 
 export type UnixTimeMs = number;
@@ -137,8 +117,7 @@ export type GamePhase =
   | "settling"
   | "settlement"
   | "roundForfeited"
-  | "gameOver"
-  | "error";
+  | "gameOver";
 
 export type RoundSettlement = {
   roundNumber: number;
@@ -249,55 +228,20 @@ export type ChoosingSideGameState = GameStateBase & {
   spreadWidth: number;
   quote: Quote;
   turnDeadlineMs: UnixTimeMs;
-  /**
-   * Set only when this choosingSide state was re-entered via SETTLEMENT_FAILED
-   * bouncing back out of `settling` (private item missing/corrupt, or F-02's
-   * forceFailStuckSettlement exhaustion fallback) - never by a normal
-   * SUBMIT_MARKET_QUOTE transition into a fresh choice. Carries forward
-   * whichever PendingTradeDecision was already in flight when settlement
-   * failed - a trader's own EXECUTE_TRADE choice, or an F-06
-   * timeoutForcedWorstSide - so it isn't silently discarded.
-   *
-   * When present, the decision is locked: EXECUTE_TRADE's requested side is
-   * ignored and settling is re-entered with this same decision instead (see
-   * the EXECUTE_TRADE and TURN_EXPIRED cases in reducer.ts). Without this,
-   * a trader who deliberately stalled choosingSide's clock to force a
-   * worst-side settlement (F-06) could get a second, unlocked roll of the
-   * dice for free any time settlement happened to fail - reopening exactly
-   * the exploit F-06 closed. The clock still runs and can still expire
-   * normally; while locked it measures time until the decision is retried
-   * automatically, not a live choice, and the UI must not present Buy/Sell
-   * as though clicking either one matters (see RoomGameView in
-   * src/app/page.tsx).
-   */
-  lockedPendingTrade?: PendingTradeDecision;
-  /**
-   * How many prior `settling` episodes have already failed for this round.
-   * Always present exactly when `lockedPendingTrade` is (both set together
-   * by SETTLEMENT_FAILED, both absent on a plain SUBMIT_MARKET_QUOTE
-   * choosingSide) - see SETTLEMENT_FAILURE_EPISODE_CAP. Carried forward
-   * unchanged by EXECUTE_TRADE/TURN_EXPIRED re-entering `settling` (see
-   * SettlingGameState.settlementFailureCount); SETTLEMENT_FAILED increments
-   * it and, once it reaches the cap, routes to the terminal `error` phase
-   * instead of bouncing back here again.
-   */
-  settlementFailureCount?: number;
 };
 
 export type SettlingGameState = GameStateBase & {
+  // Transient-only since Phase 3's synchronous settlement: EXECUTE_TRADE (and
+  // an F-06 choosingSide timeout, inside the Worker alarm) compose straight
+  // through this phase into "settlement" within a single storage
+  // transaction, so a settling state is never persisted and never broadcast.
+  // It remains a valid GamePhase because the reducer still produces it as an
+  // intermediate value and the round log can reference it.
   phase: "settling";
   item: GeneratedItem;
   spreadWidth: number;
   quote: Quote;
   pendingTrade: PendingTradeDecision;
-  /**
-   * Inherited from the choosingSide this episode entered from (0 for a
-   * fresh, never-yet-failed round - see ChoosingSideGameState's own doc
-   * comment on this field). Untouched by this episode's own outcome until
-   * SETTLEMENT_FAILED reads it to decide whether to bounce back to
-   * choosingSide again or give up - see SETTLEMENT_FAILURE_EPISODE_CAP.
-   */
-  settlementFailureCount: number;
 };
 
 export type SettlementGameState = GameStateBase & {
@@ -318,12 +262,6 @@ export type GameOverState = GameStateBase & {
   winner: PlayerId | "Tie";
 };
 
-export type ErrorGameState = GameStateBase & {
-  phase: "error";
-  error: string;
-  previousPhase: GamePhase;
-};
-
 export type GameState =
   | SetupGameState
   | GeneratingItemGameState
@@ -334,8 +272,7 @@ export type GameState =
   | SettlingGameState
   | SettlementGameState
   | RoundForfeitedGameState
-  | GameOverState
-  | ErrorGameState;
+  | GameOverState;
 
 export type StartGamePayload = {
   playerAName: string;
@@ -347,8 +284,6 @@ export type StartGamePayload = {
 export type GameAction =
   | { type: "START_GAME"; payload: StartGamePayload }
   | { type: "ITEM_RECEIVED"; item: GeneratedItem; turnDeadlineMs: UnixTimeMs }
-  | { type: "ITEM_FAILED"; error: string }
-  | { type: "RETRY_ITEM_GENERATION" }
   | { type: "SUBMIT_INITIAL_WIDTH"; width: number; turnDeadlineMs: UnixTimeMs }
   | { type: "TIGHTEN_WIDTH"; width: number; turnDeadlineMs: UnixTimeMs }
   | { type: "TRADE_ON_WIDTH"; turnDeadlineMs: UnixTimeMs }
@@ -360,7 +295,6 @@ export type GameAction =
       item: SettledGeneratedItem;
       settlement: RoundSettlement;
     }
-  | { type: "SETTLEMENT_FAILED"; error: string; turnDeadlineMs: UnixTimeMs }
   // Server-only: dispatched by the Worker alarm when a stamped turnDeadlineMs
   // elapses. Never decoded from client input (see protocol.ts) - the reducer
   // trusts it exactly like SETTLEMENT_RECEIVED trusts its settlement input,

@@ -35,22 +35,6 @@ export const ROOM_SOCKET_PONG_MESSAGE = "tt-pong";
  */
 const DEFAULT_ROOM_REQUEST_TIMEOUT_MS = 30_000;
 
-/**
- * Longer timeout bound for `START_ROOM` (round 1) and
- * `RETRY_ITEM_GENERATION`, kept separate from the default so callers can
- * pass a wider `options.signal` for exactly those two command types.
- *
- * It dates from when those commands could run real external network calls
- * synchronously in the request path. Item receipt is now a synchronous
- * static-deck pick and settlement is derived locally, so every command's
- * round-trip is local worker work and this bound no longer needs to
- * exceed `DEFAULT_ROOM_REQUEST_TIMEOUT_MS`; it simply bounds command
- * round-trips at 120s. It is slated for removal together with the rest of
- * the item-generation plumbing (cleanup plan Phase 3), after which every
- * command uses the default budget.
- */
-export const ITEM_GENERATION_REQUEST_TIMEOUT_MS = 120_000;
-
 type JsonObject = Record<string, unknown>;
 type FetchLike = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 type WebSocketConstructor = new (

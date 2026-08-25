@@ -1,12 +1,10 @@
 import { calculateSettlement } from "../game/settlement";
 import {
   GAME_MODES,
-  SETTLEMENT_FAILURE_EPISODE_CAP,
   type GameMode,
   type GamePhase,
   type GameState,
   type GeneratedItem,
-  type PendingTradeDecision,
   type PlayerId,
   type ProviderGeneratedItem,
   type Quote,
@@ -54,23 +52,25 @@ export const FINISHED_ROOM_TTL_MS =
   FINISHED_ROOM_MINUTES * SECONDS_PER_MINUTE * MILLISECONDS_PER_SECOND;
 
 export const ROOM_PERSISTENCE_KIND = "trader-titan.room";
-export const ROOM_PERSISTENCE_VERSION = 4;
+export const ROOM_PERSISTENCE_VERSION = 5;
 
 /**
  * Hard persistence cutover (decision D2): the oldest envelope version this
- * decoder accepts equals ROOM_PERSISTENCE_VERSION. Version 4 is the first
- * shape without the retired custom-query/AI config flags, without the
- * scraped Amazon item fields, and without per-version migration - the
- * v1→v3 migration chain was deleted with this cutover, so any older envelope
- * fails decode (persistence_version_unsupported) and the room's self-heal
- * paths purge it, after which the room reads as never-created. Blast radius
- * per deploy: rooms live in the ≤2 h TTL window.
+ * decoder accepts equals ROOM_PERSISTENCE_VERSION. Version 5 is the first
+ * shape without the provider-failure machinery: the `generatingItem`,
+ * `settling`, and `error` phases stopped being persistable (synchronous
+ * settlement composes straight through `settling` in one Worker storage
+ * transaction, and nothing produces `error` anymore), and the F-07 bounce
+ * fields left `choosingSide` with them.
+ * Any older envelope fails decode (persistence_version_unsupported) and the
+ * room's self-heal paths purge it, after which the room reads as
+ * never-created. Blast radius per deploy: rooms live in the ≤2 h TTL window.
  *
  * Every future shape change to a phase's persisted keys needs a version bump
  * with MIN_SUPPORTED moved up to match - no cross-version migration is
  * written at any point.
  */
-const ROOM_PERSISTENCE_MIN_SUPPORTED_VERSION = 4;
+const ROOM_PERSISTENCE_MIN_SUPPORTED_VERSION = 5;
 
 export type PersistedRoomEnvelope = Readonly<{
   kind: typeof ROOM_PERSISTENCE_KIND;
@@ -257,7 +257,6 @@ function decodeGameState(value: unknown): GameState | null {
 
   switch (value.phase) {
     case "setup":
-    case "generatingItem":
       return hasOnlyKeys(value, baseGameKeysFor(value)) ? value as GameState : null;
     case "proposingWidth":
       return hasOnlyKeys(value, [...baseGameKeysFor(value), "item", "turnDeadlineMs"]) &&
@@ -282,44 +281,19 @@ function decodeGameState(value: unknown): GameState | null {
         "spreadWidth",
         "quote",
         "turnDeadlineMs",
-        ...(value.lockedPendingTrade === undefined ? [] : ["lockedPendingTrade"]),
-        ...(value.settlementFailureCount === undefined ? [] : ["settlementFailureCount"]),
       ]) &&
         isGeneratedItem(value.item) &&
         isValidSpreadWidth(value.spreadWidth) &&
         isQuoteForWidth(value.quote, value.spreadWidth) &&
         isUnixTimeMs(value.turnDeadlineMs) &&
-        (value.lockedPendingTrade === undefined ||
-          isPendingTradeDecision(value.lockedPendingTrade)) &&
-        // F-07: lockedPendingTrade and settlementFailureCount are only ever
-        // set together, both by SETTLEMENT_FAILED (see
-        // ChoosingSideGameState's doc comment on settlementFailureCount) -
-        // reject a persisted state that has drifted to carrying only one of
-        // the pair rather than silently accepting an illegal blend.
-        (value.lockedPendingTrade === undefined) ===
-          (value.settlementFailureCount === undefined) &&
-        (value.settlementFailureCount === undefined ||
-          isSettlementFailureCount(value.settlementFailureCount)) &&
         isActiveRoundNumber(value)
         ? value as GameState
         : null;
-    case "settling":
-      return hasOnlyKeys(value, [
-        ...baseGameKeysFor(value),
-        "item",
-        "spreadWidth",
-        "quote",
-        "pendingTrade",
-        "settlementFailureCount",
-      ]) &&
-        isGeneratedItem(value.item) &&
-        isValidSpreadWidth(value.spreadWidth) &&
-        isQuoteForWidth(value.quote, value.spreadWidth) &&
-        isPendingTradeDecision(value.pendingTrade) &&
-        isSettlementFailureCount(value.settlementFailureCount) &&
-        isActiveRoundNumber(value)
-        ? value as GameState
-        : null;
+    // `generatingItem` and `settling` are transient-only phases since the
+    // synchronous-deck / synchronous-settlement cutovers: no committed room
+    // state ever carries them anymore, so a persisted envelope that does is
+    // rejected outright (and, being un-decodable, purges on first touch).
+    // The `error` phase died with the provider-failure machinery.
     case "settlement":
       return hasOnlyKeys(value, [...baseGameKeysFor(value), "item", "spreadWidth", "quote", "settlement"]) &&
         isSettledGeneratedItem(value.item) &&
@@ -340,12 +314,6 @@ function decodeGameState(value: unknown): GameState | null {
       return hasOnlyKeys(value, [...baseGameKeysFor(value), "winner"]) &&
         (value.winner === "A" || value.winner === "B" || value.winner === "Tie") &&
         isActiveRoundNumber(value)
-        ? value as GameState
-        : null;
-    case "error":
-      return hasOnlyKeys(value, [...baseGameKeysFor(value), "error", "previousPhase"]) &&
-        typeof value.error === "string" &&
-        isGamePhase(value.previousPhase)
         ? value as GameState
         : null;
     default:
@@ -555,34 +523,12 @@ function isGamePhase(value: unknown): value is GamePhase {
       value === "settling" ||
       value === "settlement" ||
       value === "roundForfeited" ||
-      value === "gameOver" ||
-      value === "error"
+      value === "gameOver"
     );
 }
 
 function isTradeSide(value: unknown): value is TradeSide {
   return value === "BUY" || value === "SELL";
-}
-
-/**
- * F-06: mirrors PendingTradeDecision's two variants exactly - a "chosen"
- * trade requires a validated TradeSide and nothing else, while
- * "timeoutForcedWorstSide" carries no extra fields (the actual side is
- * resolved later - see resolvePendingTradeSide - so persisting one here
- * would be recomputable-but-stale data, not a fact about the pending
- * decision). hasOnlyKeys on both branches keeps an illegal blend (e.g. a
- * "timeoutForcedWorstSide" that also carries a stray `side`) unrepresentable.
- */
-function isPendingTradeDecision(value: unknown): value is PendingTradeDecision {
-  if (!isRecord(value)) {
-    return false;
-  }
-
-  if (value.kind === "chosen") {
-    return hasOnlyKeys(value, ["kind", "side"]) && isTradeSide(value.side);
-  }
-
-  return value.kind === "timeoutForcedWorstSide" && hasOnlyKeys(value, ["kind"]);
 }
 
 function isPlayerId(value: unknown): value is PlayerId {
@@ -626,21 +572,6 @@ function isPositiveInteger(value: unknown): value is number {
 
 function isNonNegativeInteger(value: unknown): value is number {
   return Number.isInteger(value) && Number(value) >= 0;
-}
-
-/**
- * F-07: valid range is [0, SETTLEMENT_FAILURE_EPISODE_CAP) - a persisted
- * `settling` or locked `choosingSide` can only ever have already failed
- * *fewer* times than the cap, since reaching the cap routes to the
- * terminal `error` phase instead of persisting another settling/choosingSide
- * state at all (see the SETTLEMENT_FAILED case in reducer.ts). Rejecting an
- * out-of-range value here - rather than only trusting the reducer to never
- * produce one - keeps a corrupted or tampered envelope from smuggling in a
- * round that looks like it is one bounce further along than any reducer
- * transition could actually produce.
- */
-function isSettlementFailureCount(value: unknown): value is number {
-  return isNonNegativeInteger(value) && value < SETTLEMENT_FAILURE_EPISODE_CAP;
 }
 
 function isFiniteNumber(value: unknown): value is number {

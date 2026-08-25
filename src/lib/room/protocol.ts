@@ -41,8 +41,7 @@ export type HostRoomCommandType =
   | "START_ROOM"
   | "RESET_TO_LOBBY"
   | "KICK_GUEST"
-  | "ADVANCE_ROUND"
-  | "RETRY_ITEM_GENERATION";
+  | "ADVANCE_ROUND";
 
 export type PlayerRoomCommandType =
   | "SUBMIT_INITIAL_WIDTH"
@@ -71,8 +70,7 @@ export type HostRoomCommand =
         | "START_ROOM"
         | "RESET_TO_LOBBY"
         | "KICK_GUEST"
-        | "ADVANCE_ROUND"
-        | "RETRY_ITEM_GENERATION";
+        | "ADVANCE_ROUND";
       credential: PresentedCapabilityToken;
       commandId: string;
       nowMs: UnixTimeMs;
@@ -114,18 +112,8 @@ export type SystemRoomEvent =
       nowMs: UnixTimeMs;
     }>
   | Readonly<{
-      type: "ITEM_FAILED";
-      error: string;
-      nowMs: UnixTimeMs;
-    }>
-  | Readonly<{
       type: "SETTLEMENT_RECEIVED";
       item: SettledGeneratedItem;
-      nowMs: UnixTimeMs;
-    }>
-  | Readonly<{
-      type: "SETTLEMENT_FAILED";
-      error: string;
       nowMs: UnixTimeMs;
     }>
   | Readonly<{
@@ -152,7 +140,6 @@ export type RoomProtocolDecodeErrorCode =
   | "quote_invalid"
   | "trade_side_invalid"
   | "item_invalid"
-  | "error_invalid"
   | "settlement_not_allowed";
 
 export type RoomProtocolDecodeError = Readonly<{
@@ -219,7 +206,6 @@ export function parseClientRoomCommand(
     case "RESET_TO_LOBBY":
     case "KICK_GUEST":
     case "ADVANCE_ROUND":
-    case "RETRY_ITEM_GENERATION":
       return decodeHostRoomCommand(value, type.value, now.value);
     case "SUBMIT_INITIAL_WIDTH":
     case "TIGHTEN_WIDTH":
@@ -279,13 +265,6 @@ export function parseSystemRoomEvent(
         ? { ok: true, event: { type: type.value, item: item.value, nowMs: now.value } }
         : decodeEventFailure(item.error);
     }
-    case "ITEM_FAILED": {
-      const error = decodeErrorMessage(value.error, "error");
-
-      return error.ok
-        ? { ok: true, event: { type: type.value, error: error.value, nowMs: now.value } }
-        : decodeEventFailure(error.error);
-    }
     case "SETTLEMENT_RECEIVED": {
       if (hasField(value, "settlement")) {
         return decodeEventFailure(
@@ -302,13 +281,6 @@ export function parseSystemRoomEvent(
       return item.ok
         ? { ok: true, event: { type: type.value, item: item.value, nowMs: now.value } }
         : decodeEventFailure(item.error);
-    }
-    case "SETTLEMENT_FAILED": {
-      const error = decodeErrorMessage(value.error, "error");
-
-      return error.ok
-        ? { ok: true, event: { type: type.value, error: error.value, nowMs: now.value } }
-        : decodeEventFailure(error.error);
     }
     case "TURN_EXPIRED":
       return { ok: true, event: { type: type.value, nowMs: now.value } };
@@ -542,7 +514,6 @@ function decodeClientCommandType(value: unknown): DecodeResult<ClientCommandType
     case "RESET_TO_LOBBY":
     case "KICK_GUEST":
     case "ADVANCE_ROUND":
-    case "RETRY_ITEM_GENERATION":
     case "SUBMIT_INITIAL_WIDTH":
     case "TIGHTEN_WIDTH":
     case "TRADE_ON_WIDTH":
@@ -561,9 +532,7 @@ function decodeSystemEventType(value: unknown): DecodeResult<SystemEventType> {
 
   switch (value) {
     case "ITEM_RECEIVED":
-    case "ITEM_FAILED":
     case "SETTLEMENT_RECEIVED":
-    case "SETTLEMENT_FAILED":
     case "TURN_EXPIRED":
       return { ok: true, value };
     default:
@@ -753,12 +722,6 @@ function decodeGeneratedItemFields(
       context_clue: value.context_clue,
     },
   };
-}
-
-function decodeErrorMessage(value: unknown, path: string): DecodeResult<string> {
-  return typeof value === "string"
-    ? { ok: true, value }
-    : decodeFailure("error_invalid", "System error message must be a string.", path);
 }
 
 function decodeNowMs(value: unknown): DecodeResult<UnixTimeMs> {

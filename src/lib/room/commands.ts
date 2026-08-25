@@ -231,11 +231,6 @@ export function resetRoomToLobby(
     return { ok: false, room, error: authorized.error };
   }
 
-  const settling = settlingRoundFailure(room);
-  if (settling !== null) {
-    return settling;
-  }
-
   return {
     ok: true,
     room: {
@@ -272,11 +267,6 @@ export function kickGuest(
     return commandFailure(room, "guest_slot_empty", "There is no guest to kick.");
   }
 
-  const settling = settlingRoundFailure(room);
-  if (settling !== null) {
-    return settling;
-  }
-
   return {
     ok: true,
     room: {
@@ -307,80 +297,6 @@ export function receiveRoomItem(
     room,
     { type: "ITEM_RECEIVED", item, turnDeadlineMs: nowMs + PROPOSING_WIDTH_TURN_DURATION_MS },
     nowMs,
-  );
-}
-
-export function failRoomItem(
-  room: RoomState,
-  error: string,
-  nowMs: UnixTimeMs,
-): RoomCommandResult {
-  if (room.lifecycle !== "active") {
-    return commandFailure(room, "room_not_active", "Item failures can only be received by active rooms.");
-  }
-
-  if (room.game.phase !== "generatingItem") {
-    return commandFailure(room, "invalid_game_phase", "Item failures can only be received while the room is generating an item.");
-  }
-
-  return applySystemGameAction(room, { type: "ITEM_FAILED", error }, nowMs);
-}
-
-/**
- * F-02 mitigation: this command originally retried only a failed item
- * generation. It now also recovers a room durably stuck in `settling` -
- * the trapdoor phase EXECUTE_TRADE commits to storage before the automatic
- * settlement effect runs. If that effect never runs (isolate evicted,
- * request abandoned), no client command could previously move the room out
- * of `settling`, and the only escape was RESET_TO_LOBBY, discarding the
- * whole match. Widening this command in place (rather than introducing a
- * new wire command) keeps the client, dispatcher, and protocol decoding
- * unchanged; see specs/room-protocol.md.
- *
- * The settling branch intentionally does not touch the reducer: the room
- * is left exactly as EXECUTE_TRADE (or an F-06 choosingSide timeout)
- * committed it (same item, quote, and pendingTrade), and the caller re-runs
- * the settlement effect (Worker `applyAutomaticRoomEffects` ->
- * `receiveStoredSettlement`) against that unchanged state. Settlement is a
- * pure function of (item, quote, side), so retrying cannot change or re-roll
- * the outcome - including which side a forced timeout resolves to, since
- * that is itself a pure function of (quote, true_value) via
- * resolvePendingTradeSide.
- */
-export function retryRoomItemGeneration(
-  room: RoomState,
-  input: AuthorizedCommandInput,
-): RoomCommandResult {
-  const authorized = authorizeRoomAction(
-    room,
-    input.credential,
-    { type: "hostControl" },
-    input.verifyToken,
-  );
-
-  if (!authorized.ok) {
-    return { ok: false, room, error: authorized.error };
-  }
-
-  if (room.lifecycle !== "active") {
-    return commandFailure(room, "room_not_active", "Only active rooms can retry a pending effect.");
-  }
-
-  if (room.game.phase === "error" && room.game.previousPhase === "generatingItem") {
-    return applySystemGameAction(room, { type: "RETRY_ITEM_GENERATION" }, input.nowMs);
-  }
-
-  if (room.game.phase === "settling") {
-    // No reducer transition: the room stays in settling exactly as
-    // EXECUTE_TRADE committed it. The Worker layer treats this as a signal
-    // to re-run the settlement effect for the current round.
-    return { ok: true, room };
-  }
-
-  return commandFailure(
-    room,
-    "invalid_game_phase",
-    "Item generation or settlement can only be retried after a failure.",
   );
 }
 
@@ -495,30 +411,6 @@ export function receiveRoomSettlement(
   return applySystemGameAction(
     room,
     { type: "SETTLEMENT_RECEIVED", item, settlement },
-    nowMs,
-  );
-}
-
-export function failRoomSettlement(
-  room: RoomState,
-  error: string,
-  nowMs: UnixTimeMs,
-): RoomCommandResult {
-  if (room.lifecycle !== "active") {
-    return commandFailure(room, "room_not_active", "Settlement failures can only be received by active rooms.");
-  }
-
-  if (room.game.phase !== "settling") {
-    return commandFailure(room, "invalid_game_phase", "Settlement failures can only be received while the room is settling.");
-  }
-
-  return applySystemGameAction(
-    room,
-    {
-      type: "SETTLEMENT_FAILED",
-      error,
-      turnDeadlineMs: nowMs + CHOOSING_SIDE_TURN_DURATION_MS,
-    },
     nowMs,
   );
 }
@@ -750,60 +642,3 @@ function commandFailure(
   };
 }
 
-/**
- * Closes a competitive-integrity hole: RESET_TO_LOBBY and KICK_GUEST are
- * host-control commands with no other phase restriction, and both discard
- * the entire match (including this round's private true_value, deleted by
- * the Worker right after either command commits - see
- * `shouldDeletePrivateGeneratedItemsAfterCommand`). A host who is also the
- * trader this round has already locked in an outcome the instant
- * EXECUTE_TRADE lands (the true value was fixed back when the item was
- * generated; only the reveal and score update are still pending), so
- * without this guard the host could always duck a trade going against them
- * by nuking the room before settlement resolves - and the guest would never
- * even learn what the outcome would have been.
- *
- * This intentionally targets only `settling`: every other active phase
- * (including `choosingSide`, before a side is chosen, and `settlement`,
- * after the outcome is revealed and scored) has no determined-but-hidden
- * outcome to protect, so the host's reset/kick tools stay fully available
- * there - including for a genuinely abandoned guest or a room the host
- * wants to abandon before committing to a trade.
- *
- * This does not strand a stuck room: `retryRoomItemGeneration` is already
- * authorized for hostControl and already accepts `settling` (see F-02
- * above) as a signal to re-run the settlement effect, or, after enough
- * failed attempts, to force the round out of `settling` via
- * SETTLEMENT_FAILED - back to `choosingSide`, or, once
- * SETTLEMENT_FAILURE_EPISODE_CAP consecutive episodes have failed for the
- * same round, on to the terminal `error` phase (F-07). Every one of those
- * outcomes leaves `settling`, whether by that command or by the Worker's
- * own alarm-driven retry, after which RESET_TO_LOBBY/KICK_GUEST are
- * available again - including from `error`, which is what makes the F-07
- * terminal state recoverable rather than a dead end.
- *
- * The gate below checks `game.phase` only, not `room.lifecycle`. That is
- * deliberate, not an oversight: `lifecycle` is derived from `phase` by
- * `lifecycleForGame`, which only ever produces a non-"active" lifecycle once
- * `phase === "gameOver"` - and `gameOver` can never be `settling`. Every
- * `RoomState` reachable through the exported command API therefore already
- * satisfies `phase === "settling" implies lifecycle === "active"`, so a
- * `lifecycle !== "active"` check here can never be false when the phase
- * check is true. Adding it back would just re-check the same fact through a
- * second, derived representation - untestable through this module's public
- * surface, and a trap for a future reader who might assume it is
- * load-bearing. If a future phase/lifecycle change ever breaks that
- * invariant, fix it at the source (`lifecycleForGame`), not by resurrecting
- * a redundant check here.
- */
-function settlingRoundFailure(room: RoomState): RoomCommandFailure | null {
-  if (room.game.phase !== "settling") {
-    return null;
-  }
-
-  return commandFailure(
-    room,
-    "round_settling",
-    "This round's trade is locked in and settling. Wait for it to resolve, or use Retry if it's stuck, before resetting or kicking.",
-  );
-}

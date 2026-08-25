@@ -10,15 +10,9 @@ import { describe, expect, it } from "vitest";
 
 import worker, { GameRoomDurableObject } from "./index";
 import {
-  privateGeneratedItemStorageKey,
-  privateGeneratedItemStoragePrefix
-} from "./private-generated-items";
-import {
   SMOKE_HEADER_NAME,
   SMOKE_HEADER_VALUE
 } from "./testing/open-next-worker";
-import { applySettlementToScores, SETTLEMENT_FAILURE_EPISODE_CAP } from "../lib/game";
-import type { TradeSide } from "../lib/game";
 import {
   isRetryableRoomSocketCloseCode,
   ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS,
@@ -28,7 +22,6 @@ import {
   ROOM_CREATION_RATE_LIMIT_MAX_REQUESTS
 } from "../api/request-guards";
 import {
-  dispatchRoomCommand,
   loadPersistenceEnvelope,
   roomExpiresAtMs,
   toPersistenceEnvelope
@@ -45,32 +38,16 @@ const JOIN_ROOM_NAME = "worker-room-join-persist";
 const COMMAND_ROOM_NAME = "worker-room-command";
 const START_OFFLINE_ROOM_NAME = "worker-room-start-offline";
 const SETTLEMENT_ROOM_NAME = "worker-room-settlement";
-const MISSING_SETTLEMENT_ITEM_ROOM_NAME = "worker-room-missing-settlement-item";
-const CORRUPT_SETTLEMENT_ITEM_ROOM_NAME = "worker-room-corrupt-settlement-item";
-const STUCK_SETTLING_ROOM_NAME = "worker-room-stuck-settling";
-const STUCK_SETTLING_UNAUTHORIZED_ROOM_NAME = "worker-room-stuck-settling-unauthorized";
-const STUCK_SETTLING_AUTO_RESUME_ROOM_NAME = "worker-room-stuck-settling-auto-resume";
-const STUCK_SETTLING_TTL_ROOM_NAME = "worker-room-stuck-settling-ttl";
-const STUCK_SETTLING_BOTH_DEADLINES_ROOM_NAME = "worker-room-stuck-settling-both-deadlines";
-const STUCK_SETTLING_EXHAUSTION_ROOM_NAME = "worker-room-stuck-settling-exhaustion";
-const STUCK_SETTLING_STALE_ROUND_EXHAUSTION_ROOM_NAME =
-  "worker-room-stuck-settling-stale-round-exhaustion";
-const STUCK_SETTLING_NO_DOUBLE_SETTLE_ROOM_NAME = "worker-room-stuck-settling-no-double-settle";
-const PERMANENT_SETTLEMENT_FAILURE_ROOM_NAME = "worker-room-permanent-settlement-failure";
-const STUCK_SETTLING_MID_ALARM_EXPIRY_ROOM_NAME = "worker-room-stuck-settling-mid-alarm-expiry";
-const SETTLING_ABORT_ROOM_NAME = "worker-room-settling-abort";
-const RETRY_SUCCESS_ROOM_NAME = "worker-room-retry-success";
-const RETRY_FAILURE_ROOM_NAME = "worker-room-retry-failure";
-const RETRY_UNAUTHORIZED_ROOM_NAME = "worker-room-retry-unauthorized";
-const RESET_PRIVATE_ITEM_ROOM_NAME = "worker-room-reset-private-item";
-const KICK_PRIVATE_ITEM_ROOM_NAME = "worker-room-kick-private-item";
-const REPLACE_PRIVATE_ITEM_ROOM_NAME = "worker-room-replace-private-item";
-const ALARM_PRIVATE_ITEM_ROOM_NAME = "worker-room-alarm-private-item";
+const DECK_START_ROOM_NAME = "worker-room-deck-start";
+const DECK_ADVANCE_ROOM_NAME = "worker-room-deck-advance";
+const NO_SETTLING_ENVELOPE_ROOM_NAME = "worker-room-no-settling-envelope";
+const IDLE_ALARM_TTL_ROOM_NAME = "worker-room-idle-alarm-ttl-only";
+const CORRUPT_REPLACE_ROOM_NAME = "worker-room-corrupt-replace";
+const ALARM_INVALID_ROOM_NAME = "worker-room-alarm-invalid-envelope";
 const COMMAND_PURGE_ON_INVALID_ROOM_NAME = "worker-room-command-purge-on-invalid";
 const JOIN_PURGE_ON_INVALID_ROOM_NAME = "worker-room-join-purge-on-invalid";
-const ALARM_MISSING_PRIVATE_ITEM_ROOM_NAME = "worker-room-alarm-missing-private-item";
-const ALARM_EXPIRED_PRIVATE_ITEM_ROOM_NAME = "worker-room-alarm-expired-private-item";
-const ALARM_VALID_PRIVATE_ITEM_ROOM_NAME = "worker-room-alarm-valid-private-item";
+const ALARM_EXPIRED_ROOM_NAME = "worker-room-alarm-expired-envelope";
+const ALARM_RESCHEDULE_ROOM_NAME = "worker-room-alarm-valid-reschedule";
 const SOCKET_INITIAL_ROOM_NAME = "worker-room-socket-initial";
 const SOCKET_COMMAND_ROOM_NAME = "worker-room-socket-command";
 const SOCKET_ERROR_ROOM_NAME = "worker-room-socket-error";
@@ -85,7 +62,6 @@ const PING_PONG_ROOM_NAME = "worker-room-ping-pong";
 const LIVENESS_SWEEP_STALE_VS_LIVE_ROOM_NAME = "worker-room-liveness-sweep-stale-vs-live";
 const LIVENESS_SWEEP_EXACT_BOUNDARY_ROOM_NAME = "worker-room-liveness-sweep-exact-boundary";
 const LIVENESS_SWEEP_ALARM_MULTIPLEX_ROOM_NAME = "worker-room-liveness-sweep-alarm-multiplex";
-const LIVENESS_SWEEP_WITH_PENDING_EFFECT_ROOM_NAME = "worker-room-liveness-sweep-with-pending-effect";
 const LIVENESS_LEGACY_ATTACHMENT_ROOM_NAME = "worker-room-liveness-legacy-attachment";
 const LIVENESS_LEGACY_ATTACHMENT_SWEEP_ROOM_NAME = "worker-room-liveness-legacy-attachment-sweep";
 const LIVENESS_LEGACY_ATTACHMENT_LONG_RUN_ROOM_NAME =
@@ -95,10 +71,8 @@ const LIVENESS_LEGACY_ATTACHMENT_REAL_PING_ROOM_NAME =
 const TIGHTEN_REPLAY_SAME_ID_ROOM_NAME = "worker-room-tighten-replay-same-id";
 const TIGHTEN_REPLAY_DIFFERENT_ID_ROOM_NAME = "worker-room-tighten-replay-different-id";
 const KICKED_GUEST_REPLAY_ROOM_NAME = "worker-room-kicked-guest-replay";
-const NEARER_DEADLINE_ROOM_NAME = "worker-room-nearer-deadline";
 const NEAREST_OF_THREE_ROOM_NAME = "worker-room-nearest-of-three";
 const PURGE_DEDUPE_ROOM_NAME = "worker-room-purge-dedupe";
-const STALE_ROUND_SETTLE_ROOM_NAME = "worker-room-stale-round-settle";
 const TURN_EXPIRY_ALARM_ROOM_NAME = "worker-room-turn-expiry-alarm";
 const TURN_EXPIRY_TTL_ROOM_NAME = "worker-room-turn-expiry-ttl";
 const STALE_TURN_EXPIRY_ROOM_NAME = "worker-room-stale-turn-expiry";
@@ -115,11 +89,8 @@ const ROOM_SOCKET_URL = `${GAME_ROOM_SMOKE_URL}/socket`;
 const ROOM_TEST_EXPIRE_TURN_URL = `${GAME_ROOM_SMOKE_URL}/test-expire-turn`;
 const PUBLIC_ROOMS_URL = "https://trader-titan.worker.test/api/rooms";
 const TEST_ROOM_STORAGE_KEY = "room:persistence:v1";
-const TEST_PENDING_EFFECT_STORAGE_KEY = "room:pending-effect:v1";
 // Mirrors ROOM_COMMAND_DEDUPE_STORAGE_KEY in src/worker/index.ts.
 const TEST_COMMAND_DEDUPE_STORAGE_KEY = "room:command-dedupe:v1";
-// Mirrors PENDING_SETTLE_EFFECT_MAX_ATTEMPTS in src/worker/index.ts.
-const TEST_PENDING_SETTLE_EFFECT_MAX_ATTEMPTS = 5;
 const HTTP_BAD_REQUEST_STATUS = 400;
 const HTTP_FORBIDDEN_STATUS = 403;
 const HTTP_NOT_FOUND_STATUS = 404;
@@ -199,6 +170,7 @@ type RoomSocketMessage =
 type RoomSnapshotSocketMessage = Extract<RoomSocketMessage, { type: "ROOM_SNAPSHOT" }>;
 
 describe("Cloudflare worker scaffold", () => {
+
   it("delegates fetch requests to the OpenNext worker entrypoint", async () => {
     const request = new Request(WORKER_SMOKE_URL) as WorkerFetchRequest;
     const ctx = createExecutionContext();
@@ -795,6 +767,7 @@ describe("Cloudflare worker scaffold", () => {
   // F-04: presence gating was dropped entirely (the F-05 turn shot clock
   // now handles an absent opponent instead), so HTTP START_ROOM succeeds
   // even when the joined guest has no live socket.
+
   it("allows HTTP START_ROOM when a joined guest has no live socket (F-04)", async () => {
     const stub = roomStub(START_OFFLINE_ROOM_NAME);
     const created = await createRoom(stub, "Host");
@@ -827,7 +800,7 @@ describe("Cloudflare worker scaffold", () => {
   });
 
   it("START_ROOM response lands directly in proposingWidth with the deck item", async () => {
-    const stub = roomStub(RETRY_SUCCESS_ROOM_NAME);
+    const stub = roomStub(DECK_START_ROOM_NAME);
     const created = await createRoom(stub, "Host");
 
     if (!created.created) {
@@ -860,10 +833,6 @@ describe("Cloudflare worker scaffold", () => {
       item_title: "Base 10 representation of binary 101010"
     });
 
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
-      privateGeneratedItemStorageKey(started.room.game.item.round_id)
-    ]);
-
     const persisted = await accessRoom(stub, created.hostToken);
 
     expect(persisted.room).toEqual(started.room);
@@ -872,7 +841,7 @@ describe("Cloudflare worker scaffold", () => {
   });
 
   it("ADVANCE_ROUND picks deck index (round - 1) % deck length", async () => {
-    const stub = roomStub(RETRY_FAILURE_ROOM_NAME);
+    const stub = roomStub(DECK_ADVANCE_ROOM_NAME);
     const created = await createRoom(stub, "Host", { totalRounds: 3 });
 
     if (!created.created) {
@@ -914,66 +883,7 @@ describe("Cloudflare worker scaffold", () => {
     });
   });
 
-  it("rejects guest item-generation retries over HTTP and WebSocket", async () => {
-    const stub = roomStub(RETRY_UNAUTHORIZED_ROOM_NAME);
-    const created = await createRoom(stub, "Host");
-
-    if (!created.created) {
-      throw new Error("Expected a newly created unauthorized retry room.");
-    }
-
-    const joined = await joinRoom(stub, "Guest");
-    const guestConnection = await openRoomSocket(stub, joined.guestToken);
-    const started = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "START_ROOM",
-      credential: created.hostToken
-    });
-
-    expect(started.room.game.phase).toBe("proposingWidth");
-
-    if (started.room.game.phase !== "proposingWidth") {
-      throw new Error("Expected the deck item to be ready.");
-    }
-
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
-      privateGeneratedItemStorageKey(started.room.game.item.round_id)
-    ]);
-
-    const httpRetryResponse = await postRoomCommand(stub, {
-      type: "RETRY_ITEM_GENERATION",
-      credential: joined.guestToken
-    });
-    const httpRetry = await expectPublicJson<RoomErrorResponse>(httpRetryResponse);
-
-    expect(httpRetryResponse.status).toBe(HTTP_FORBIDDEN_STATUS);
-    expect(httpRetry.error.code).toBe("host_control_denied");
-
-    const socketRetryError = nextSocketMessage<RoomSocketMessage>(guestConnection.socket);
-
-    guestConnection.socket.send(JSON.stringify(withTestCommandId({
-      type: "RETRY_ITEM_GENERATION",
-      credential: joined.guestToken
-    })));
-
-    await expect(socketRetryError).resolves.toMatchObject({
-      type: "ROOM_ERROR",
-      error: {
-        code: "host_control_denied"
-      }
-    });
-
-    const persisted = await accessRoom(stub, created.hostToken);
-
-    expect(persisted.room.revision).toBe(started.room.revision);
-    expect(persisted.room.game).toEqual(started.room.game);
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
-      privateGeneratedItemStorageKey(started.room.game.item.round_id)
-    ]);
-
-    guestConnection.socket.close();
-  });
-
-  it("settles from the private Durable Object item after a fresh stub", async () => {
+  it("EXECUTE_TRADE HTTP response IS the settlement phase", async () => {
     const stub = roomStub(SETTLEMENT_ROOM_NAME);
     const created = await createRoom(stub, "Host");
 
@@ -998,14 +908,8 @@ describe("Cloudflare worker scaffold", () => {
       throw new Error("Expected generated item to be ready.");
     }
 
-    const privateItemKey = privateGeneratedItemStorageKey(
-      started.room.game.item.round_id
-    );
-
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
-      privateItemKey
-    ]);
-
+    // A brand-new stub proves settlement no longer depends on any stored
+    // private item: everything needed to settle is in the room envelope.
     const freshStub = roomStub(SETTLEMENT_ROOM_NAME);
     const widthResponse = await postRoomCommand(freshStub, {
       type: "SUBMIT_INITIAL_WIDTH",
@@ -1053,43 +957,30 @@ describe("Cloudflare worker scaffold", () => {
       throw new Error("Expected settlement phase.");
     }
 
+    // The HTTP response is not an intermediate "settling" ack: by the time
+    // it returns, the same transaction has already committed and revealed
+    // the full settlement (deck true_value included).
     expect(settled.room.game.item.true_value).toBe(42);
     expect(settled.room.game.settlement.trueValue).toBe(42);
     expect(settled.room.game.settlement.side).toBe("BUY");
+    expect(settled.room.revision).toBe(quoted.room.revision + 2);
 
     const persisted = await accessRoom(roomStub(SETTLEMENT_ROOM_NAME), created.hostToken);
 
     expect(persisted.room).toEqual(settled.room);
-    await expect(privateGeneratedItemKeys(freshStub)).resolves.toEqual([]);
 
     guestConnection.socket.close();
   });
 
-  it.each([
-    {
-      roomName: MISSING_SETTLEMENT_ITEM_ROOM_NAME,
-      storageState: "missing",
-      expectedPrivateKeys: noPrivateItemKeys,
-      prepareUnavailableItem: deleteStoredPrivateGeneratedItem
-    },
-    {
-      roomName: CORRUPT_SETTLEMENT_ITEM_ROOM_NAME,
-      storageState: "corrupt",
-      expectedPrivateKeys: (privateItemKey: string) => [privateItemKey],
-      prepareUnavailableItem: corruptStoredPrivateGeneratedItem
-    }
-  ] as const)(
-    "fails settlement without leaking private item data when the stored item is $storageState",
-    async ({ roomName, expectedPrivateKeys, prepareUnavailableItem }) => {
-      const stub = roomStub(roomName);
-      const created = await createRoom(stub, "Host");
+  it("no `settling` envelope ever persists - EXECUTE_TRADE commits straight through to settlement", async () => {
+    const stub = roomStub(NO_SETTLING_ENVELOPE_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
 
     if (!created.created) {
-      throw new Error("Expected a newly created unavailable-settlement-item room.");
+      throw new Error("Expected a newly created sync-settlement room.");
     }
 
     const joined = await joinRoom(stub, "Guest");
-    const guestConnection = await openRoomSocket(stub, joined.guestToken);
     const started = await applyRoomCommandWithoutTrueValue(stub, {
       type: "START_ROOM",
       credential: created.hostToken
@@ -1098,15 +989,6 @@ describe("Cloudflare worker scaffold", () => {
     if (started.room.game.phase !== "proposingWidth") {
       throw new Error("Expected generated item to be ready.");
     }
-
-    const privateItemKey = privateGeneratedItemStorageKey(
-      started.room.game.item.round_id
-    );
-
-    await prepareUnavailableItem(stub, privateItemKey);
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual(
-      expectedPrivateKeys(privateItemKey)
-    );
 
     const marketMakerToken = tokenForPlayer(
       started.room.game.roles.marketMaker,
@@ -1118,726 +1000,42 @@ describe("Cloudflare worker scaffold", () => {
       created.hostToken,
       joined.guestToken
     );
-    const width = await applyRoomCommandWithoutTrueValue(stub, {
+
+    await applyRoomCommandWithoutTrueValue(stub, {
       type: "SUBMIT_INITIAL_WIDTH",
       credential: marketMakerToken,
       width: 100
     });
-
-    expect(width.room.game.phase).toBe("negotiatingWidth");
-
-    const configuring = await applyRoomCommandWithoutTrueValue(stub, {
+    await applyRoomCommandWithoutTrueValue(stub, {
       type: "TRADE_ON_WIDTH",
       credential: traderToken
     });
-
-    expect(configuring.room.game.phase).toBe("configuringMarket");
-
-    const quoted = await applyRoomCommandWithoutTrueValue(stub, {
+    await applyRoomCommandWithoutTrueValue(stub, {
       type: "SUBMIT_MARKET_QUOTE",
       credential: marketMakerToken,
-      quote: {
-        bid: 3500,
-        ask: 3600
-      }
+      quote: { bid: 3400, ask: 3500 }
     });
 
-    expect(quoted.room.game.phase).toBe("choosingSide");
-
-    const settlementResponse = await postRoomCommand(stub, {
+    const settled = await applyRoomCommand(stub, {
       type: "EXECUTE_TRADE",
       credential: traderToken,
       side: "BUY"
     });
-    const failed = await expectPublicJsonWithoutPrivateItemMetadata<CommandRoomResponse>(
-      settlementResponse
-    );
 
-    expect(settlementResponse.status).toBe(HTTP_OK_STATUS);
-    expect(failed.room.game.phase).toBe("choosingSide");
-    expect(failed.room.revision).toBe(quoted.room.revision + 2);
+    expect(settled.room.game.phase).toBe("settlement");
 
-    if (failed.room.game.phase !== "choosingSide") {
-      throw new Error("Expected settlement failure to return to side choice.");
-    }
+    // The v5 decoder rejects a persisted `settling` phase outright, so if
+    // EXECUTE_TRADE ever committed its transient settling intermediate,
+    // the next touch would purge this room instead of finding it settled.
+    // Only the persistence envelope and the command-dedupe record may exist.
+    await expect(rawStorageKeys(stub)).resolves.toEqual([
+      TEST_COMMAND_DEDUPE_STORAGE_KEY,
+      TEST_ROOM_STORAGE_KEY
+    ].sort());
 
-    expect(failed.room.game.lastError).toBe(
-      "Private generated item is unavailable for settlement."
-    );
-    expect(failed.room.game.scores).toEqual(quoted.room.game.scores);
-    expect(failed.room.game.log.at(-1)?.message).toBe(
-      "Settlement failed: Private generated item is unavailable for settlement."
-    );
+    const loaded = await loadInternalRoomState(stub);
 
-    const persisted = await accessRoom(stub, created.hostToken);
-
-    expect(persisted.room).toEqual(failed.room);
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual(
-      expectedPrivateKeys(privateItemKey)
-    );
-
-    guestConnection.socket.close();
-  });
-
-  it("recovers a room durably stuck in settling via host retry, preserving prior-round scores (F-02)", async () => {
-    const stub = roomStub(STUCK_SETTLING_ROOM_NAME);
-    const created = await createRoom(stub, "Host", { totalRounds: 2 });
-
-    if (!created.created) {
-      throw new Error("Expected a newly created stuck-settling room.");
-    }
-
-    const joined = await joinRoom(stub, "Guest");
-    const guestConnection = await openRoomSocket(stub, joined.guestToken);
-    const started = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "START_ROOM",
-      credential: created.hostToken
-    });
-
-    // Round 1 settles normally and contributes to the scoreboard. Recovering
-    // round 2 must not touch this. Quote away from round 1's deck true_value
-    // (42, the Chaos Quant deck's first item) so round 1's PnL is non-zero and
-    // score preservation is a meaningful assertion, not a 0 === 0 coincidence.
-    if (started.room.game.phase !== "proposingWidth") {
-      throw new Error("Expected a room ready for round 1 width proposal.");
-    }
-
-    const round1MarketMakerToken = tokenForPlayer(
-      started.room.game.roles.marketMaker,
-      created.hostToken,
-      joined.guestToken
-    );
-    const round1TraderToken = tokenForPlayer(
-      started.room.game.roles.trader,
-      created.hostToken,
-      joined.guestToken
-    );
-
-    const round1Width = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_INITIAL_WIDTH",
-      credential: round1MarketMakerToken,
-      width: 100
-    });
-
-    expect(round1Width.room.game.phase).toBe("negotiatingWidth");
-
-    const round1Configuring = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "TRADE_ON_WIDTH",
-      credential: round1TraderToken
-    });
-
-    expect(round1Configuring.room.game.phase).toBe("configuringMarket");
-
-    const round1Quoted = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_MARKET_QUOTE",
-      credential: round1MarketMakerToken,
-      quote: {
-        bid: 3400,
-        ask: 3500
-      }
-    });
-
-    expect(round1Quoted.room.game.phase).toBe("choosingSide");
-
-    const firstSettlementResponse = await applyRoomCommand(stub, {
-      type: "EXECUTE_TRADE",
-      credential: round1TraderToken,
-      side: "BUY"
-    });
-
-    if (firstSettlementResponse.room.game.phase !== "settlement") {
-      throw new Error("Expected round 1 to settle.");
-    }
-
-    const firstSettlement = firstSettlementResponse.room;
-    const priorScores = firstSettlement.game.scores;
-
-    expect(priorScores.A !== 0 || priorScores.B !== 0).toBe(true);
-
-    const round2 = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "ADVANCE_ROUND",
-      credential: created.hostToken
-    });
-
-    if (round2.room.game.phase !== "proposingWidth") {
-      throw new Error("Expected round 2 item to be ready.");
-    }
-
-    expect(round2.room.game.roundNumber).toBe(2);
-
-    const marketMakerToken = tokenForPlayer(
-      round2.room.game.roles.marketMaker,
-      created.hostToken,
-      joined.guestToken
-    );
-    const traderToken = tokenForPlayer(
-      round2.room.game.roles.trader,
-      created.hostToken,
-      joined.guestToken
-    );
-
-    const width = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_INITIAL_WIDTH",
-      credential: marketMakerToken,
-      width: 100
-    });
-
-    expect(width.room.game.phase).toBe("negotiatingWidth");
-
-    const configuring = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "TRADE_ON_WIDTH",
-      credential: traderToken
-    });
-
-    expect(configuring.room.game.phase).toBe("configuringMarket");
-
-    const quoted = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_MARKET_QUOTE",
-      credential: marketMakerToken,
-      quote: {
-        bid: 3500,
-        ask: 3600
-      }
-    });
-
-    expect(quoted.room.game.phase).toBe("choosingSide");
-
-    // Simulate the F-02 trapdoor: the settling transition is durably
-    // persisted, but the settlement effect that should follow it never runs
-    // (isolate evicted / request abandoned before applyAutomaticRoomEffects
-    // reached receiveStoredSettlement).
-    const stuck = await forceStuckSettling(stub, traderToken, "BUY");
-
-    expect(stuck.game.phase).toBe("settling");
-
-    // Confirm the room is durably stuck: a fresh load still shows settling,
-    // and no client command targets that phase today.
-    const reloadedWhileStuck = await accessRoom(stub, created.hostToken);
-
-    expect(reloadedWhileStuck.room.game.phase).toBe("settling");
-    expect(reloadedWhileStuck.room.game.roundNumber).toBe(2);
-
-    const blockedTrade = await postRoomCommand(stub, {
-      type: "EXECUTE_TRADE",
-      credential: traderToken,
-      side: "SELL"
-    });
-    const blockedTradeResult = await expectPublicJson<RoomErrorResponse>(blockedTrade);
-
-    expect(blockedTrade.status).toBe(HTTP_CONFLICT_STATUS);
-    expect(blockedTradeResult.error.code).toBe("invalid_game_phase");
-
-    // Host recovery: retrying re-runs settlement for THIS round from the
-    // already-committed item, quote, and side. It must not regenerate the
-    // item, restart the round, or touch round 1's scores.
-    const recovered = await applyRoomCommand(stub, {
-      type: "RETRY_ITEM_GENERATION",
-      credential: created.hostToken
-    });
-
-    expect(recovered.room.game.phase).toBe("settlement");
-
-    if (recovered.room.game.phase !== "settlement") {
-      throw new Error("Expected host retry to complete round 2 settlement.");
-    }
-
-    expect(recovered.room.game.roundNumber).toBe(2);
-    expect(recovered.room.game.settlement.side).toBe("BUY");
-    expect(recovered.room.game.settlement.transactionPrice).toBe(3600);
-    expect(recovered.room.game.scores).toEqual(
-      applySettlementToScores(priorScores, recovered.room.game.settlement)
-    );
-
-    // The round can now complete without ever resetting to the lobby.
-    const finished = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "ADVANCE_ROUND",
-      credential: created.hostToken
-    });
-
-    expect(finished.room.lifecycle).toBe("finished");
-    expect(finished.room.game.phase).toBe("gameOver");
-
-    if (finished.room.game.phase !== "gameOver") {
-      throw new Error("Expected the game to finish.");
-    }
-
-    expect(finished.room.game.scores).toEqual(recovered.room.game.scores);
-
-    guestConnection.socket.close();
-  });
-
-  it("blocks the host from resetting or kicking while a trade is settling, and both work again once retry resolves it", async () => {
-    // The competitive-integrity gap: a host who is the trader this round has
-    // already locked in an outcome the instant EXECUTE_TRADE lands (the
-    // private true_value was fixed back at item generation), but the
-    // reveal/score update is still pending in `settling`. RESET_TO_LOBBY and
-    // KICK_GUEST are host-control commands with no other phase restriction,
-    // so without this guard the host could always duck a trade going
-    // against them by nuking the room before settlement resolves - and the
-    // private item would be deleted with it, so the outcome would never
-    // even be computed.
-    const stub = roomStub(SETTLING_ABORT_ROOM_NAME);
-    const created = await createRoom(stub, "Host");
-
-    if (!created.created) {
-      throw new Error("Expected a newly created settling-abort room.");
-    }
-
-    const joined = await joinRoom(stub, "Guest");
-    const guestConnection = await openRoomSocket(stub, joined.guestToken);
-    const started = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "START_ROOM",
-      credential: created.hostToken
-    });
-
-    if (started.room.game.phase !== "proposingWidth") {
-      throw new Error("Expected generated item to be ready.");
-    }
-
-    const marketMakerToken = tokenForPlayer(
-      started.room.game.roles.marketMaker,
-      created.hostToken,
-      joined.guestToken
-    );
-    const traderToken = tokenForPlayer(
-      started.room.game.roles.trader,
-      created.hostToken,
-      joined.guestToken
-    );
-
-    const width = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_INITIAL_WIDTH",
-      credential: marketMakerToken,
-      width: 100
-    });
-
-    expect(width.room.game.phase).toBe("negotiatingWidth");
-
-    const configuring = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "TRADE_ON_WIDTH",
-      credential: traderToken
-    });
-
-    expect(configuring.room.game.phase).toBe("configuringMarket");
-
-    const quoted = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_MARKET_QUOTE",
-      credential: marketMakerToken,
-      quote: {
-        bid: 3400,
-        ask: 3500
-      }
-    });
-
-    expect(quoted.room.game.phase).toBe("choosingSide");
-
-    // Force the round into `settling` and leave it there, exactly like the
-    // F-02 fixture above - this is the window RESET_TO_LOBBY/KICK_GUEST must
-    // not be able to short-circuit.
-    const stuck = await forceStuckSettling(stub, traderToken, "BUY");
-
-    if (stuck.game.phase !== "settling") {
-      throw new Error("Expected forceStuckSettling to land in settling.");
-    }
-
-    const roundId = stuck.game.item.round_id;
-
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
-      privateGeneratedItemStorageKey(roundId)
-    ]);
-
-    const blockedReset = await postRoomCommand(stub, {
-      type: "RESET_TO_LOBBY",
-      credential: created.hostToken
-    });
-    const blockedResetResult = await expectPublicJson<RoomErrorResponse>(blockedReset);
-
-    expect(blockedReset.status).toBe(HTTP_CONFLICT_STATUS);
-    expect(blockedResetResult.error.code).toBe("round_settling");
-
-    const blockedKick = await postRoomCommand(stub, {
-      type: "KICK_GUEST",
-      credential: created.hostToken
-    });
-    const blockedKickResult = await expectPublicJson<RoomErrorResponse>(blockedKick);
-
-    expect(blockedKick.status).toBe(HTTP_CONFLICT_STATUS);
-    expect(blockedKickResult.error.code).toBe("round_settling");
-
-    // Neither rejected command may have mutated the room or torn down the
-    // private true_value the eventual settlement still needs.
-    const reloadedWhileBlocked = await accessRoom(stub, created.hostToken);
-
-    expect(reloadedWhileBlocked.room.game.phase).toBe("settling");
-    expect(reloadedWhileBlocked.room.revision).toBe(stuck.revision);
-    expect(reloadedWhileBlocked.room.seats.guest.occupied).toBe(true);
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
-      privateGeneratedItemStorageKey(roundId)
-    ]);
-
-    // Recovery path: the host is not stranded. RETRY_ITEM_GENERATION is
-    // already authorized for hostControl and already resolves a room stuck
-    // in `settling` (F-02); it is untouched by this guard.
-    const recovered = await applyRoomCommand(stub, {
-      type: "RETRY_ITEM_GENERATION",
-      credential: created.hostToken
-    });
-
-    expect(recovered.room.game.phase).toBe("settlement");
-
-    // Now that the round has left `settling`, both host-control commands
-    // work normally again.
-    const reset = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "RESET_TO_LOBBY",
-      credential: created.hostToken
-    });
-
-    expect(reset.room.lifecycle).toBe("lobby");
-    expect(reset.room.game.phase).toBe("setup");
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
-
-    guestConnection.socket.close();
-  });
-
-  it("rejects guest recovery of a room stuck in settling without mutating it", async () => {
-    const stub = roomStub(STUCK_SETTLING_UNAUTHORIZED_ROOM_NAME);
-    const created = await createRoom(stub, "Host");
-
-    if (!created.created) {
-      throw new Error("Expected a newly created unauthorized stuck-settling room.");
-    }
-
-    const joined = await joinRoom(stub, "Guest");
-    const guestConnection = await openRoomSocket(stub, joined.guestToken);
-    const started = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "START_ROOM",
-      credential: created.hostToken
-    });
-
-    if (started.room.game.phase !== "proposingWidth") {
-      throw new Error("Expected generated item to be ready.");
-    }
-
-    const marketMakerToken = tokenForPlayer(
-      started.room.game.roles.marketMaker,
-      created.hostToken,
-      joined.guestToken
-    );
-    const traderToken = tokenForPlayer(
-      started.room.game.roles.trader,
-      created.hostToken,
-      joined.guestToken
-    );
-
-    const width = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_INITIAL_WIDTH",
-      credential: marketMakerToken,
-      width: 100
-    });
-
-    expect(width.room.game.phase).toBe("negotiatingWidth");
-
-    const configuring = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "TRADE_ON_WIDTH",
-      credential: traderToken
-    });
-
-    expect(configuring.room.game.phase).toBe("configuringMarket");
-
-    const quoted = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_MARKET_QUOTE",
-      credential: marketMakerToken,
-      quote: {
-        bid: 3500,
-        ask: 3600
-      }
-    });
-
-    expect(quoted.room.game.phase).toBe("choosingSide");
-
-    const stuck = await forceStuckSettling(stub, traderToken, "BUY");
-
-    expect(stuck.game.phase).toBe("settling");
-
-    const guestCredential = tokenForPlayer("B", created.hostToken, joined.guestToken);
-    const httpRetryResponse = await postRoomCommand(stub, {
-      type: "RETRY_ITEM_GENERATION",
-      credential: guestCredential
-    });
-    const httpRetry = await expectPublicJson<RoomErrorResponse>(httpRetryResponse);
-
-    expect(httpRetryResponse.status).toBe(HTTP_FORBIDDEN_STATUS);
-    expect(httpRetry.error.code).toBe("host_control_denied");
-
-    const persisted = await accessRoom(stub, created.hostToken);
-
-    expect(persisted.room.game.phase).toBe("settling");
-    expect(persisted.room.revision).toBe(stuck.revision);
-
-    guestConnection.socket.close();
-  });
-
-  it("recovers a room durably stuck in settling automatically via the alarm, with no client command (F-02 auto-resume)", async () => {
-    const stub = roomStub(STUCK_SETTLING_AUTO_RESUME_ROOM_NAME);
-    const created = await createRoom(stub, "Host");
-
-    if (!created.created) {
-      throw new Error("Expected a newly created auto-resume room.");
-    }
-
-    const joined = await joinRoom(stub, "Guest");
-    const guestConnection = await openRoomSocket(stub, joined.guestToken);
-    const started = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "START_ROOM",
-      credential: created.hostToken
-    });
-
-    if (started.room.game.phase !== "proposingWidth") {
-      throw new Error("Expected generated item to be ready.");
-    }
-
-    const marketMakerToken = tokenForPlayer(
-      started.room.game.roles.marketMaker,
-      created.hostToken,
-      joined.guestToken
-    );
-    const traderToken = tokenForPlayer(
-      started.room.game.roles.trader,
-      created.hostToken,
-      joined.guestToken
-    );
-
-    await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_INITIAL_WIDTH",
-      credential: marketMakerToken,
-      width: 100
-    });
-    await applyRoomCommandWithoutTrueValue(stub, {
-      type: "TRADE_ON_WIDTH",
-      credential: traderToken
-    });
-    const quoted = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_MARKET_QUOTE",
-      credential: marketMakerToken,
-      quote: { bid: 3400, ask: 3500 }
-    });
-
-    expect(quoted.room.game.phase).toBe("choosingSide");
-
-    const stuck = await forceStuckSettling(stub, traderToken, "BUY");
-
-    expect(stuck.game.phase).toBe("settling");
-
-    if (stuck.game.phase !== "settling") {
-      throw new Error("Expected forceStuckSettling to land in settling.");
-    }
-
-    const pendingBeforeAlarm = await readPendingRoomEffect(stub);
-
-    expect(pendingBeforeAlarm).toMatchObject({
-      kind: "settle",
-      roundId: stuck.game.item.round_id,
-      attempts: 0
-    });
-
-    // Registered before the alarm runs (see the identical comment on the
-    // F-05 forfeit-broadcast test above) so the listener is armed before
-    // runDueSettleEffect's own broadcastRoomSnapshot call fires.
-    const autoResumeBroadcast = nextSocketMessage<RoomSnapshotSocketMessage>(
-      guestConnection.socket
-    );
-
-    // The alarm fires on its own here - no RETRY_ITEM_GENERATION, no other
-    // client command touches this room between forceStuckSettling and the
-    // assertions below.
-    await runRoomCleanupAlarm(stub);
-
-    const resumed = await accessRoom(stub, created.hostToken);
-
-    expect(resumed.room.game.phase).toBe("settlement");
-
-    if (resumed.room.game.phase !== "settlement") {
-      throw new Error("Expected the alarm to auto-resume settlement.");
-    }
-
-    expect(resumed.room.game.settlement.side).toBe("BUY");
-    expect(resumed.room.game.settlement.transactionPrice).toBe(3500);
-    expect(resumed.room.game.scores).toEqual(
-      applySettlementToScores(quoted.room.game.scores, resumed.room.game.settlement)
-    );
-    expect(resumed.room.revision).toBe(stuck.revision + 1);
-
-    await expect(readPendingRoomEffect(stub)).resolves.toBeNull();
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual(noPrivateItemKeys());
-
-    // This auto-resume is not a response to any request a client is
-    // waiting on either - without runDueSettleEffect's own broadcast, a
-    // connected client would never hear that F-02's own recovery path
-    // just settled the round out from under it.
-    const broadcast = await autoResumeBroadcast;
-
-    expect(broadcast.room.game.phase).toBe("settlement");
-    expect(broadcast.room.revision).toBe(resumed.room.revision);
-
-    guestConnection.socket.close();
-  });
-
-  it("still purges an expired room and its pending settlement marker when the TTL deadline wins the race (regression)", async () => {
-    const stub = roomStub(STUCK_SETTLING_TTL_ROOM_NAME);
-    const created = await createRoom(stub, "Host");
-
-    if (!created.created) {
-      throw new Error("Expected a newly created TTL-regression room.");
-    }
-
-    const joined = await joinRoom(stub, "Guest");
-    const guestConnection = await openRoomSocket(stub, joined.guestToken);
-    const started = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "START_ROOM",
-      credential: created.hostToken
-    });
-
-    if (started.room.game.phase !== "proposingWidth") {
-      throw new Error("Expected generated item to be ready.");
-    }
-
-    const marketMakerToken = tokenForPlayer(
-      started.room.game.roles.marketMaker,
-      created.hostToken,
-      joined.guestToken
-    );
-    const traderToken = tokenForPlayer(
-      started.room.game.roles.trader,
-      created.hostToken,
-      joined.guestToken
-    );
-
-    await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_INITIAL_WIDTH",
-      credential: marketMakerToken,
-      width: 100
-    });
-    await applyRoomCommandWithoutTrueValue(stub, {
-      type: "TRADE_ON_WIDTH",
-      credential: traderToken
-    });
-    const quoted = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_MARKET_QUOTE",
-      credential: marketMakerToken,
-      quote: { bid: 3400, ask: 3500 }
-    });
-
-    expect(quoted.room.game.phase).toBe("choosingSide");
-
-    await forceStuckSettling(stub, traderToken, "BUY");
-    await expect(readPendingRoomEffect(stub)).resolves.not.toBeNull();
-
-    // The room's TTL has *also* elapsed while a settlement effect is still
-    // pending. Multiplexing the single alarm slot between the two deadlines
-    // must not let the outstanding pending effect suppress TTL cleanup -
-    // this is the regression the multiplexer most likely introduces.
-    await expireStoredRoomEnvelope(stub);
-    await runRoomCleanupAlarm(stub);
-
-    await expect(storedRoomEnvelopeExists(stub)).resolves.toBe(false);
-    await expect(readPendingRoomEffect(stub)).resolves.toBeNull();
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual(noPrivateItemKeys());
-    await expect(storedRoomAlarm(stub)).resolves.toBeNull();
-
-    guestConnection.socket.close();
-  });
-
-  it("multiplexes both outstanding deadlines: the nearer pending effect fires first, and the farther TTL deadline stays scheduled afterward", async () => {
-    const stub = roomStub(STUCK_SETTLING_BOTH_DEADLINES_ROOM_NAME);
-    const created = await createRoom(stub, "Host");
-
-    if (!created.created) {
-      throw new Error("Expected a newly created both-deadlines room.");
-    }
-
-    const joined = await joinRoom(stub, "Guest");
-    const guestConnection = await openRoomSocket(stub, joined.guestToken);
-    const started = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "START_ROOM",
-      credential: created.hostToken
-    });
-
-    if (started.room.game.phase !== "proposingWidth") {
-      throw new Error("Expected generated item to be ready.");
-    }
-
-    const marketMakerToken = tokenForPlayer(
-      started.room.game.roles.marketMaker,
-      created.hostToken,
-      joined.guestToken
-    );
-    const traderToken = tokenForPlayer(
-      started.room.game.roles.trader,
-      created.hostToken,
-      joined.guestToken
-    );
-
-    await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_INITIAL_WIDTH",
-      credential: marketMakerToken,
-      width: 100
-    });
-    await applyRoomCommandWithoutTrueValue(stub, {
-      type: "TRADE_ON_WIDTH",
-      credential: traderToken
-    });
-    const quoted = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_MARKET_QUOTE",
-      credential: marketMakerToken,
-      quote: { bid: 3400, ask: 3500 }
-    });
-
-    expect(quoted.room.game.phase).toBe("choosingSide");
-
-    const stuck = await forceStuckSettling(stub, traderToken, "BUY");
-    const pendingEffect = await readPendingRoomEffect(stub);
-
-    if (pendingEffect === null) {
-      throw new Error("Expected a pending settlement marker.");
-    }
-
-    const ttlDeadline = roomExpiresAtMs(stuck);
-
-    expect(pendingEffect.notBeforeMs).toBeLessThan(ttlDeadline);
-
-    // This test is specifically about TTL/pending-effect multiplexing, not
-    // the F-08 liveness sweep - close the still-open guest socket (opened
-    // above only so START_ROOM's presence gate would pass) and confirm the
-    // DO's live-socket-derived state has caught up, so the alarm math below
-    // is not also folding in a liveness deadline.
-    await closeSocketAndWaitOffline(stub, guestConnection.socket, created.hostToken, {
-      A: false,
-      B: false
-    });
-
-    // forceStuckSettling deliberately leaves the *scheduled* DO alarm at the
-    // far TTL deadline rather than the pending effect's earlier, already-due
-    // notBeforeMs (see its comment - an overdue alarm can fire
-    // opportunistically the moment this fixture is next touched, which
-    // would race the assertions below). alarm() must still resolve the
-    // nearer pending effect on the very next invocation regardless, because
-    // it compares now against the stored marker's notBeforeMs directly
-    // rather than trusting whatever deadline it happened to be woken for.
-    await expect(storedRoomAlarm(stub)).resolves.toBe(ttlDeadline);
-
-    await runRoomCleanupAlarm(stub);
-
-    const resumed = await accessRoom(stub, created.hostToken);
-
-    expect(resumed.room.game.phase).toBe("settlement");
-    await expect(readPendingRoomEffect(stub)).resolves.toBeNull();
-
-    // Once the nearer deadline resolves, the farther TTL deadline must still
-    // be scheduled - the multiplexer must not have dropped it.
-    const ttlAfterResolution = await storedRoomExpiresAt(stub);
-
-    await expect(storedRoomAlarm(stub)).resolves.toBe(ttlAfterResolution);
-    expect(ttlAfterResolution).toBeGreaterThan(Date.now());
+    expect(loaded.game.phase).toBe("settlement");
   });
 
   it("fires a due F-05 turn deadline via the alarm and forfeits the round into roundForfeited", async () => {
@@ -1914,6 +1112,7 @@ describe("Cloudflare worker scaffold", () => {
   // roundForfeited shortcut - against whichever side is worse for the
   // trader, so stalling can never beat acting. The static deck fixes round 1's
   // Chaos Quant true_value at 42 for every room in this file.
+
   it("settles a choosingSide timeout against BUY when BUY is the worse side for the trader (F-06)", async () => {
     const stub = roomStub(CHOOSING_SIDE_TIMEOUT_BUY_WORSE_ROOM_NAME);
     // trueValue 42, quote 40/60: buyPnL = 42-60 = -18,
@@ -1932,14 +1131,10 @@ describe("Cloudflare worker scaffold", () => {
     }
 
     // Registered before the alarm runs (see the identical comment on the
-    // F-05 forfeit-broadcast test above): F-06's choosingSide timeout
-    // synchronously broadcasts twice within the one alarm invocation - once
-    // for runDueTurnExpiry's own settling transition, and again once
-    // receiveStoredSettlement resolves it - so both listeners must already
-    // be attached before the alarm runs (see nextSocketMessages).
-    const broadcasts = nextSocketMessages<RoomSnapshotSocketMessage>(
-      guestConnection.socket,
-      2
+    // F-05 forfeit-broadcast test above) so the listener is armed before
+    // runDueTurnExpiry's own broadcastRoomSnapshot call fires.
+    const settlementBroadcast = nextSocketMessage<RoomSnapshotSocketMessage>(
+      guestConnection.socket
     );
 
     await runRoomCleanupAlarm(stub);
@@ -1949,25 +1144,23 @@ describe("Cloudflare worker scaffold", () => {
     expect(resumed.room.game.phase).toBe("settlement");
 
     if (resumed.room.game.phase !== "settlement") {
-      throw new Error("Expected settlement after the F-06 forced settle effect ran.");
+      throw new Error("Expected settlement after the F-06 forced settle ran.");
     }
     expect(resumed.room.game.settlement.side).toBe("BUY");
     expect(resumed.room.game.settlement.forcedByTimeout).toBe(true);
     expect(resumed.room.game.settlement.traderPnL).toBe(-18);
     expect(resumed.room.game.item.true_value).toBe(42);
     expect(resumed.room.revision).toBe(quoted.room.revision + 2);
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual(noPrivateItemKeys());
+    await expect(readCommandDedupeEntries(stub)).resolves.not.toEqual([]);
 
-    // F-06's settling -> settlement transition runs off the alarm just
-    // like a plain forfeit does - without runDueTurnExpiry's broadcast
-    // after entering settling, and receiveStoredSettlement's own broadcast
-    // once it resolves, a connected trader would never learn their clock
-    // ran out and which side it settled against.
-    const [settlingBroadcast, settlementBroadcast] = await broadcasts;
+    // Since synchronous settlement, TURN_EXPIRED and its composed
+    // SETTLEMENT_RECEIVED commit in ONE transaction and broadcast exactly
+    // once - already in the final settlement state. No transient settling
+    // snapshot ever reaches the client.
+    const broadcast = await settlementBroadcast;
 
-    expect(settlingBroadcast.room.game.phase).toBe("settling");
-    expect(settlementBroadcast.room.game.phase).toBe("settlement");
-    expect(settlementBroadcast.room.revision).toBe(resumed.room.revision);
+    expect(broadcast.room.game.phase).toBe("settlement");
+    expect(broadcast.room.revision).toBe(resumed.room.revision);
 
     guestConnection.socket.close();
   });
@@ -2033,6 +1226,7 @@ describe("Cloudflare worker scaffold", () => {
   // the *other* player's clock. That is safe only because the gate makes the
   // route unreachable outside test/dev; these tests pin both halves of that
   // safety property directly, since nothing previously asserted either one.
+
   it("404s POST /room/test-expire-turn, and its public /api/rooms alias, when WORKER_TEST_MODE is unset - even for an otherwise-valid, well-authenticated request", async () => {
     const stub = roomStub(TEST_EXPIRE_TURN_GATE_ROOM_NAME);
     const created = await createRoom(stub, "Host");
@@ -2208,7 +1402,6 @@ describe("Cloudflare worker scaffold", () => {
     const turnDeadline = started.room.game.turnDeadlineMs;
 
     expect(turnDeadline).toBeLessThan(ttlDeadline);
-    await expect(readPendingRoomEffect(stub)).resolves.toBeNull();
 
     // Force the scheduled alarm to look overdue, then let alarm() re-derive
     // and reschedule purely from the freshly-loaded room's candidate
@@ -2246,8 +1439,6 @@ describe("Cloudflare worker scaffold", () => {
     await runRoomCleanupAlarm(stub);
 
     await expect(storedRoomEnvelopeExists(stub)).resolves.toBe(false);
-    await expect(readPendingRoomEffect(stub)).resolves.toBeNull();
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual(noPrivateItemKeys());
     await expect(storedRoomAlarm(stub)).resolves.toBeNull();
 
     guestConnection.socket.close();
@@ -2317,57 +1508,6 @@ describe("Cloudflare worker scaffold", () => {
     guestConnection.socket.close();
   });
 
-  it("schedules the nearer of the two deadlines while a pending effect is not yet due", async () => {
-    // Closes a mutation gap: flipping scheduleNextAlarm's Math.min to Math.max
-    // (i.e. always scheduling the *farther* deadline, the exact failure its own
-    // docstring warns about) previously passed the entire suite.
-    //
-    // The neighbouring "multiplexes both outstanding deadlines" test cannot
-    // catch that, because it only observes the alarm either while the fixture
-    // has deliberately pinned it to the TTL, or after the effect has resolved
-    // and the marker is null -- and with a null marker scheduleNextAlarm
-    // short-circuits to the TTL without ever comparing the two deadlines.
-    //
-    // This exercises alarm()'s not-yet-due branch, which is the one place the
-    // comparison actually runs with a live marker: a pending effect whose
-    // notBeforeMs is in the future but well inside the room's TTL must leave
-    // the alarm armed at notBeforeMs, not at the TTL.
-    const stub = roomStub(NEARER_DEADLINE_ROOM_NAME);
-    const created = await createRoom(stub, "Host");
-
-    if (!created.created) {
-      throw new Error("Expected a newly created nearer-deadline room.");
-    }
-
-    await joinRoom(stub, "Guest");
-
-    const ttlDeadline = await storedRoomExpiresAt(stub);
-    const notBeforeMs = Date.now() + 60_000;
-
-    expect(notBeforeMs).toBeLessThan(ttlDeadline);
-
-    await writePendingRoomEffectForTest(stub, {
-      kind: "settle",
-      roundId: "round-not-yet-due",
-      attempts: 0,
-      notBeforeMs
-    });
-
-    await runRoomCleanupAlarm(stub);
-
-    // The nearer deadline wins. Under Math.max this is ttlDeadline instead,
-    // and the pending settlement would not be retried until the room expired.
-    await expect(storedRoomAlarm(stub)).resolves.toBe(notBeforeMs);
-
-    // Not-yet-due means untouched: the marker must survive this tick intact.
-    await expect(readPendingRoomEffect(stub)).resolves.toMatchObject({
-      kind: "settle",
-      roundId: "round-not-yet-due",
-      attempts: 0,
-      notBeforeMs
-    });
-  });
-
   it("purges the command dedupe table along with the rest of an expired room's state", async () => {
     // Closes a mutation gap: deleting the dedupe-table line from
     // purgeExpiredRoomState previously passed the entire suite, because every
@@ -2400,760 +1540,11 @@ describe("Cloudflare worker scaffold", () => {
     await runRoomCleanupAlarm(stub);
 
     await expect(readCommandDedupeEntries(stub)).resolves.toEqual([]);
-    await expect(readPendingRoomEffect(stub)).resolves.toBeNull();
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual(noPrivateItemKeys());
     await expect(storedRoomAlarm(stub)).resolves.toBeNull();
   });
 
-  it("ignores a settlement effect whose round no longer matches the stored room", async () => {
-    // Closes a mutation gap: removing the `item.round_id !== roundId` clause
-    // from receiveStoredSettlement's re-validation previously passed the whole
-    // suite. The test that claims to cover it ("does not double-settle when a
-    // manual retry races the alarm") is stopped one layer earlier by the
-    // reducer's phase guard, so the round_id clause itself was never reached.
-    //
-    // The guard defends a TOCTOU window: the room is re-read inside a fresh
-    // transaction, and the round may have moved on since the caller loaded it.
-    // Reproduced here by invoking receiveStoredSettlement with a room object
-    // whose round_id does not match what is actually persisted, which is
-    // precisely the state that window produces.
-    const stub = roomStub(STALE_ROUND_SETTLE_ROOM_NAME);
-    const created = await createRoom(stub, "Host");
-
-    if (!created.created) {
-      throw new Error("Expected a newly created stale-round room.");
-    }
-
-    const joined = await joinRoom(stub, "Guest");
-    const guestConnection = await openRoomSocket(stub, joined.guestToken);
-    const started = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "START_ROOM",
-      credential: created.hostToken
-    });
-    if (started.room.game.phase !== "proposingWidth") {
-      throw new Error("Expected generated item to be ready.");
-    }
-
-    const marketMakerToken = tokenForPlayer(
-      started.room.game.roles.marketMaker,
-      created.hostToken,
-      joined.guestToken
-    );
-    const traderToken = tokenForPlayer(
-      started.room.game.roles.trader,
-      created.hostToken,
-      joined.guestToken
-    );
-
-    await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_INITIAL_WIDTH",
-      credential: marketMakerToken,
-      width: 100
-    });
-    await applyRoomCommandWithoutTrueValue(stub, {
-      type: "TRADE_ON_WIDTH",
-      credential: traderToken
-    });
-    await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_MARKET_QUOTE",
-      credential: marketMakerToken,
-      quote: { bid: 3400, ask: 3500 }
-    });
-
-    const stuck = await forceStuckSettling(stub, traderToken, "BUY");
-
-    if (stuck.game.phase !== "settling") {
-      throw new Error("Expected forceStuckSettling to land in settling.");
-    }
-
-    const revisionBefore = stuck.revision;
-    const staleRoom = {
-      ...stuck,
-      game: {
-        ...stuck.game,
-        item: { ...stuck.game.item, round_id: "round-from-a-previous-round" }
-      }
-    };
-
-    await runInDurableObject(stub, async (instance) => {
-      await (
-        instance as unknown as {
-          receiveStoredSettlement(room: unknown, nowMs: number): Promise<unknown>;
-        }
-      ).receiveStoredSettlement(staleRoom, Date.now());
-    });
-
-    // The stale effect must not settle the round it no longer belongs to.
-    const after = await accessRoom(stub, created.hostToken);
-
-    expect(after.room.game.phase).toBe("settling");
-    expect(after.room.revision).toBe(revisionBefore);
-
-    // And the genuine, matching effect must still be able to settle it, so the
-    // guard rejects the stale round rather than wedging the room.
-    await runRoomCleanupAlarm(stub);
-
-    const resumed = await accessRoom(stub, created.hostToken);
-
-    expect(resumed.room.game.phase).toBe("settlement");
-
-    guestConnection.socket.close();
-  });
-
-  it("exhausts retries after the attempt cap and lands in the existing choosingSide fallback instead of looping forever", async () => {
-    const stub = roomStub(STUCK_SETTLING_EXHAUSTION_ROOM_NAME);
-    const created = await createRoom(stub, "Host");
-
-    if (!created.created) {
-      throw new Error("Expected a newly created exhaustion room.");
-    }
-
-    const joined = await joinRoom(stub, "Guest");
-    const guestConnection = await openRoomSocket(stub, joined.guestToken);
-    const started = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "START_ROOM",
-      credential: created.hostToken
-    });
-
-    if (started.room.game.phase !== "proposingWidth") {
-      throw new Error("Expected generated item to be ready.");
-    }
-
-    const marketMakerToken = tokenForPlayer(
-      started.room.game.roles.marketMaker,
-      created.hostToken,
-      joined.guestToken
-    );
-    const traderToken = tokenForPlayer(
-      started.room.game.roles.trader,
-      created.hostToken,
-      joined.guestToken
-    );
-
-    await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_INITIAL_WIDTH",
-      credential: marketMakerToken,
-      width: 100
-    });
-    await applyRoomCommandWithoutTrueValue(stub, {
-      type: "TRADE_ON_WIDTH",
-      credential: traderToken
-    });
-    const quoted = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_MARKET_QUOTE",
-      credential: marketMakerToken,
-      quote: { bid: 3400, ask: 3500 }
-    });
-
-    expect(quoted.room.game.phase).toBe("choosingSide");
-
-    const stuck = await forceStuckSettling(stub, traderToken, "BUY");
-
-    if (stuck.game.phase !== "settling") {
-      throw new Error("Expected forceStuckSettling to land in settling.");
-    }
-
-    // Simulate a marker whose attempt budget is already exhausted (as if
-    // several prior alarm wakes each failed to complete the effect). The
-    // stored private item is still genuinely present and valid here - the
-    // point of this test is that exhaustion terminates regardless of
-    // whether the next attempt would actually have succeeded.
-    await writePendingRoomEffectForTest(stub, {
-      kind: "settle",
-      roundId: stuck.game.item.round_id,
-      attempts: TEST_PENDING_SETTLE_EFFECT_MAX_ATTEMPTS,
-      notBeforeMs: Date.now() - 1
-    });
-
-    // Registered before the alarm runs (see the identical comment on the
-    // F-05 forfeit-broadcast test above) so the listener is armed before
-    // forceFailStuckSettlement's own broadcastRoomSnapshot call fires.
-    const exhaustionBroadcast = nextSocketMessage<RoomSnapshotSocketMessage>(
-      guestConnection.socket
-    );
-
-    await runRoomCleanupAlarm(stub);
-
-    const afterExhaustion = await accessRoom(stub, created.hostToken);
-
-    expect(afterExhaustion.room.game.phase).toBe("choosingSide");
-
-    if (afterExhaustion.room.game.phase !== "choosingSide") {
-      throw new Error("Expected exhaustion to fall back to choosingSide.");
-    }
-
-    expect(afterExhaustion.room.game.lastError).toBe(
-      "Automatic settlement retries were exhausted. A host can retry settlement manually."
-    );
-    expect(afterExhaustion.room.revision).toBe(stuck.revision + 1);
-    await expect(readPendingRoomEffect(stub)).resolves.toBeNull();
-
-    // The exhaustion fallback runs off the alarm too - without
-    // forceFailStuckSettlement's own broadcast, a connected client would
-    // be stuck watching a "settling" spinner that silently resolved to
-    // choosingSide with a "retries exhausted" error it never received.
-    const broadcast = await exhaustionBroadcast;
-
-    expect(broadcast.room.game.phase).toBe("choosingSide");
-    expect(broadcast.room.revision).toBe(afterExhaustion.room.revision);
-
-    // This test's remaining assertions are about the F-02/F-05 alarm
-    // deadline exactly matching the fresh turn clock, not about the F-08
-    // liveness sweep - close the guest socket (kept open only so the
-    // exhaustion broadcast above could be observed) and run one more no-op
-    // alarm tick so the liveness deadline the still-open socket would
-    // otherwise fold into the alarm slot is dropped before checking the
-    // exact stored alarm value below.
-    await closeSocketAndWaitOffline(stub, guestConnection.socket, created.hostToken, {
-      A: false,
-      B: false
-    });
-    await runRoomCleanupAlarm(stub);
-
-    // The alarm slot must not spin: the pending settle-effect marker is
-    // gone after exhaustion, so the only deadlines left are the room's TTL
-    // and the fresh F-05 turn clock SETTLEMENT_FAILED just armed on
-    // re-entering choosingSide - and the turn clock is far nearer than the
-    // two-hour TTL. Either way, a further alarm tick is a stable no-op.
-    const alarmAfterExhaustion = await storedRoomAlarm(stub);
-
-    expect(alarmAfterExhaustion).toBe(afterExhaustion.room.game.turnDeadlineMs);
-    expect(alarmAfterExhaustion).toBeLessThan(await storedRoomExpiresAt(stub));
-
-    await runRoomCleanupAlarm(stub);
-
-    const afterSecondTick = await accessRoom(stub, created.hostToken);
-
-    expect(afterSecondTick.room.revision).toBe(afterExhaustion.room.revision);
-  });
-
-  it("does not force-fail a settling round whose round_id no longer matches the exhausted pending effect (self-heals instead)", async () => {
-    // forceFailStuckSettlement's own round_id re-check (see the guard right
-    // after its fresh transactional read) defends the identical TOCTOU
-    // window as receiveStoredSettlement's round_id clause, proven reachable
-    // above by "ignores a settlement effect whose round no longer matches
-    // the stored room": forceFailStuckSettlement is invoked (from
-    // runDueSettleEffect, once pendingEffect.attempts >= the cap) using a
-    // pendingEffect/room snapshot that may already be stale by the time its
-    // own fresh transaction actually runs - the room could since have
-    // settled this exact round through another path and moved on to a
-    // later round that is *also* stuck in settling, which is phase
-    // "settling" again but for a different round_id. The exhaustion test
-    // above ("exhausts retries after the attempt cap...") only ever
-    // exercises the matching-round_id branch, since it hands
-    // forceFailStuckSettlement the round_id of the very room it just got
-    // stuck on - so the mismatch branch itself was unreached. Reproduced
-    // here the same way the earlier stale-round test reproduces its TOCTOU
-    // window: call the method directly with a round_id that does not match
-    // what is actually persisted.
-    const stub = roomStub(STUCK_SETTLING_STALE_ROUND_EXHAUSTION_ROOM_NAME);
-    const created = await createRoom(stub, "Host");
-
-    if (!created.created) {
-      throw new Error("Expected a newly created stale-round exhaustion room.");
-    }
-
-    const joined = await joinRoom(stub, "Guest");
-    const guestConnection = await openRoomSocket(stub, joined.guestToken);
-    const started = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "START_ROOM",
-      credential: created.hostToken
-    });
-
-    if (started.room.game.phase !== "proposingWidth") {
-      throw new Error("Expected generated item to be ready.");
-    }
-
-    const marketMakerToken = tokenForPlayer(
-      started.room.game.roles.marketMaker,
-      created.hostToken,
-      joined.guestToken
-    );
-    const traderToken = tokenForPlayer(
-      started.room.game.roles.trader,
-      created.hostToken,
-      joined.guestToken
-    );
-
-    await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_INITIAL_WIDTH",
-      credential: marketMakerToken,
-      width: 100
-    });
-    await applyRoomCommandWithoutTrueValue(stub, {
-      type: "TRADE_ON_WIDTH",
-      credential: traderToken
-    });
-    await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_MARKET_QUOTE",
-      credential: marketMakerToken,
-      quote: { bid: 3400, ask: 3500 }
-    });
-
-    const stuck = await forceStuckSettling(stub, traderToken, "BUY");
-
-    if (stuck.game.phase !== "settling") {
-      throw new Error("Expected forceStuckSettling to land in settling.");
-    }
-
-    const revisionBefore = stuck.revision;
-    const stuckRoundId = stuck.game.item.round_id;
-
-    // Invoke the exhaustion fallback with a round_id that does not match
-    // the genuinely stuck round persisted above - simulating exactly the
-    // TOCTOU window the guard exists for, without needing to actually race
-    // a manual retry against a real alarm tick.
-    await runInDurableObject(stub, async (instance) => {
-      await (
-        instance as unknown as {
-          forceFailStuckSettlement(roundId: string, nowMs: number): Promise<void>;
-        }
-      ).forceFailStuckSettlement("round-from-a-previous-round", Date.now());
-    });
-
-    const afterMismatch = await accessRoom(stub, created.hostToken);
-
-    // The stale-round_id call must not touch a round it does not belong to.
-    expect(afterMismatch.room.game.phase).toBe("settling");
-    expect(afterMismatch.room.revision).toBe(revisionBefore);
-
-    // And the guard must not be a blanket no-op: the genuine, matching
-    // round_id still forces the fallback, proving the branch above rejects
-    // specifically the mismatch rather than forceFailStuckSettlement being
-    // broken outright.
-    await runInDurableObject(stub, async (instance) => {
-      await (
-        instance as unknown as {
-          forceFailStuckSettlement(roundId: string, nowMs: number): Promise<void>;
-        }
-      ).forceFailStuckSettlement(stuckRoundId, Date.now());
-    });
-
-    const afterGenuine = await accessRoom(stub, created.hostToken);
-
-    expect(afterGenuine.room.game.phase).toBe("choosingSide");
-
-    if (afterGenuine.room.game.phase !== "choosingSide") {
-      throw new Error("Expected the matching round_id to fall back to choosingSide.");
-    }
-
-    expect(afterGenuine.room.game.lastError).toBe(
-      "Automatic settlement retries were exhausted. A host can retry settlement manually."
-    );
-    expect(afterGenuine.room.revision).toBe(revisionBefore + 1);
-
-    guestConnection.socket.close();
-  });
-
-  // F-07: nothing previously bounded how many times choosingSide(locked) ->
-  // settling -> SETTLEMENT_FAILED -> choosingSide(locked) could repeat for
-  // the same round. PENDING_SETTLE_EFFECT_MAX_ATTEMPTS only bounds retries
-  // *within* one settling episode before forceFailStuckSettlement bounces
-  // back to choosingSide - each bounce re-arms a fresh turn clock and a
-  // fresh pending-settle-effect with attempts reset to 0, so a persistent
-  // (non-transient) cause could cycle indefinitely with no terminal state.
-  // This reproduces that persistent cause directly (the private item is
-  // deleted once and never restored, so every settlement attempt fails the
-  // same way) and proves three things end to end: the failure count is
-  // tracked across episodes rather than reset by each bounce, the round
-  // reaches a genuinely terminal phase at exactly SETTLEMENT_FAILURE_EPISODE_CAP
-  // failures, and the Durable Object stops re-arming a near-term alarm for
-  // the dead round once it gets there.
-  it("stops bouncing choosingSide <-> settling after SETTLEMENT_FAILURE_EPISODE_CAP consecutive failures and reaches a terminal error phase (F-07)", async () => {
-    const stub = roomStub(PERMANENT_SETTLEMENT_FAILURE_ROOM_NAME);
-    const created = await createRoom(stub, "Host");
-
-    if (!created.created) {
-      throw new Error("Expected a newly created permanent-settlement-failure room.");
-    }
-
-    const joined = await joinRoom(stub, "Guest");
-    const guestConnection = await openRoomSocket(stub, joined.guestToken);
-    const started = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "START_ROOM",
-      credential: created.hostToken
-    });
-
-    if (started.room.game.phase !== "proposingWidth") {
-      throw new Error("Expected generated item to be ready.");
-    }
-
-    const privateItemKey = privateGeneratedItemStorageKey(
-      started.room.game.item.round_id
-    );
-
-    // The underlying cause is persistent, not transient: the private item
-    // is gone for good, so every settlement attempt for this round fails
-    // identically, no matter how many times it is retried.
-    await deleteStoredPrivateGeneratedItem(stub, privateItemKey);
-
-    const marketMakerToken = tokenForPlayer(
-      started.room.game.roles.marketMaker,
-      created.hostToken,
-      joined.guestToken
-    );
-    const traderToken = tokenForPlayer(
-      started.room.game.roles.trader,
-      created.hostToken,
-      joined.guestToken
-    );
-
-    await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_INITIAL_WIDTH",
-      credential: marketMakerToken,
-      width: 100
-    });
-    await applyRoomCommandWithoutTrueValue(stub, {
-      type: "TRADE_ON_WIDTH",
-      credential: traderToken
-    });
-    const quoted = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_MARKET_QUOTE",
-      credential: marketMakerToken,
-      quote: { bid: 3400, ask: 3500 }
-    });
-
-    expect(quoted.room.game.phase).toBe("choosingSide");
-
-    // Every failure before the cap-th must still bounce back to a locked
-    // choosingSide, with the failure count climbing across episodes rather
-    // than resetting each time (the exact property that was previously
-    // unbounded).
-    for (let attempt = 1; attempt < SETTLEMENT_FAILURE_EPISODE_CAP; attempt += 1) {
-      const settlementResponse = await postRoomCommand(stub, {
-        type: "EXECUTE_TRADE",
-        credential: traderToken,
-        side: "BUY"
-      });
-      const failed = await expectPublicJsonWithoutPrivateItemMetadata<CommandRoomResponse>(
-        settlementResponse
-      );
-
-      expect(settlementResponse.status).toBe(HTTP_OK_STATUS);
-      expect(failed.room.game.phase).toBe("choosingSide");
-
-      if (failed.room.game.phase !== "choosingSide") {
-        throw new Error("Expected settlement failure to bounce back to side choice.");
-      }
-
-      expect(failed.room.game.lockedPendingTrade).toEqual({ kind: "chosen", side: "BUY" });
-      expect(failed.room.game.settlementFailureCount).toBe(attempt);
-    }
-
-    // The cap-th failure - and only the cap-th - must be terminal.
-    const finalResponse = await postRoomCommand(stub, {
-      type: "EXECUTE_TRADE",
-      credential: traderToken,
-      side: "BUY"
-    });
-    const terminal = await expectPublicJsonWithoutPrivateItemMetadata<CommandRoomResponse>(
-      finalResponse
-    );
-
-    expect(finalResponse.status).toBe(HTTP_OK_STATUS);
-    expect(terminal.room.game.phase).toBe("error");
-
-    if (terminal.room.game.phase !== "error") {
-      throw new Error("Expected a terminal error phase.");
-    }
-
-    expect(terminal.room.game.previousPhase).toBe("settling");
-    expect(terminal.room.lifecycle).toBe("active");
-    // No RoundSettlement and no revealed true_value exist for a
-    // permanently failed settlement - the terminal error state must not
-    // carry either.
-    expect("item" in terminal.room.game).toBe(false);
-    expect("settlement" in terminal.room.game).toBe(false);
-
-    // A dead round must not keep waking the object: no pending settle
-    // effect and no turn-clocked deadline remain, so the only thing left to
-    // schedule the alarm against is the room's own TTL.
-    await expect(readPendingRoomEffect(stub)).resolves.toBeNull();
-
-    // This assertion is about the F-02/F-05 alarm collapsing to the room's
-    // TTL, not about the F-08 liveness sweep - close the still-open guest
-    // socket (it never gated presence in this test) so it does not fold an
-    // unrelated liveness deadline into the alarm slot and break the exact
-    // equality check below.
-    await closeSocketAndWaitOffline(stub, guestConnection.socket, created.hostToken, {
-      A: false,
-      B: false
-    });
-    await runRoomCleanupAlarm(stub);
-
-    const alarmAfterTerminal = await storedRoomAlarm(stub);
-    const ttlAfterTerminal = await storedRoomExpiresAt(stub);
-
-    expect(alarmAfterTerminal).toBe(ttlAfterTerminal);
-
-    // A further alarm tick (simulating time passing with nothing left to
-    // do) must be a stable no-op, not another bounce.
-    const revisionBeforeExtraTick = terminal.room.revision;
-
-    await runRoomCleanupAlarm(stub);
-
-    const afterExtraTick = await accessRoom(stub, created.hostToken);
-
-    expect(afterExtraTick.room.revision).toBe(revisionBeforeExtraTick);
-    expect(afterExtraTick.room.game.phase).toBe("error");
-
-    // A further EXECUTE_TRADE (e.g. a stale client retry) must be rejected
-    // rather than resuming the dead round - `error` is not choosingSide.
-    const staleRetryResponse = await postRoomCommand(stub, {
-      type: "EXECUTE_TRADE",
-      credential: traderToken,
-      side: "BUY"
-    });
-
-    expect(staleRetryResponse.status).not.toBe(HTTP_OK_STATUS);
-  });
-
-  it("does not double-settle when a manual retry races the alarm: the alarm settles once, and the losing retry is rejected unchanged", async () => {
-    const stub = roomStub(STUCK_SETTLING_NO_DOUBLE_SETTLE_ROOM_NAME);
-    const created = await createRoom(stub, "Host");
-
-    if (!created.created) {
-      throw new Error("Expected a newly created no-double-settle room.");
-    }
-
-    const joined = await joinRoom(stub, "Guest");
-    const guestConnection = await openRoomSocket(stub, joined.guestToken);
-    const started = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "START_ROOM",
-      credential: created.hostToken
-    });
-
-    if (started.room.game.phase !== "proposingWidth") {
-      throw new Error("Expected generated item to be ready.");
-    }
-
-    const marketMakerToken = tokenForPlayer(
-      started.room.game.roles.marketMaker,
-      created.hostToken,
-      joined.guestToken
-    );
-    const traderToken = tokenForPlayer(
-      started.room.game.roles.trader,
-      created.hostToken,
-      joined.guestToken
-    );
-
-    await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_INITIAL_WIDTH",
-      credential: marketMakerToken,
-      width: 100
-    });
-    await applyRoomCommandWithoutTrueValue(stub, {
-      type: "TRADE_ON_WIDTH",
-      credential: traderToken
-    });
-    const quoted = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_MARKET_QUOTE",
-      credential: marketMakerToken,
-      quote: { bid: 3400, ask: 3500 }
-    });
-
-    expect(quoted.room.game.phase).toBe("choosingSide");
-
-    const stuck = await forceStuckSettling(stub, traderToken, "BUY");
-
-    // The alarm wins the race and resolves settlement first.
-    await runRoomCleanupAlarm(stub);
-
-    const resolved = await accessRoom(stub, created.hostToken);
-
-    expect(resolved.room.game.phase).toBe("settlement");
-    expect(resolved.room.revision).toBe(stuck.revision + 1);
-
-    // A host's manual retry arrives moments later, unaware the alarm already
-    // resolved it. receiveStoredSettlement's fresh phase/round_id re-check -
-    // shared by both the alarm path and this manual path - must reject the
-    // late retry rather than settle a second time.
-    const raced = await postRoomCommand(stub, {
-      type: "RETRY_ITEM_GENERATION",
-      credential: created.hostToken
-    });
-    const racedResult = await expectPublicJson<RoomErrorResponse>(raced);
-
-    expect(raced.status).toBe(HTTP_CONFLICT_STATUS);
-    expect(racedResult.error.code).toBe("invalid_game_phase");
-
-    const afterRace = await accessRoom(stub, created.hostToken);
-
-    expect(afterRace.room.revision).toBe(resolved.room.revision);
-    expect(afterRace.room).toEqual(resolved.room);
-
-    guestConnection.socket.close();
-  });
-
-  it("purges storage and clears the alarm rather than leaking an expired room when it disappears mid-alarm-invocation (regression)", async () => {
-    // alarm() reads the room and its pending-effect marker in one outer
-    // transaction, then (for the mismatch/self-heal path) re-reads the room
-    // in a second, separate transaction inside runDueSettleEffect. Both
-    // reads share the same frozen `nowMs`, so under normal conditions they
-    // agree on whether the room has expired. The only way the second read
-    // can find the room gone when the first read found it fine is a
-    // concurrent write landing in the gap between the two transactions -
-    // this test reproduces that outcome directly by expiring storage and
-    // then invoking the inner method with a stale marker that forces the
-    // mismatch branch, exactly the shape alarm() would have handed it just
-    // before such a race.
-    const stub = roomStub(STUCK_SETTLING_MID_ALARM_EXPIRY_ROOM_NAME);
-    const created = await createRoom(stub, "Host");
-
-    if (!created.created) {
-      throw new Error("Expected a newly created mid-alarm-expiry room.");
-    }
-
-    const joined = await joinRoom(stub, "Guest");
-    const guestConnection = await openRoomSocket(stub, joined.guestToken);
-    const started = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "START_ROOM",
-      credential: created.hostToken
-    });
-
-    if (started.room.game.phase !== "proposingWidth") {
-      throw new Error("Expected generated item to be ready.");
-    }
-
-    const marketMakerToken = tokenForPlayer(
-      started.room.game.roles.marketMaker,
-      created.hostToken,
-      joined.guestToken
-    );
-    const traderToken = tokenForPlayer(
-      started.room.game.roles.trader,
-      created.hostToken,
-      joined.guestToken
-    );
-
-    await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_INITIAL_WIDTH",
-      credential: marketMakerToken,
-      width: 100
-    });
-    await applyRoomCommandWithoutTrueValue(stub, {
-      type: "TRADE_ON_WIDTH",
-      credential: traderToken
-    });
-    const quoted = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_MARKET_QUOTE",
-      credential: marketMakerToken,
-      quote: { bid: 3400, ask: 3500 }
-    });
-
-    expect(quoted.room.game.phase).toBe("choosingSide");
-
-    const stuck = await forceStuckSettling(stub, traderToken, "BUY");
-
-    await expect(readPendingRoomEffect(stub)).resolves.not.toBeNull();
-    await expect(privateGeneratedItemKeys(stub)).resolves.not.toEqual(noPrivateItemKeys());
-
-    // The room expires (simulating the concurrent write that would have
-    // raced alarm()'s two transactions in production). Deliberately do NOT
-    // arm an overdue DO alarm here (unlike expireStoredRoomEnvelope) -
-    // workerd in this harness can fire an overdue alarm opportunistically
-    // the moment the object is next touched (see forceStuckSettling's own
-    // comment on the same hazard), which would race runDueSettleEffectDirect
-    // below via the real alarm() entrypoint instead of isolating the exact
-    // method call this test means to exercise. Leaving the actually-scheduled
-    // alarm at its existing future TTL deadline avoids that entirely.
-    await expireStoredRoomEnvelopeWithoutArmingAlarm(stub);
-
-    // A marker whose roundId no longer matches the (pre-expiry) room
-    // forces runDueSettleEffect's first branch: the mismatch/self-heal path
-    // that reloads the room fresh and, prior to this fix, returned bare on
-    // !loaded.ok instead of purging.
-    const staleMismatchedPendingEffect: TestPendingRoomEffect = {
-      kind: "settle",
-      roundId: "round-that-no-longer-matches",
-      attempts: 0,
-      notBeforeMs: Date.now()
-    };
-
-    await runDueSettleEffectDirect(stub, stuck, staleMismatchedPendingEffect, Date.now());
-
-    await expect(storedRoomEnvelopeExists(stub)).resolves.toBe(false);
-    await expect(readPendingRoomEffect(stub)).resolves.toBeNull();
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual(noPrivateItemKeys());
-    await expect(storedRoomAlarm(stub)).resolves.toBeNull();
-
-    guestConnection.socket.close();
-  });
-
-  it("deletes private generated items when resetting to the lobby", async () => {
-    const stub = roomStub(RESET_PRIVATE_ITEM_ROOM_NAME);
-    const created = await createRoom(stub, "Host");
-
-    if (!created.created) {
-      throw new Error("Expected a newly created reset cleanup room.");
-    }
-
-    const joined = await joinRoom(stub, "Guest");
-    const guestConnection = await openRoomSocket(stub, joined.guestToken);
-    const started = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "START_ROOM",
-      credential: created.hostToken
-    });
-
-    if (started.room.game.phase !== "proposingWidth") {
-      throw new Error("Expected generated item to be ready.");
-    }
-
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
-      privateGeneratedItemStorageKey(started.room.game.item.round_id)
-    ]);
-
-    const reset = await applyRoomCommand(stub, {
-      type: "RESET_TO_LOBBY",
-      credential: created.hostToken
-    });
-
-    expect(reset.room.lifecycle).toBe("lobby");
-    expect(reset.room.game.phase).toBe("setup");
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
-
-    guestConnection.socket.close();
-  });
-
-  it("deletes private generated items when kicking a guest", async () => {
-    const stub = roomStub(KICK_PRIVATE_ITEM_ROOM_NAME);
-    const created = await createRoom(stub, "Host");
-
-    if (!created.created) {
-      throw new Error("Expected a newly created kick cleanup room.");
-    }
-
-    const joined = await joinRoom(stub, "Guest");
-    const guestConnection = await openRoomSocket(stub, joined.guestToken);
-    const started = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "START_ROOM",
-      credential: created.hostToken
-    });
-
-    if (started.room.game.phase !== "proposingWidth") {
-      throw new Error("Expected generated item to be ready.");
-    }
-
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
-      privateGeneratedItemStorageKey(started.room.game.item.round_id)
-    ]);
-
-    const guestClosed = nextSocketClose(guestConnection.socket);
-    const kicked = await applyRoomCommand(stub, {
-      type: "KICK_GUEST",
-      credential: created.hostToken
-    });
-
-    expect(kicked.room.lifecycle).toBe("lobby");
-    expect(kicked.room.seats.guest.occupied).toBe(false);
-    expect(kicked.room.game.phase).toBe("setup");
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
-    await expect(guestClosed).resolves.toBeUndefined();
-  });
-
-  it("deletes private generated items when replacing a corrupt room", async () => {
-    const stub = roomStub(REPLACE_PRIVATE_ITEM_ROOM_NAME);
+  it("replaces a corrupt room with a fresh lobby when a create arrives", async () => {
+    const stub = roomStub(CORRUPT_REPLACE_ROOM_NAME);
     const created = await createRoom(stub, "Host");
 
     if (!created.created) {
@@ -3170,10 +1561,6 @@ describe("Cloudflare worker scaffold", () => {
     if (started.room.game.phase !== "proposingWidth") {
       throw new Error("Expected generated item to be ready.");
     }
-
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
-      privateGeneratedItemStorageKey(started.room.game.item.round_id)
-    ]);
 
     await corruptRoomEnvelope(stub);
 
@@ -3193,13 +1580,12 @@ describe("Cloudflare worker scaffold", () => {
     expect(replaced.room.lifecycle).toBe("lobby");
     expect(replaced.room.revision).toBe(0);
     expect(replaced.room.seats.host.displayName).toBe("Replacement Host");
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
 
     guestConnection.socket.close();
   });
 
-  it("deletes private generated items when the cleanup alarm sees an invalid room envelope", async () => {
-    const stub = roomStub(ALARM_PRIVATE_ITEM_ROOM_NAME);
+  it("purges an invalid room envelope during the cleanup alarm", async () => {
+    const stub = roomStub(ALARM_INVALID_ROOM_NAME);
     const created = await createRoom(stub, "Host");
 
     if (!created.created) {
@@ -3217,14 +1603,9 @@ describe("Cloudflare worker scaffold", () => {
       throw new Error("Expected generated item to be ready.");
     }
 
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
-      privateGeneratedItemStorageKey(started.room.game.item.round_id)
-    ]);
-
     await corruptRoomEnvelope(stub);
     await runRoomCleanupAlarm(stub);
     await expect(storedRoomEnvelopeExists(stub)).resolves.toBe(false);
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
 
     guestConnection.socket.close();
   });
@@ -3243,6 +1624,7 @@ describe("Cloudflare worker scaffold", () => {
   // transaction as the 500 they return, so the *next* request against that
   // room object sees "missing" (404, and a fresh POST /room can recreate
   // it) instead of repeating the same 500.
+
   it("purges an undecodable room envelope when a command is dispatched against it, so the next request sees a fresh room instead of another 500", async () => {
     const stub = roomStub(COMMAND_PURGE_ON_INVALID_ROOM_NAME);
     const created = await createRoom(stub, "Host");
@@ -3262,10 +1644,6 @@ describe("Cloudflare worker scaffold", () => {
       throw new Error("Expected generated item to be ready.");
     }
 
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
-      privateGeneratedItemStorageKey(started.room.game.item.round_id)
-    ]);
-
     await corruptRoomEnvelope(stub);
 
     const firstResponse = await postRoomCommand(stub, {
@@ -3278,7 +1656,6 @@ describe("Cloudflare worker scaffold", () => {
     expect(firstResponse.status).toBe(HTTP_INTERNAL_SERVER_ERROR_STATUS);
     expect(firstRejected.error.code).toBe("persistence_invalid");
     await expect(storedRoomEnvelopeExists(stub)).resolves.toBe(false);
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
 
     // The bad envelope is gone now, so this is no longer "invalid" - it is
     // simply a room that does not exist, exactly like never having created
@@ -3296,17 +1673,18 @@ describe("Cloudflare worker scaffold", () => {
     guestConnection.socket.close();
   });
 
-  // Persistence v4 cutover regression (decision D2): a room persisted by the
-  // previous build as a version-3 envelope must fail decode with
+  // Persistence v5 cutover regression (decision D2): a room persisted by the
+  // previous build as a version-4 envelope must fail decode with
   // persistence_version_unsupported and then purge on first touch, exactly
   // like an undecodable envelope - the room reads back as never-created
-  // instead of 500ing forever.
-  it("purges a planted version-3 envelope on first touch (v4 hard-cutover regression)", async () => {
-    const stub = roomStub(COMMAND_PURGE_ON_INVALID_ROOM_NAME + "-v3");
+  // instead of erroring forever.
+
+  it("purges a planted version-4 envelope on first touch (v5 hard-cutover regression)", async () => {
+    const stub = roomStub(COMMAND_PURGE_ON_INVALID_ROOM_NAME + "-v4");
     const created = await createRoom(stub, "Host");
 
     if (!created.created) {
-      throw new Error("Expected a newly created v3-cutover room.");
+      throw new Error("Expected a newly created v4-cutover room.");
     }
 
     const joined = await joinRoom(stub, "Guest");
@@ -3320,9 +1698,7 @@ describe("Cloudflare worker scaffold", () => {
 
     expect(started.room.game.phase).toBe("proposingWidth");
 
-    // Plant a v3 envelope: same current shape, tagged with the retired
-
-    // Plant a v3 envelope: same current shape, tagged with the retired
+    // Plant a v4 envelope: same current shape, tagged with the retired
     // version. The strict allowlists no longer carry a migration chain, so
     // this is rejected by version alone.
     await runInDurableObject(stub, async (_instance, state) => {
@@ -3334,7 +1710,7 @@ describe("Cloudflare worker scaffold", () => {
         throw new Error("Expected a stored room envelope to downgrade.");
       }
 
-      await state.storage.put(TEST_ROOM_STORAGE_KEY, { ...envelope, version: 3 });
+      await state.storage.put(TEST_ROOM_STORAGE_KEY, { ...envelope, version: 4 });
     });
 
     const firstResponse = await postRoomCommand(stub, {
@@ -3344,10 +1720,9 @@ describe("Cloudflare worker scaffold", () => {
     });
     const firstRejected = await expectPublicJson<RoomErrorResponse>(firstResponse);
 
-    expect(firstResponse.status).toBe(HTTP_INTERNAL_SERVER_ERROR_STATUS);
+    expect(firstResponse.status).toBe(HTTP_GONE_STATUS);
     expect(firstRejected.error.code).toBe("persistence_version_unsupported");
     await expect(storedRoomEnvelopeExists(stub)).resolves.toBe(false);
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
 
     const secondResponse = await postRoomCommand(stub, {
       type: "SUBMIT_INITIAL_WIDTH",
@@ -3390,19 +1765,8 @@ describe("Cloudflare worker scaffold", () => {
     expect(secondRejected.error.code).toBe("room_not_found");
   });
 
-  it("deletes stale private generated items when the cleanup alarm sees no room envelope", async () => {
-    const stub = roomStub(ALARM_MISSING_PRIVATE_ITEM_ROOM_NAME);
-    const staleKey = await putStalePrivateGeneratedItem(stub, "missing-room");
-
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([staleKey]);
-    await runRoomCleanupAlarm(stub);
-    await expect(storedRoomEnvelopeExists(stub)).resolves.toBe(false);
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
-    await expect(storedRoomAlarm(stub)).resolves.toBeNull();
-  });
-
   it("deletes expired room envelopes and private generated items during cleanup alarms", async () => {
-    const stub = roomStub(ALARM_EXPIRED_PRIVATE_ITEM_ROOM_NAME);
+    const stub = roomStub(ALARM_EXPIRED_ROOM_NAME);
     const created = await createRoom(stub, "Host");
 
     if (!created.created) {
@@ -3420,20 +1784,15 @@ describe("Cloudflare worker scaffold", () => {
       throw new Error("Expected generated item to be ready.");
     }
 
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
-      privateGeneratedItemStorageKey(started.room.game.item.round_id)
-    ]);
-
     await expireStoredRoomEnvelope(stub);
     await runRoomCleanupAlarm(stub);
     await expect(storedRoomEnvelopeExists(stub)).resolves.toBe(false);
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([]);
 
     guestConnection.socket.close();
   });
 
-  it("reschedules valid room cleanup alarms without deleting private generated items", async () => {
-    const stub = roomStub(ALARM_VALID_PRIVATE_ITEM_ROOM_NAME);
+  it("reschedules valid room cleanup alarms without purging the room", async () => {
+    const stub = roomStub(ALARM_RESCHEDULE_ROOM_NAME);
     const created = await createRoom(stub, "Host");
 
     if (!created.created) {
@@ -3460,9 +1819,6 @@ describe("Cloudflare worker scaffold", () => {
       B: false
     });
 
-    const privateItemKey = privateGeneratedItemStorageKey(
-      started.room.game.item.round_id
-    );
     // The room is in proposingWidth, which now carries its own F-05 turn
     // deadline - and that deadline (60s out) is far nearer than the
     // two-hour TTL, so a reschedule must arm the alarm there, not at TTL.
@@ -3470,19 +1826,37 @@ describe("Cloudflare worker scaffold", () => {
 
     expect(expectedAlarm).toBeLessThan(await storedRoomExpiresAt(stub));
 
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
-      privateItemKey
-    ]);
     await setStoredRoomAlarm(stub, Date.now() - 1);
     await runRoomCleanupAlarm(stub);
     await expect(storedRoomEnvelopeExists(stub)).resolves.toBe(true);
-    await expect(privateGeneratedItemKeys(stub)).resolves.toEqual([
-      privateItemKey
-    ]);
     await expect(storedRoomAlarm(stub)).resolves.toBe(expectedAlarm);
   });
 
+  it("alarm stays TTL+liveness-only while idle", async () => {
+    const stub = roomStub(IDLE_ALARM_TTL_ROOM_NAME);
+    const created = await createRoom(stub, "Host");
 
+    if (!created.created) {
+      throw new Error("Expected a newly created idle-alarm room.");
+    }
+
+    const ttlDeadline = await storedRoomExpiresAt(stub);
+
+    // Idle posture: lobby phase carries no turn deadline, no sockets are
+    // connected to contribute a liveness deadline, and synchronous
+    // settlement removed the pending-effect marker entirely - so the only
+    // deadline left for the multiplexer to arm is the room's TTL. Force a
+    // premature tick and confirm it is a stable no-op re-arm at exactly TTL.
+    await setStoredRoomAlarm(stub, Date.now() - 1);
+    await runRoomCleanupAlarm(stub);
+
+    await expect(storedRoomAlarm(stub)).resolves.toBe(ttlDeadline);
+    await expect(storedRoomEnvelopeExists(stub)).resolves.toBe(true);
+
+    await runRoomCleanupAlarm(stub);
+
+    await expect(storedRoomAlarm(stub)).resolves.toBe(ttlDeadline);
+  });
 
 
   it("upgrades the public room socket route and sends the initial snapshot", async () => {
@@ -3626,6 +2000,7 @@ describe("Cloudflare worker scaffold", () => {
   // F-04: presence gating was dropped entirely, so a WebSocket START_ROOM
   // now succeeds (broadcasting a fresh ROOM_SNAPSHOT) even while the joined
   // guest has no live socket.
+
   it("sends ROOM_SNAPSHOT for WebSocket START_ROOM even when a joined guest is offline (F-04)", async () => {
     const stub = roomStub(SOCKET_START_OFFLINE_ROOM_NAME);
     const created = await createRoom(stub, "Host");
@@ -3846,6 +2221,7 @@ describe("Cloudflare worker scaffold", () => {
   // now handles an absent opponent instead), so both a non-final and the
   // final round advance succeed while Player B's socket is offline - only
   // the presence badge on the snapshot reflects the disconnect.
+
   it("advances both non-final and final rounds while Player B's socket is offline (F-04)", async () => {
     const stub = roomStub(ADVANCE_PRESENCE_ROOM_NAME);
     const created = await createRoom(stub, "Host", { totalRounds: 2 });
@@ -3914,6 +2290,7 @@ describe("Cloudflare worker scaffold", () => {
   // F-04: presence gating was dropped entirely, so a WebSocket ADVANCE_ROUND
   // now succeeds (broadcasting a fresh ROOM_SNAPSHOT) even after Player B
   // disconnects before a non-final advance.
+
   it("sends ROOM_SNAPSHOT for WebSocket ADVANCE_ROUND even after Player B disconnects before a non-final advance (F-04)", async () => {
     const stub = roomStub(SOCKET_ADVANCE_OFFLINE_ROOM_NAME);
     const created = await createRoom(stub, "Host", { totalRounds: 2 });
@@ -4500,82 +2877,6 @@ describe("Cloudflare worker scaffold", () => {
     await expect(storedRoomAlarm(stub)).resolves.toBe(ttlDeadline);
   });
 
-  it("resolves a due pending settlement effect and sweeps a stale socket in the same alarm tick, dropping neither", async () => {
-    const stub = roomStub(LIVENESS_SWEEP_WITH_PENDING_EFFECT_ROOM_NAME);
-    const created = await createRoom(stub, "Host");
-
-    if (!created.created) {
-      throw new Error("Expected a newly created liveness-with-pending-effect room.");
-    }
-
-    const joined = await joinRoom(stub, "Guest");
-    const guestConnection = await openRoomSocket(stub, joined.guestToken);
-    const started = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "START_ROOM",
-      credential: created.hostToken
-    });
-
-    if (started.room.game.phase !== "proposingWidth") {
-      throw new Error("Expected generated item to be ready.");
-    }
-
-    const marketMakerToken = tokenForPlayer(
-      started.room.game.roles.marketMaker,
-      created.hostToken,
-      joined.guestToken
-    );
-    const traderToken = tokenForPlayer(
-      started.room.game.roles.trader,
-      created.hostToken,
-      joined.guestToken
-    );
-
-    await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_INITIAL_WIDTH",
-      credential: marketMakerToken,
-      width: 100
-    });
-    await applyRoomCommandWithoutTrueValue(stub, {
-      type: "TRADE_ON_WIDTH",
-      credential: traderToken
-    });
-    const quoted = await applyRoomCommandWithoutTrueValue(stub, {
-      type: "SUBMIT_MARKET_QUOTE",
-      credential: marketMakerToken,
-      quote: { bid: 3400, ask: 3500 }
-    });
-
-    expect(quoted.room.game.phase).toBe("choosingSide");
-
-    // forceStuckSettling leaves a due pending settle-effect marker (F-02)
-    // for this room - the guest socket opened above (needed for
-    // START_ROOM's presence gate) is still connected throughout.
-    await forceStuckSettling(stub, traderToken, "BUY");
-    await expect(readPendingRoomEffect(stub)).resolves.not.toBeNull();
-
-    await withPatchedAutoResponseTimestamp(
-      (ws) =>
-        socketAttachmentRole(ws) === "guest"
-          ? new Date(Date.now() - ROOM_SOCKET_LIVENESS_STALE_THRESHOLD_MS - 1_000)
-          : null,
-      async () => {
-        const guestClosed = nextSocketCloseCode(guestConnection.socket);
-
-        await runRoomCleanupAlarm(stub);
-
-        const closeInfo = await guestClosed;
-
-        expect(closeInfo.code).toBe(ROOM_SOCKET_LIVENESS_SWEEP_CLOSE_CODE);
-      }
-    );
-
-    // Neither concern lost the other in the same tick: the pending
-    // settlement effect actually resolved...
-    const resumed = await accessRoom(stub, created.hostToken);
-
-    expect(resumed.room.game.phase).toBe("settlement");
-    await expect(readPendingRoomEffect(stub)).resolves.toBeNull();
-  });
 });
 
 function roomStub(roomName: string) {
@@ -4618,126 +2919,13 @@ async function setDurableObjectTestModeEnv(
 }
 
 
-
-
-
-
-
-async function privateGeneratedItemKeys(stub: GameRoomStub): Promise<string[]> {
-  return runInDurableObject(stub, async (_instance, state) => {
-    const items = await state.storage.list<unknown>({
-      prefix: privateGeneratedItemStoragePrefix()
-    });
-
-    return [...items.keys()].sort();
-  });
-}
-
-function noPrivateItemKeys(): string[] {
-  return [];
-}
-
-async function deleteStoredPrivateGeneratedItem(
-  stub: GameRoomStub,
-  key: string
-): Promise<void> {
-  await runInDurableObject(stub, async (_instance, state) => {
-    await state.storage.delete(key);
-  });
-}
-
-async function corruptStoredPrivateGeneratedItem(
-  stub: GameRoomStub,
-  key: string
-): Promise<void> {
-  await runInDurableObject(stub, async (_instance, state) => {
-    await state.storage.put(key, {
-      kind: "trader-titan.test-corrupt-private-item"
-    });
-  });
-}
-
-
 /**
- * Reproduces the F-02 trapdoor directly: EXECUTE_TRADE's choosingSide -> settling
- * transition (and, after the structural F-02 fix, its pending-effect marker -
- * both committed together in one transaction, matching applyDecodedRoomCommand)
- * is committed to storage, but the automatic settlement effect that normally
- * follows it (applyAutomaticRoomEffects -> receiveStoredSettlement) never runs,
- * exactly as if the isolate had been evicted or the request abandoned between
- * the commit and the effect. The stored private item is left untouched,
- * matching a real abandonment (settlement was never attempted, not that it
- * failed).
- */
-async function forceStuckSettling(
-  stub: GameRoomStub,
-  traderCredential: RoomCapabilityToken,
-  side: TradeSide
-): Promise<RoomState> {
-  return runInDurableObject(stub, async (_instance, state) => {
-    const nowMs = Date.now();
-    const loaded = loadPersistenceEnvelope(
-      await state.storage.get<unknown>(TEST_ROOM_STORAGE_KEY),
-      nowMs
-    );
-
-    if (!loaded.ok) {
-      throw new Error(`Expected loadable room envelope: ${loaded.error.code}`);
-    }
-
-    const result = dispatchRoomCommand(
-      loaded.room,
-      {
-        type: "EXECUTE_TRADE",
-        credential: traderCredential,
-        commandId: "test-command-force-stuck-settling",
-        side,
-        nowMs
-      },
-      {
-        verifyToken: () => true
-      }
-    );
-
-    if (!result.ok) {
-      throw new Error(`Expected EXECUTE_TRADE to transition to settling: ${result.error.code}`);
-    }
-
-    if (result.room.game.phase !== "settling") {
-      throw new Error("Expected settling phase after forced EXECUTE_TRADE.");
-    }
-
-    await state.storage.put(
-      TEST_ROOM_STORAGE_KEY,
-      JSON.parse(JSON.stringify(toPersistenceEnvelope(result.room, nowMs))) as unknown
-    );
-    await state.storage.put(TEST_PENDING_EFFECT_STORAGE_KEY, {
-      kind: "settle",
-      roundId: result.room.game.item.round_id,
-      attempts: 0,
-      notBeforeMs: nowMs
-    });
-
-    // Deliberately leave the *scheduled* DO alarm at the room's TTL deadline
-    // rather than the pending effect's (earlier, already-due) notBeforeMs.
-    // workerd honors real alarm scheduling in this harness - an overdue
-    // alarm can fire opportunistically the next time the object is touched,
-    // which would resolve settlement out from under a test before it gets a
-    // chance to assert the still-stuck fixture. Tests that want to exercise
-    // the pending effect must do so explicitly via runRoomCleanupAlarm().
-    await state.storage.setAlarm(roomExpiresAtMs(result.room));
-
-    return result.room;
-  });
-}
-
-/**
- * F-05 analogue of forceStuckSettling: directly patches the persisted
+ * F-05 test helper: directly patches the persisted
  * room's turnDeadlineMs into the past (production code has no way to stamp
  * a past deadline, since it always computes nowMs + a positive duration),
  * so a test can exercise the alarm's due-turn-clock path without waiting
  * out a real 30-60s duration. Requires the room to already be in one of
- * the four turn-clocked phases. Like forceStuckSettling, the *scheduled* DO
+ * the four turn-clocked phases. Like the other forced fixtures, the *scheduled* DO
  * alarm is deliberately left at the room's TTL rather than the forced past
  * deadline, so it does not fire opportunistically before a test explicitly
  * ticks it via runRoomCleanupAlarm().
@@ -4795,7 +2983,7 @@ async function runDueTurnExpiryDirect(
 /**
  * Reads the private, internal RoomState straight out of storage - unlike
  * CommandRoomResponse.room (a PublicRoomSnapshot), this carries host/guest
- * seat token hashes and is what runDueTurnExpiryDirect / forceStuckSettling
+ * seat token hashes and is what runDueTurnExpiryDirect
  * expect, since production only ever passes internal RoomState objects
  * between these methods, never redacted public snapshots.
  */
@@ -4814,31 +3002,6 @@ async function loadInternalRoomState(stub: GameRoomStub): Promise<RoomState> {
   });
 }
 
-type TestPendingRoomEffect = Readonly<{
-  kind: "settle";
-  roundId: string;
-  attempts: number;
-  notBeforeMs: number;
-}>;
-
-async function readPendingRoomEffect(
-  stub: GameRoomStub
-): Promise<TestPendingRoomEffect | null> {
-  return runInDurableObject(stub, async (_instance, state) => {
-    const value = await state.storage.get<unknown>(TEST_PENDING_EFFECT_STORAGE_KEY);
-
-    return (value as TestPendingRoomEffect | undefined) ?? null;
-  });
-}
-
-async function writePendingRoomEffectForTest(
-  stub: GameRoomStub,
-  effect: TestPendingRoomEffect
-): Promise<void> {
-  await runInDurableObject(stub, async (_instance, state) => {
-    await state.storage.put(TEST_PENDING_EFFECT_STORAGE_KEY, effect);
-  });
-}
 
 async function corruptRoomEnvelope(stub: GameRoomStub): Promise<void> {
   await runInDurableObject(stub, async (_instance, state) => {
@@ -4963,48 +3126,12 @@ function socketAttachmentRole(ws: WebSocket): "host" | "guest" | null {
     : null;
 }
 
-/**
- * Invokes the DO's private runDueSettleEffect directly, bypassing alarm()'s
- * outer transaction. alarm() freezes a single `nowMs` for its whole
- * invocation, so a room that alarm()'s outer transaction found loadable
- * cannot flip to "expired" for a later transaction within that same
- * invocation unless the underlying storage genuinely changed out from under
- * it (e.g. a concurrent write racing the two transactions) - the exact
- * narrow race this helper reproduces deterministically by expiring storage
- * first and then entering the method with the room/marker snapshot alarm()
- * would have captured before that expiry.
- */
-async function runDueSettleEffectDirect(
-  stub: GameRoomStub,
-  room: RoomState,
-  pendingEffect: TestPendingRoomEffect,
-  nowMs: number
-): Promise<void> {
-  await runInDurableObject(stub, async (instance) => {
-    await (
-      instance as unknown as {
-        runDueSettleEffect(
-          room: RoomState,
-          pendingEffect: TestPendingRoomEffect,
-          nowMs: number
-        ): Promise<void>;
-      }
-    ).runDueSettleEffect(room, pendingEffect, nowMs);
+async function rawStorageKeys(stub: GameRoomStub): Promise<string[]> {
+  return runInDurableObject(stub, async (_instance, state) => {
+    const entries = await state.storage.list<unknown>({});
+
+    return [...entries.keys()].sort();
   });
-}
-
-async function putStalePrivateGeneratedItem(
-  stub: GameRoomStub,
-  suffix: string
-): Promise<string> {
-  const key = `${privateGeneratedItemStoragePrefix()}${suffix}`;
-
-  await runInDurableObject(stub, async (_instance, state) => {
-    await state.storage.put(key, { stale: true });
-    await state.storage.setAlarm(Date.now() - 1);
-  });
-
-  return key;
 }
 
 async function readCommandDedupeEntries(stub: GameRoomStub): Promise<unknown[]> {
@@ -5064,37 +3191,6 @@ async function expireStoredRoomEnvelope(stub: GameRoomStub): Promise<void> {
       JSON.parse(JSON.stringify(toPersistenceEnvelope(expiredRoom, expiredAtMs))) as unknown
     );
     await state.storage.setAlarm(Date.now() - 1);
-  });
-}
-
-/**
- * Same content mutation as expireStoredRoomEnvelope (rewrites the stored
- * room so any future loadStoredRoomEnvelope/loadPersistenceEnvelope call
- * sees it as expired), but deliberately leaves the DO's actually-scheduled
- * alarm untouched instead of arming an overdue one. Some tests need the
- * room to *read back* as expired without triggering workerd's opportunistic
- * overdue-alarm firing in this harness (see forceStuckSettling's comment on
- * the same hazard) - e.g. when isolating a direct call to a private
- * effect-resume method rather than going through the real alarm().
- */
-async function expireStoredRoomEnvelopeWithoutArmingAlarm(stub: GameRoomStub): Promise<void> {
-  await runInDurableObject(stub, async (_instance, state) => {
-    const loaded = loadPersistenceEnvelope(
-      await state.storage.get<unknown>(TEST_ROOM_STORAGE_KEY),
-      Date.now()
-    );
-
-    if (!loaded.ok) {
-      throw new Error(`Expected loadable room envelope: ${loaded.error.code}`);
-    }
-
-    const expiredAtMs = 1;
-    const expiredRoom = roomWithStorageTimestamps(loaded.room, expiredAtMs);
-
-    await state.storage.put(
-      TEST_ROOM_STORAGE_KEY,
-      JSON.parse(JSON.stringify(toPersistenceEnvelope(expiredRoom, expiredAtMs))) as unknown
-    );
   });
 }
 
@@ -5471,7 +3567,6 @@ type CreateRoomConfig = Readonly<{
 }>;
 
 
-
 async function postPublicCustomAmazonItemBody(roomId: string, body: unknown): Promise<Response> {
   return fetchPublicWorker(new Request(`${PUBLIC_ROOMS_URL}/${roomId}/custom-amazon-item`, {
     body: JSON.stringify(body),
@@ -5600,59 +3695,6 @@ function nextSocketMessage<T>(socket: WebSocket): Promise<T> {
 }
 
 /**
- * Collects the next `count` JSON socket messages in order, for a single
- * alarm invocation that can synchronously broadcast more than once (e.g.
- * F-06's choosingSide timeout: one broadcast for the settling transition,
- * a second once receiveStoredSettlement resolves it). A single listener is
- * registered up front and kept attached across all `count` messages -
- * unlike chaining separate nextSocketMessage() calls, which would only
- * attach the second listener *after* awaiting the first, by which point a
- * synchronous second send has already happened with nothing attached to
- * receive it.
- */
-function nextSocketMessages<T>(socket: WebSocket, count: number): Promise<T[]> {
-  return new Promise<T[]>((resolve, reject) => {
-    const collected: T[] = [];
-    const onMessage = (event: MessageEvent): void => {
-      if (typeof event.data !== "string") {
-        clearTimeout(timeout);
-        socket.removeEventListener("message", onMessage as EventListener);
-        reject(new Error("Expected room socket message data to be a string."));
-
-        return;
-      }
-
-      try {
-        collected.push(JSON.parse(event.data) as T);
-      } catch (error) {
-        clearTimeout(timeout);
-        socket.removeEventListener("message", onMessage as EventListener);
-        reject(error);
-
-        return;
-      }
-
-      if (collected.length >= count) {
-        clearTimeout(timeout);
-        socket.removeEventListener("message", onMessage as EventListener);
-        resolve(collected);
-      }
-    };
-
-    const timeout = setTimeout(() => {
-      socket.removeEventListener("message", onMessage as EventListener);
-      reject(
-        new Error(
-          `Timed out waiting for ${count} room socket messages (got ${collected.length}).`
-        )
-      );
-    }, SOCKET_MESSAGE_TIMEOUT_MS);
-
-    socket.addEventListener("message", onMessage as EventListener);
-  });
-}
-
-/**
  * Waits for the next raw text socket message without JSON-decoding it, for
  * asserting on non-JSON protocol frames such as the "tt-pong" auto-response.
  */
@@ -5738,19 +3780,6 @@ async function expectPublicJsonWithoutTrueValue<T = unknown>(
 
   expectPublicPayload(text);
   expect(text).not.toContain("true_value");
-
-  return JSON.parse(text) as T;
-}
-
-async function expectPublicJsonWithoutPrivateItemMetadata<T = unknown>(
-  response: Response
-): Promise<T> {
-  const text = await response.text();
-
-  expectPublicPayload(text);
-  expect(text).not.toContain("true_value");
-  expect(text).not.toContain("scraped_items");
-  expect(text).not.toContain("amazon_url");
 
   return JSON.parse(text) as T;
 }

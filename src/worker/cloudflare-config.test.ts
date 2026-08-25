@@ -43,8 +43,8 @@ describe("Cloudflare configuration contract", () => {
 
   it("keeps deploy readiness tied to Durable Object room ownership", () => {
     expect(deployReadinessScript).toContain("LEGACY_NEXT_GAME_API_PATHS");
-    expect(deployReadinessScript).toContain("applyAutomaticRoomEffects");
-    expect(deployReadinessScript).toContain("privateGeneratedItemStorageKey");
+    expect(deployReadinessScript).toContain("applyDecodedRoomCommand");
+    expect(deployReadinessScript).toContain("itemForRound");
     expect(deployReadinessScript).not.toContain("TRADER_TITAN_ALLOW_PROCESS_LOCAL_ROUNDS");
   });
 });
