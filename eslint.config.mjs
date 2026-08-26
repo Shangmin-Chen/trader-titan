@@ -18,7 +18,8 @@ const eslintConfig = [
       "**/dist/**",
       "**/playwright-report/**",
       "**/test-results/**",
-      ".claude/**"
+      ".claude/**",
+      "worker-configuration.d.ts"
     ]
   }
 ];

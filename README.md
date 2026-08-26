@@ -56,7 +56,7 @@ After changing `wrangler.toml`/`.dev.vars.example`, regenerate the Worker enviro
 ## Release Notes
 
 - **Per-phase room invalidation on deploy:** persistence envelope versions hard-cutover per phase (v4 → v5 → v6) with no migration path. Deploying a phase invalidates every live room still inside the ≤2 h abandoned-room TTL window; affected players simply start a new room. This is deliberate policy, not a bug.
-- **One-time secret cleanup:** after deploying, remove the now-unused Gemini credential from your Cloudflare account with `wrangler secret delete GEMINI_API_KEY`.
+- **One-time secret cleanup:** after deploying, remove the now-unused Gemini credential from your Cloudflare account with `wrangler secret delete GEMINI_API_KEY`. The cleanup removed the entire env surface - `GEMINI_API_KEY`, `WORKER_ITEM_PROVIDER`, and `WORKER_TEST_MODE`; none exist in `wrangler`/`.dev.vars` anymore.
 - **Asymmetric-revert caveat:** reverting an earlier cleanup phase after later ones have landed restores an older decoder whose minimum supported version rejects newer envelopes - post-cutover rooms then fail decode and purge on first touch. Emergency-only; pair any revert with an immediate re-forward-fix.
 
 The Cloudflare build script no longer clears server secrets from the build environment or scans generated `.open-next` artifacts for known secret values - its only tracked secret was removed with the AI provider. If future secrets appear, reinstate equivalent blanking/scanning in `scripts/build-cloudflare.mjs`.
