@@ -19,11 +19,11 @@ import * as workerEntrypoint from "./index";
  *
  * This test encodes workerd's export-type rule directly via reflection so a
  * regression like that one fails fast in `npm run worker-test` instead of
- * only surfacing when something actually boots the built Worker (see
- * PR_BODY.md for the incident this guards against). It intentionally does
- * NOT attempt to boot the module as a service itself - there is no cheap
- * way to do that from within this pool (see PR_BODY.md); this is the
- * structural check that was actually feasible.
+ * only surfacing when something actually boots the built Worker (see the
+ * introducing commit b978a3e for the incident this guards against). It
+ * intentionally does NOT attempt to boot the module as a service itself -
+ * there is no cheap way to do that from within this pool (same rationale as
+ * commit b978a3e); this is the structural check that was actually feasible.
  */
 const KNOWN_GOOD_NAMED_EXPORTS = new Set(["GameRoomDurableObject"]);
 

@@ -7,7 +7,7 @@ The Cloudflare target uses OpenNext for the existing Next app and a Durable Obje
 - Wrangler `main` points to `src/worker/index.ts`.
 - The Worker delegates normal app requests to the generated OpenNext worker at `.open-next/worker.js`.
 - Worker tests alias that generated worker to a smoke implementation before the OpenNext build artifact exists.
-- Legacy process-local game routes (`/api/generate-item`, `/api/commit-market`, and `/api/settle-round`) are rejected by the Worker with `410` before OpenNext can serve them.
+- Legacy process-local game routes (`/api/generate-item`, `/api/generate-custom-amazon-item`, `/api/commit-market`, and `/api/settle-round`) are rejected by the Worker with `410` before OpenNext can serve them.
 
 ## Public Room Routes
 
@@ -51,11 +51,17 @@ Implemented HTTP endpoints on the Durable Object stub:
 - `POST /room/command`: decodes known host/player protocol commands and dispatches to the pure room command functions.
 - `GET /room/socket` with `Upgrade: websocket`: validates the capability token from `Sec-WebSocket-Protocol`, authorizes room access, and upgrades to a hibernatable Durable Object WebSocket using `acceptWebSocket`.
 
-Both `POST /room/join` and `POST /room/command` purge a missing, expired, or invalid stored envelope (the room envelope, its command-dedupe record, and the alarm) in the same storage transaction as the error they return, mirroring the cleanup-alarm behavior below. Without this, an envelope that fails to decode would return the same error on every subsequent request against that room object until its already-scheduled alarm eventually fired - up to `ABANDONED_ROOM_TTL_MS` later for a room with no sooner turn-clock or socket-liveness deadline armed. The next request against the same room object instead sees `room_not_found` (missing), not a repeat of the original error.
+Both `POST /room/join` and `POST /room/command` purge a missing, expired, or invalid stored envelope (the room envelope, its command-dedupe record, and the alarm) in the same storage transaction as the error they return, mirroring the cleanup-alarm behavior below. Without this, an envelope that fails to decode would return the same error on every subsequent request against that room object until its already-scheduled alarm eventually fired - up to `ABANDONED_ROOM_TTL_MS` later for a room with no sooner socket-liveness deadline armed. The next request against the same room object instead sees `room_not_found` (missing), not a repeat of the original error.
 
 Private room state is stored through the room persistence envelope and loaded through the persistence decoder. Unauthenticated invite reads never include game state. Authenticated clients receive public snapshots only; persistence metadata and token hashes must never be returned. Capability token secrets and hashes are generated with Worker crypto, and Durable Object storage stores only hashes.
 
-The persistence envelope carries a version, and decoding is a hard cutover: `ROOM_PERSISTENCE_VERSION` and `ROOM_PERSISTENCE_MIN_SUPPORTED_VERSION` in `src/lib/room/persistence.ts` move together (currently 5) and there is no read-time migration chain, so an envelope tagged with any other version fails decode with `persistence_version_unsupported` and the existing self-heal paths purge it so the room reads as never-created.
+The persistence envelope carries a version, and decoding is a hard cutover with no migration policy: `ROOM_PERSISTENCE_VERSION` and `ROOM_PERSISTENCE_MIN_SUPPORTED_VERSION` in `src/lib/room/persistence.ts` move together (currently 6) and there is no read-time migration chain, so an envelope tagged with any other version fails decode with `persistence_version_unsupported` and the existing self-heal paths purge it so the room reads as never-created. Blast radius per deploy: rooms live in the ≤2 h TTL window.
+
+Cutover history (one hard bump per phase that changed persisted shapes):
+
+- **v4 (static-deck provider + custom-Amazon/AI flag removal):** the config flags `customAmazonQuery`/`aiGenerated` and the scraped fields `scraped_items`/`amazon_url` left the persisted envelope; the v1→v3 migration chain was deleted.
+- **v5 (synchronous settlement):** `generatingItem`, `settling`, and `error` stopped being persistable phases, and `lockedPendingTrade`/`settlementFailureCount` left `choosingSide`.
+- **v6 (shot-clock cut):** `roundForfeited` stopped being a persistable phase, and forfeit/forced-timeout fields (`RoundForfeit`, `RoundSettlement.forcedByTimeout`) no longer exist.
 
 ## Room Presence
 
@@ -68,9 +74,9 @@ The Durable Object is the authoritative source for live room presence:
 - Every authenticated public room snapshot includes presence booleans. Presence-only snapshots can keep the same room revision because the room state did not mutate.
 - HTTP joins, HTTP commands, WebSocket commands, and authenticated access responses use the same `currentRoomPresence` source when returning full public snapshots.
 
-Presence does not gate any room command (F-04). `START_ROOM` and `ADVANCE_ROUND` (both non-final and final-round, which moves the room to `finished` with a `gameOver` game state) succeed regardless of whether Player B is connected. An idle or absent opponent is instead handled by the F-05 turn shot clock, which forfeits the round they are on the clock for; presence is a purely cosmetic connection indicator in the snapshot.
+Presence does not gate any room command (F-04). `START_ROOM` and `ADVANCE_ROUND` (both non-final and final-round, which moves the room to `finished` with a `gameOver` game state) succeed regardless of whether Player B is connected. There is no shot clock to force an idle player's hand; a missing opponent stalls only their own turn, and the host's recourse is `RESET_TO_LOBBY` or `KICK_GUEST`. Presence is a purely cosmetic connection indicator in the snapshot.
 
-## Private Item Storage And Effects
+## No Private Item Storage - Deck-Derived Settlement
 
 The Durable Object is the gameplay authority for generated item values and settlement:
 
@@ -81,17 +87,14 @@ The Durable Object is the gameplay authority for generated item values and settl
 - Successful `RESET_TO_LOBBY` and `KICK_GUEST` commands persist the lobby replacement in the same storage transaction as the command dispatch.
 - Room envelope writes schedule a Durable Object alarm for the room persistence expiration. When the alarm runs and the room envelope is missing, expired, or invalid, the Durable Object deletes the room envelope and its command-dedupe record and clears the alarm; if the room is still loadable, the alarm is rescheduled to the current room expiration.
 
-## Turn Shot Clock Alarm (F-05)
+## Durable Object Alarm
 
-A Durable Object has exactly one alarm slot. `scheduleNextAlarm` multiplexes it across up to three candidate deadlines and arms it at whichever is soonest:
+A Durable Object has exactly one alarm slot. `scheduleNextAlarm` multiplexes it across two candidate deadlines and arms it at whichever is soonest:
 
-1. The room's TTL expiration (unchanged, see above).
+1. The room's TTL expiration (see above).
 2. The F-08 socket-liveness sweep deadline: the earliest time at which some currently-connected room socket would go stale with no further auto-response (`nextLivenessSweepDeadline`, recomputed from live socket state on every call; `null` - contributing no deadline - when no sockets are connected).
-3. The F-05 turn shot clock's `turnDeadlineMs`, read directly off the room's current game state rather than a separate persisted marker - it is already durable as part of the committed room envelope for the four turn-clocked phases (`proposingWidth`, `negotiatingWidth`, `configuringMarket`, `choosingSide`).
 
-When the alarm fires and a turn deadline is the one that is due, the Durable Object re-loads the room in a fresh transaction, re-validates that the same phase and deadline are still outstanding, and only then dispatches `TURN_EXPIRED` through the room command layer and persists the result. This re-validation is what keeps a stale alarm wake from forfeiting a round that has already advanced past that phase.
-
-If the alarm fires while the room envelope is missing, expired, or invalid, the Durable Object purges the room envelope and its command-dedupe record exactly as the plain TTL case above - a turn deadline being simultaneously outstanding does not suppress this cleanup.
+Each alarm invocation runs the liveness sweep first and then reschedules against whichever stored deadline is next. The liveness deadline is never persisted, so once every stale socket has been closed (or none were connected), a room with no remaining sockets drops the liveness term and the alarm settles back to firing only for TTL purposes. When the alarm fires and the room envelope is missing, expired, or invalid, the Durable Object purges the room envelope and its command-dedupe record exactly as the plain TTL case above - nothing else arms an alarm, so no other deadline can be simultaneously outstanding.
 
 ## Room WebSocket Contract
 
@@ -115,6 +118,8 @@ Successful WebSocket commands are dispatched through the same room command layer
 
 - `ASSETS` serves OpenNext assets.
 - `NEXT_PUBLIC_APP_ENV` may distinguish local, preview, and production deployments.
+
+There are no other Worker environment variables: no AI-provider credentials, item-provider selectors, or test-mode gates exist (`GEMINI_API_KEY`, `WORKER_ITEM_PROVIDER`, and `WORKER_TEST_MODE` were all removed).
 
 ## Gates
 
